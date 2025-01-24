@@ -49,10 +49,6 @@ if config.debug:
 
 
 def main() -> None:
-    if config.nccl_optimizations is not None:
-        os.environ["NCCL_SOCKET_NTHREADS"] = str(config.nccl_optimizations[0])
-        os.environ["NCCL_NSOCKS_PERTHREAD"] = str(config.nccl_optimizations[1])
-
     if config.benchmark:
         checkpoint = None
         os.environ["NCCL_DEBUG"] = "INFO"
@@ -74,7 +70,6 @@ def main() -> None:
                 "weight_decay": config.weight_decay,
                 "gpus_per_node": config.gpus_per_node,
                 "nodes": config.nodes,
-                "nccl_optimizations": config.nccl_optimizations,
                 "benchmark": config.benchmark,
                 "runtime": config.runtime,
             },

@@ -29,13 +29,10 @@ epochs = 90
 momentum = 0.9
 weight_decay = 0.0001
 debug = False
-nccl_optimizations = [4, 1]
 benchmark = False
 runtime = "gvisor"
 assert runtime in ["gvisor", "runc"]
 run_name = f"lars-{batch_size}-{nodes}x{gpus_per_node}"
-if nccl_optimizations is not None:
-    run_name += f"-ncclopt{nccl_optimizations[0]}x{nccl_optimizations[1]}"
 if benchmark:
     run_name += "-benchmark"
 if runtime == "runc":
