@@ -249,7 +249,10 @@ checkpoint = None  # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
+    t0_compile = time.time()
     model = torch.compile(model)  # requires PyTorch 2.0
+    compile_time = time.time() - t0_compile
+    print(f"Compilation completed in {compile_time:.2f} seconds")
 
 # wrap model into DDP container
 if ddp:
