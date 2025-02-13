@@ -12,7 +12,7 @@ flavor = "devel"  #  includes full CUDA toolkit
 operating_sys = "ubuntu22.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
-LOCAL_CODE_DIR = "./"
+LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_CODE_DIR = "/root/"
 REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 REMOTE_BENCH_SCRIPT_PATH = "/root/bench.py"
@@ -35,6 +35,9 @@ image = (
 )
 app = modal.App("nanoGPT", image=image)
 volume = modal.Volume.from_name("nanogpt-multinode-demo", create_if_missing=True)
+volume_model_output = modal.Volume.from_name(
+    "nanogpt-multinode-demo-model-output", create_if_missing=True
+)
 
 
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
@@ -49,7 +52,9 @@ MOUNTS = []
     mounts=MOUNTS,
     timeout=3600,
     cpu=(0.2, 16),  # Set higher limit to avoid CPU bottleneck.
-    volumes={"/vol": volume},
+    volumes={
+        "/vol": volume,
+    },
 )
 def prepare_data():
     os.environ["TRUST_REMOTE_CODE"] = "true"
@@ -67,11 +72,15 @@ def prepare_data():
         # Required for connecting to Weights & Biases from within the Modal container.
         modal.Secret.from_name("wandb-secret"),
     ],
-    volumes={"/vol": volume},
+    volumes={
+        "/vol": volume,
+        # Mount a Volume where NanoGPT outputs checkpoints.
+        "/root/out": volume_model_output,
+    },
     timeout=60 * 60 * 24,
 )
 @modal.experimental.clustered(n_nodes)
-def train(bench: bool = False):
+def train(bench: bool = False, profile: bool = False):
     from torch.distributed.run import parse_args, run
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -88,6 +97,9 @@ def train(bench: bool = False):
     # "In particular, if you don't have Infiniband then also prepend ..."
     # As of Feb 2025 Modal does not (yet) support Infiniband.
     os.environ["NCCL_IB_DISABLE"] = "1"
+
+    if profile:
+        os.environ["NANOGPT_PROFILE"] = "1"
 
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")

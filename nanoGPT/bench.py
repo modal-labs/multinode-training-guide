@@ -21,7 +21,10 @@ dtype = (
     else "float16"
 )  # 'float32' or 'bfloat16' or 'float16'
 compile = True  # use PyTorch 2.0 to compile the model to be faster
-profile = False  # use pytorch profiler, or just simple benchmarking?
+profile = os.environ.get("NANOGPT_PROFILE", "0").lower() in (
+    "1",
+    "true",
+)  # use pytorch profiler, or just simple benchmarking?
 exec(open("configurator.py").read())  # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
@@ -93,6 +96,7 @@ if compile:
     model = torch.compile(model)  # pytorch 2.0
 
 if profile:
+    print("Profiling NanoGPT model...")
     # useful docs on pytorch profiler:
     # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
     # - api https://pytorch.org/docs/stable/profiler.html#torch.profiler.profile
@@ -106,7 +110,7 @@ if profile:
         schedule=torch.profiler.schedule(
             wait=wait, warmup=warmup, active=active, repeat=1
         ),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./bench_log"),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("/root/out/bench_log"),
         record_shapes=False,
         profile_memory=False,
         with_stack=False,  # incurs an additional overhead, disable if not needed
@@ -125,6 +129,7 @@ if profile:
             print(f"{k}/{num_steps} loss: {lossf:.4f}")
 
             prof.step()  # notify the profiler at end of each step
+    print("Done")
 
 else:
     # simple benchmarking
