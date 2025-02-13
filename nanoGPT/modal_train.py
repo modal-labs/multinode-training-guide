@@ -14,7 +14,8 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
 LOCAL_CODE_DIR = "./"
 REMOTE_CODE_DIR = "/root/"
-REMOTE_SCRIPT_PATH = "/root/train.py"
+REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
+REMOTE_BENCH_SCRIPT_PATH = "/root/bench.py"
 GPU_TYPE = "H100:8"
 
 image = (
@@ -27,7 +28,10 @@ image = (
     # https://github.com/karpathy/nanoGPT?tab=readme-ov-file#install
     # TODO: why doesn't karpathy pin these?
     .pip_install("torch", "transformers", "datasets", "tiktoken", "wandb", "tqdm")
-    .add_local_dir(LOCAL_CODE_DIR, remote_path=REMOTE_CODE_DIR,)
+    .add_local_dir(
+        LOCAL_CODE_DIR,
+        remote_path=REMOTE_CODE_DIR,
+    )
 )
 app = modal.App("nanoGPT", image=image)
 volume = modal.Volume.from_name("nanogpt-multinode-demo", create_if_missing=True)
@@ -40,10 +44,11 @@ n_proc_per_node = 4
 
 MOUNTS = []
 
+
 @app.function(
     mounts=MOUNTS,
     timeout=3600,
-    cpu=(0.2, 16), # Set higher limit to avoid CPU bottleneck.
+    cpu=(0.2, 16),  # Set higher limit to avoid CPU bottleneck.
     volumes={"/vol": volume},
 )
 def prepare_data():
@@ -53,7 +58,6 @@ def prepare_data():
     print("Copying train.bin to modal.Volume for persistent storage...")
     shutil.copy("/root/data/openwebtext/train.bin", "/vol/train.bin")
     shutil.copy("/root/data/openwebtext/val.bin", "/vol/val.bin")
-
 
 
 @app.function(
@@ -67,7 +71,7 @@ def prepare_data():
     timeout=60 * 60 * 24,
 )
 @modal.experimental.clustered(n_nodes)
-def train():
+def train(bench: bool = False):
     from torch.distributed.run import parse_args, run
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -88,12 +92,13 @@ def train():
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
     os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
+    script = REMOTE_TRAIN_SCRIPT_PATH if not bench else REMOTE_BENCH_SCRIPT_PATH
     args = [
         f"--nnodes={n_nodes}",
         f"--nproc-per-node={n_proc_per_node}",
         f"--node-rank={cluster_info.rank}",
         f"--master-addr={main_ip_addr}",
-        REMOTE_SCRIPT_PATH,
+        script,
     ]
     print(f"Running torchrun with args: {' '.join(args)}")
     run(parse_args(args))
