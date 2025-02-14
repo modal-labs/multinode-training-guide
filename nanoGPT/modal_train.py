@@ -16,7 +16,7 @@ LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_CODE_DIR = "/root/"
 REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 REMOTE_BENCH_SCRIPT_PATH = "/root/bench.py"
-GPU_TYPE = "H100:8"
+GPU_TYPE = "H100"
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
@@ -43,7 +43,7 @@ volume_model_output = modal.Volume.from_name(
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
 n_nodes = 2
 # Typically this matches the number of GPUs per container.
-n_proc_per_node = 4
+n_proc_per_node = 8
 
 MOUNTS = []
 
@@ -66,7 +66,7 @@ def prepare_data():
 
 
 @app.function(
-    gpu=GPU_TYPE,
+    gpu=f"{GPU_TYPE}:{n_proc_per_node}",
     mounts=MOUNTS,
     secrets=[
         # Required for connecting to Weights & Biases from within the Modal container.
@@ -80,7 +80,7 @@ def prepare_data():
     timeout=60 * 60 * 24,
 )
 @modal.experimental.clustered(n_nodes)
-def train(bench: bool = False, profile: bool = False):
+def train_multi_node():
     from torch.distributed.run import parse_args, run
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -98,19 +98,69 @@ def train(bench: bool = False, profile: bool = False):
     # As of Feb 2025 Modal does not (yet) support Infiniband.
     os.environ["NCCL_IB_DISABLE"] = "1"
 
+    # Symlink the training data in our volume to the place that nanoGPT expects it.
+    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
+    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
+    args = [
+        f"--nnodes={n_nodes}",
+        f"--nproc-per-node={n_proc_per_node}",
+        f"--node-rank={cluster_info.rank}",
+        f"--master-addr={main_ip_addr}",
+        REMOTE_TRAIN_SCRIPT_PATH,
+    ]
+    print(f"Running torchrun with args: {' '.join(args)}")
+    run(parse_args(args))
+
+
+@app.function(
+    gpu=f"A100:{n_proc_per_node}",
+    mounts=MOUNTS,
+    secrets=[
+        # Required for connecting to Weights & Biases from within the Modal container.
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    volumes={
+        "/vol": volume,
+        # Mount a Volume where NanoGPT outputs checkpoints.
+        "/root/out": volume_model_output,
+    },
+    timeout=60 * 60 * 24,
+)
+def train_single_node():
+    from torch.distributed.run import parse_args, run
+
+    # Symlink the training data in our volume to the place that nanoGPT expects it.
+    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
+    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
+    args = [
+        f"--nproc-per-node={n_proc_per_node}",
+        REMOTE_TRAIN_SCRIPT_PATH,
+    ]
+    print(f"Running torchrun with args: {' '.join(args)}")
+    run(parse_args(args))
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    mounts=MOUNTS,
+    volumes={
+        "/vol": volume,
+        # Mount a Volume where NanoGPT outputs checkpoints.
+        "/root/out": volume_model_output,
+    },
+)
+def bench(profile: bool = False):
+    from torch.distributed.run import parse_args, run
+
     if profile:
         os.environ["NANOGPT_PROFILE"] = "1"
 
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
     os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
-    script = REMOTE_TRAIN_SCRIPT_PATH if not bench else REMOTE_BENCH_SCRIPT_PATH
     args = [
-        f"--nnodes={n_nodes}",
-        f"--nproc-per-node={n_proc_per_node}",
-        f"--node-rank={cluster_info.rank}",
-        f"--master-addr={main_ip_addr}",
-        script,
+        "--nproc-per-node=1",
+        REMOTE_BENCH_SCRIPT_PATH,
     ]
     print(f"Running torchrun with args: {' '.join(args)}")
     run(parse_args(args))

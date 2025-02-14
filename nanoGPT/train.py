@@ -45,7 +45,7 @@ wandb_project = "owt"
 wandb_run_name = "gpt2"  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
-gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
+gradient_accumulation_steps = 6 * 8  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -91,6 +91,7 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
 if ddp:
+    print("Initializing DDP...")
     init_process_group(backend=backend)
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
@@ -101,7 +102,9 @@ if ddp:
     seed_offset = ddp_rank  # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
+    assert (
+        gradient_accumulation_steps % ddp_world_size == 0
+    ), f"{gradient_accumulation_steps=} must be divisible by {ddp_world_size=}"
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process

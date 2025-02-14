@@ -1,5 +1,21 @@
 
-# nanoGPT
+# nanoGPT on Modal
+
+See `modal_train.py` for the Modal training App wrapper. Here are performance stats for specific
+GPU configurations:
+
+| GPU Config | Time per iteration | MFU |
+|------------|-------------------|-----|
+| 8xA100 | ~360ms | ~47.84% |
+| 8xH100 | ~200ms | ~25.4% |
+| 2x8xH100 | 250-350ms | ~10.00% |
+
+> [!WARNING]
+> MFU performance on multi-node training is not yet optimized.
+
+---
+
+## nanoGPT
 
 ![nanoGPT](assets/nanogpt.jpg)
 
