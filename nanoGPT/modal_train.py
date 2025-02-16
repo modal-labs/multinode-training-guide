@@ -81,6 +81,11 @@ def prepare_data():
 )
 @modal.experimental.clustered(n_nodes)
 def train_multi_node():
+    """
+    Train the model on a multi-node cluster with N GPUs per node (typically 8).
+    Good cluster scale performance should result in a ~linear speedup as the number of nodes
+    is increased.
+    """
     from torch.distributed.run import parse_args, run
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -127,6 +132,11 @@ def train_multi_node():
     timeout=60 * 60 * 24,
 )
 def train_single_node():
+    """
+    Train the model on a single node (a.k.a container) with N GPUs.
+    Training on a single 8x A100 container is a useful baseline for performance comparison
+    because it is the original training configuration of the karpathy/nanoGPT repository.
+    """
     from torch.distributed.run import parse_args, run
 
     # Symlink the training data in our volume to the place that nanoGPT expects it.
@@ -150,6 +160,10 @@ def train_single_node():
     },
 )
 def bench(profile: bool = False):
+    """
+    Run the benchmark script, which profiles the performance of the model forward/backward pass
+    on a single GPU.
+    """
     from torch.distributed.run import parse_args, run
 
     if profile:
