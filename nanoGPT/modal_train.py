@@ -66,6 +66,39 @@ def prepare_data():
 
 
 @app.function(
+    gpu=f"A100:{n_proc_per_node}",
+    mounts=MOUNTS,
+    secrets=[
+        # Required for connecting to Weights & Biases from within the Modal container.
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    volumes={
+        "/vol": volume,
+        # Mount a Volume where NanoGPT outputs checkpoints.
+        "/root/out": volume_model_output,
+    },
+    timeout=60 * 60 * 24,
+)
+def train_single_node():
+    """
+    Train the model on a single node (a.k.a container) with N GPUs.
+    Training on a single 8x A100 container is a useful baseline for performance comparison
+    because it is the original training configuration of the karpathy/nanoGPT repository.
+    """
+    from torch.distributed.run import parse_args, run
+
+    # Symlink the training data in our volume to the place that nanoGPT expects it.
+    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
+    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
+    args = [
+        f"--nproc-per-node={n_proc_per_node}",
+        REMOTE_TRAIN_SCRIPT_PATH,
+    ]
+    print(f"Running torchrun with args: {' '.join(args)}")
+    run(parse_args(args))
+
+
+@app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
     mounts=MOUNTS,
     secrets=[
@@ -118,12 +151,8 @@ def train_multi_node():
 
 
 @app.function(
-    gpu=f"A100:{n_proc_per_node}",
+    gpu=f"{GPU_TYPE}:{n_proc_per_node}",
     mounts=MOUNTS,
-    secrets=[
-        # Required for connecting to Weights & Biases from within the Modal container.
-        modal.Secret.from_name("wandb-secret"),
-    ],
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -131,19 +160,38 @@ def train_multi_node():
     },
     timeout=60 * 60 * 24,
 )
-def train_single_node():
+@modal.experimental.clustered(n_nodes)
+def bench_multi_node():
     """
-    Train the model on a single node (a.k.a container) with N GPUs.
-    Training on a single 8x A100 container is a useful baseline for performance comparison
-    because it is the original training configuration of the karpathy/nanoGPT repository.
+    Train the model on a multi-node cluster with N GPUs per node (typically 8).
+    Good cluster scale performance should result in a ~linear speedup as the number of nodes
+    is increased.
     """
     from torch.distributed.run import parse_args, run
+
+    cluster_info = modal.experimental.get_cluster_info()
+    # which container am I?
+    container_rank: int = cluster_info.rank
+    # what's the leader/master/main container's address?
+    main_ip_addr: str = cluster_info.container_ips[0]
+    container_id = os.environ["MODAL_TASK_ID"]
+
+    print(f"hello from {container_id}, rank {container_rank} of {n_nodes}")
+    if container_rank == 0:
+        print(f"main container's address: {main_ip_addr}")
+
+    # "In particular, if you don't have Infiniband then also prepend ..."
+    # As of Feb 2025 Modal does not (yet) support Infiniband.
+    os.environ["NCCL_IB_DISABLE"] = "1"
 
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
     os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
     args = [
+        f"--nnodes={n_nodes}",
         f"--nproc-per-node={n_proc_per_node}",
+        f"--node-rank={cluster_info.rank}",
+        f"--master-addr={main_ip_addr}",
         REMOTE_TRAIN_SCRIPT_PATH,
     ]
     print(f"Running torchrun with args: {' '.join(args)}")
@@ -159,7 +207,7 @@ def train_single_node():
         "/root/out": volume_model_output,
     },
 )
-def bench(profile: bool = False):
+def bench_single_gpu(profile: bool = False):
     """
     Run the benchmark script, which profiles the performance of the model forward/backward pass
     on a single GPU.
