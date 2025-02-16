@@ -98,6 +98,37 @@ def train_single_node():
     run(parse_args(args))
 
 
+def _train_multi_node() -> None:
+    from torch.distributed.run import parse_args, run
+
+    cluster_info = modal.experimental.get_cluster_info()
+    # which container am I?
+    container_rank: int = cluster_info.rank
+    # what's the leader/master/main container's address?
+    main_ip_addr: str = cluster_info.container_ips[0]
+    container_id = os.environ["MODAL_TASK_ID"]
+
+    print(f"hello from {container_id}, rank {container_rank} of {n_nodes}")
+    if container_rank == 0:
+        print(f"main container's address: {main_ip_addr}")
+
+    # "In particular, if you don't have Infiniband then also prepend ..."
+    # As of Feb 2025 Modal does not (yet) support Infiniband.
+    os.environ["NCCL_IB_DISABLE"] = "1"
+
+    # Symlink the training data in our volume to the place that nanoGPT expects it.
+    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
+    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
+    args = [
+        f"--nnodes={n_nodes}",
+        f"--nproc-per-node={n_proc_per_node}",
+        f"--node-rank={cluster_info.rank}",
+        f"--master-addr={main_ip_addr}",
+        REMOTE_TRAIN_SCRIPT_PATH,
+    ]
+    print(f"Running torchrun with args: {' '.join(args)}")
+    run(parse_args(args))
+
 @app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
     mounts=MOUNTS,
@@ -119,35 +150,7 @@ def train_multi_node():
     Good cluster scale performance should result in a ~linear speedup as the number of nodes
     is increased.
     """
-    from torch.distributed.run import parse_args, run
-
-    cluster_info = modal.experimental.get_cluster_info()
-    # which container am I?
-    container_rank: int = cluster_info.rank
-    # what's the leader/master/main container's address?
-    main_ip_addr: str = cluster_info.container_ips[0]
-    container_id = os.environ["MODAL_TASK_ID"]
-
-    print(f"hello from {container_id}, rank {container_rank} of {n_nodes}")
-    if container_rank == 0:
-        print(f"main container's address: {main_ip_addr}")
-
-    # "In particular, if you don't have Infiniband then also prepend ..."
-    # As of Feb 2025 Modal does not (yet) support Infiniband.
-    os.environ["NCCL_IB_DISABLE"] = "1"
-
-    # Symlink the training data in our volume to the place that nanoGPT expects it.
-    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
-    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
-    args = [
-        f"--nnodes={n_nodes}",
-        f"--nproc-per-node={n_proc_per_node}",
-        f"--node-rank={cluster_info.rank}",
-        f"--master-addr={main_ip_addr}",
-        REMOTE_TRAIN_SCRIPT_PATH,
-    ]
-    print(f"Running torchrun with args: {' '.join(args)}")
-    run(parse_args(args))
+    _train_multi_node()
 
 
 @app.function(
@@ -167,36 +170,10 @@ def bench_multi_node():
     Good cluster scale performance should result in a ~linear speedup as the number of nodes
     is increased.
     """
-    from torch.distributed.run import parse_args, run
-
-    cluster_info = modal.experimental.get_cluster_info()
-    # which container am I?
-    container_rank: int = cluster_info.rank
-    # what's the leader/master/main container's address?
-    main_ip_addr: str = cluster_info.container_ips[0]
-    container_id = os.environ["MODAL_TASK_ID"]
-
-    print(f"hello from {container_id}, rank {container_rank} of {n_nodes}")
-    if container_rank == 0:
-        print(f"main container's address: {main_ip_addr}")
-
-    # "In particular, if you don't have Infiniband then also prepend ..."
-    # As of Feb 2025 Modal does not (yet) support Infiniband.
-    os.environ["NCCL_IB_DISABLE"] = "1"
-
-    # Symlink the training data in our volume to the place that nanoGPT expects it.
-    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
-    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
-    args = [
-        f"--nnodes={n_nodes}",
-        f"--nproc-per-node={n_proc_per_node}",
-        f"--node-rank={cluster_info.rank}",
-        f"--master-addr={main_ip_addr}",
-        REMOTE_TRAIN_SCRIPT_PATH,
-    ]
-    print(f"Running torchrun with args: {' '.join(args)}")
-    run(parse_args(args))
-
+    # Enable profiling.
+    os.environ["NANOGPT_MAX_ITERS"] = "200"
+    os.environ["NANOGPT_PROFILE"] = "true"
+    _train_multi_node()
 
 @app.function(
     gpu=GPU_TYPE,
