@@ -4,14 +4,32 @@
 See `modal_train.py` for the Modal training App wrapper. Here are performance stats for specific
 GPU configurations:
 
+### MFU Performance
+
 | GPU Config | Time per iteration | MFU |
 |------------|-------------------|-----|
 | 8xA100 | ~360ms | ~47.84% |
-| 8xH100 | ~200ms | ~25.4% |
+| 8xH100 | ~230ms | ~25.4% |
+| 8xH200 | ~220ms | ~25.0% |
 | 2x8xH100 | 250-350ms | ~10.00% |
 
 > [!WARNING]
 > MFU performance on multi-node training is not yet optimized.
+
+### NanoGPT Speedrun Performance
+
+| Name | GPU Config | Date | Duration | Speedup |
+|------|------------|------|----------|---------|
+| Original modded-nanogpt baseline [llm.c](https://github.com/karpathy/llm.c/discussions/481) | 8x H100 SXM | 2024-05-28 | 45 mins | 1x |
+| Modal nanoGPT (this repo) | 8x A100 80BG SXM | 2025-02-16 | 45.62 mins | 0.99x |
+| Modal nanoGPT (this repo) | 8x H100 SXM | 20250-02-16 | 24.928 mins | 1.805x
+| Modal nanoGPT (this repo) | 8x H**2**00 SXM | 20250-02-16 | 23.97 mins | 1.88x |
+| Modal clustered nanoGPT (this repo) | 2x8xH100 SXM | 2023-11-20 | 36.75 mins | 1.22x ⚠️ |
+| [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) current record | 8x H100 SXM | 2024-02-01 | 2.997 minutes | 15.015x |
+
+* ⚠️ Multi-node performance is currently suffering a lot from inter-node communication overhead. Run the PyTorch profiler to analyze.
+* There's a lot of room for improvement on single node performance by following [modded-nanogpt's](https://github.dev/KellerJordan/modded-nanogpt) lead.
+
 
 ---
 
