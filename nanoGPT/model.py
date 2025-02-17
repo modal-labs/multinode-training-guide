@@ -371,9 +371,12 @@ class GPT(nn.Module):
                 # See FP16 FLOPS section of A100 datasheet (ignore sparsity)
                 # https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-nvidia-us-2188504-web.pdf
                 flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS (without sparsity)
-            elif "H100" in gpu_model:
+            elif "H100" in gpu_model or "H200" in gpu_model:
                 # See FP16 FLOPS section of H100 datasheet (ignore sparsity)
                 # https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet
+                # 
+                # See FP16 FLOPS section of H200 datasheet. It shows only metric with sparsity enabled. Halve it.
+                # https://nvdam.widen.net/s/nb5zzzsjdf/hpc-datasheet-sc23-h200-datasheet-3002446
                 #
                 # Also see Liger Kernel repo:
                 # https://github.com/linkedin/Liger-Kernel/blob/fc88dc6ccec6fabb4153cfe84f17307846ef06b0/examples/medusa/callback.py#L373
