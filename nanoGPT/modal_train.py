@@ -64,6 +64,18 @@ def prepare_data():
     shutil.copy("/root/data/openwebtext/train.bin", "/vol/train.bin")
     shutil.copy("/root/data/openwebtext/val.bin", "/vol/val.bin")
 
+def _train_single_node():
+    from torch.distributed.run import parse_args, run
+
+    # Symlink the training data in our volume to the place that nanoGPT expects it.
+    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
+    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
+    args = [
+        f"--nproc-per-node={n_proc_per_node}",
+        REMOTE_TRAIN_SCRIPT_PATH,
+    ]
+    print(f"Running torchrun with args: {' '.join(args)}")
+    run(parse_args(args))
 
 @app.function(
     gpu=f"A100:{n_proc_per_node}",
@@ -85,17 +97,27 @@ def train_single_node():
     Training on a single 8x A100 container is a useful baseline for performance comparison
     because it is the original training configuration of the karpathy/nanoGPT repository.
     """
-    from torch.distributed.run import parse_args, run
+    _train_single_node()
 
-    # Symlink the training data in our volume to the place that nanoGPT expects it.
-    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
-    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
-    args = [
-        f"--nproc-per-node={n_proc_per_node}",
-        REMOTE_TRAIN_SCRIPT_PATH,
-    ]
-    print(f"Running torchrun with args: {' '.join(args)}")
-    run(parse_args(args))
+
+@app.function(
+    gpu=f"H100:{n_proc_per_node}",
+    mounts=MOUNTS,
+    volumes={
+        "/vol": volume,
+        # Mount a Volume where NanoGPT outputs checkpoints.
+        "/root/out": volume_model_output,
+    },
+    timeout=2* 60 * 60, # should always be faster than 2 hours
+)
+def speedrun_single_node():
+    """
+    Follow https://github.dev/KellerJordan/modded-nanogpt's benchmark rules to test
+    multi-node scaling performance. 
+    """
+    os.environ["NANOGPT_SPEEDRUN"] = "true"
+    _train_single_node()
+
 
 
 def _train_multi_node() -> None:
@@ -174,6 +196,27 @@ def bench_multi_node():
     os.environ["NANOGPT_MAX_ITERS"] = "200"
     os.environ["NANOGPT_PROFILE"] = "true"
     _train_multi_node()
+
+
+@app.function(
+    gpu=f"{GPU_TYPE}:{n_proc_per_node}",
+    mounts=MOUNTS,
+    volumes={
+        "/vol": volume,
+        # Mount a Volume where NanoGPT outputs checkpoints.
+        "/root/out": volume_model_output,
+    },
+    timeout=2* 60 * 60, # should always be faster than 2 hours
+)
+@modal.experimental.clustered(n_nodes)
+def speedrun_multi_node():
+    """
+    Follow https://github.dev/KellerJordan/modded-nanogpt's benchmark rules to test
+    multi-node scaling performance. 
+    """
+    os.environ["NANOGPT_SPEEDRUN"] = "true"
+    _train_multi_node()
+
 
 @app.function(
     gpu=GPU_TYPE,

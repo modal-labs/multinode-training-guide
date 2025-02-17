@@ -29,11 +29,15 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+# Whether to do a https://github.dev/KellerJordan/modded-nanogpt style speedrun test.
+speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
+speedrun_target_eval_loss = 3.28
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = "out"
-eval_interval = 2_000
+# every how many steps to evaluate val loss? 0 for only at the end
+eval_interval = 2_000 if not speedrun else 125 # 125 is used in modded-nanogpt
 log_interval = 1
 eval_iters = 200
 eval_only = False  # if True, script exits right after the first eval
@@ -328,13 +332,21 @@ profiler = nullcontext() if not profile else torch.profiler.profile(
     with_modules=False,  # only for torchscript models atm
 )
 
+if speedrun and master_process:
+    print("Speedrun mode enabled! 🏎️ 🏍️ 🐎 🏃‍♀️")
+
 # training loop
 X, Y = get_batch("train")  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
 running_mfu = -1.0
+training_time_ms = 0
+# Track another t0, separate from the original t0 which cares only about iter time.
+# This t0 cares about overall training time, and is used in speedrun mode.
+training_time_t0 = time.perf_counter()
 while True:
+
     with profiler:
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -343,10 +355,21 @@ while True:
 
         # evaluate the loss on train/val sets and write checkpoints
         if iter_num % eval_interval == 0 and master_process:
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - training_time_t0)
+
             losses = estimate_loss()
             print(
-                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} train_time:{training_time_ms:.0f}ms"
             )
+            if speedrun and losses["val"] < speedrun_target_eval_loss:
+                print(f"Speedrun target eval loss {speedrun_target_eval_loss} reached! 🏆")
+                # we must teardown or else the program will hang waiting for other processes
+                if ddp:
+                    destroy_process_group()
+                break
+
             if wandb_log:
                 wandb.log(
                     {
@@ -357,7 +380,7 @@ while True:
                         "mfu": running_mfu * 100,  # convert to percentage
                     }
                 )
-            if losses["val"] < best_val_loss or always_save_checkpoint:
+            if (losses["val"] < best_val_loss or always_save_checkpoint) and not speedrun:
                 best_val_loss = losses["val"]
                 if iter_num > 0:
                     checkpoint = {
@@ -370,6 +393,9 @@ while True:
                     }
                     print(f"saving checkpoint to {out_dir}")
                     torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+            # start the clock again
+            torch.cuda.synchronize()
+            training_time_t0 = time.perf_counter()
         if iter_num == 0 and eval_only:
             break
 
