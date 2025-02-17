@@ -11,6 +11,7 @@ Use this repository to learn how to build distributed training jobs on Modal.
 # Examples
 
 - [**`resnet50/`**](resnet50/) training a ResNet50 model on the ImageNet dataset.
+- [**`nanoGPT/`**](nanoGPT/) training Karpathy's nanoGPT reproduction of OpenAI's GPT-2.
 
 # Documentation
 
