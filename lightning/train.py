@@ -26,6 +26,7 @@ def main():
     model, optimizer = fabric.setup(model, optimizer)
     train_dataloader = fabric.setup_dataloaders(train_dataloader)
 
+    max_steps = len(train_dataloader)
     for batch_idx, batch in enumerate(train_dataloader):
         input, target = batch
         output = model(input, target)
@@ -35,7 +36,7 @@ def main():
         optimizer.zero_grad()
 
         if batch_idx % 10 == 0:
-            fabric.print(f"iteration: {batch_idx} - loss {loss.item():.4f}")
+            fabric.print(f"iteration: {batch_idx}/{max_steps} - loss {loss.item():.4f}")
 
 
 if __name__ == "__main__":

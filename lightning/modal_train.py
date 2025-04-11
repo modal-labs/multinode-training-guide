@@ -76,7 +76,7 @@ def train_single_node():
 def train_multi_node():
     """
     Train the model on a multi-node cluster with N GPUs per node (typically 8).
-    Good cluster scale performance should result in a ~linear speedup as the number of nodes
+    Optimal cluster scale performance should result in a ~linear speedup as the number of nodes
     is increased.
     """
 
