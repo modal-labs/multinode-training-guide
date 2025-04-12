@@ -145,10 +145,6 @@ def speedrun_modded_single_node():
     """
     print(os.environ["MODAL_TASK_ID"])
     from torch.distributed.run import parse_args, run
-
-    # Symlink the training data in our volume to the place that nanoGPT expects it.
-    os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
-    os.symlink("/vol/val.bin", "/root/data/openwebtext/val.bin")
     args = [
         f"--nproc-per-node={n_proc_per_node}",
         "/root/train_modded.py",
@@ -284,3 +280,41 @@ def bench_single_gpu(profile: bool = False):
     ]
     print(f"Running torchrun with args: {' '.join(args)}")
     run(parse_args(args))
+
+
+@app.function(
+    gpu=f"H100!:{n_proc_per_node}",
+    mounts=MOUNTS,
+    secrets=[
+        # Required for connecting to Weights & Biases from within the Modal container.
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    volumes={
+        "/vol": volume,
+    },
+    timeout=60 * 60 * 24,
+    image=(
+        base_image
+        .pip_install("git+https://github.com/matttreed/diloco-sim.git@1532cace")
+        .add_local_dir(
+            LOCAL_CODE_DIR,
+            remote_path=REMOTE_CODE_DIR,
+        )
+    ),
+)
+def train_diloco_single_node():
+    """
+    Train using DiLoCo (Distributed Low Communication).
+    """
+    print(f"task id: {os.environ['MODAL_TASK_ID']}")
+
+    # TODO(Jonathon): Using torchrun is hanging
+    # from torch.distributed.run import parse_args, run
+    # args = [
+    #     f"--nproc-per-node={n_proc_per_node}",
+    #     "/root/train_diloco.py",
+    # ]
+    # print(f"Running torchrun with args: {' '.join(args)}")
+    # run(parse_args(args))
+    import subprocess
+    subprocess.run(["python", "/root/train_diloco.py"], check=True)
