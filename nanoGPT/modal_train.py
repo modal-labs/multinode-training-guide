@@ -172,8 +172,8 @@ def _train_multi_node() -> None:
         print(f"main container's address: {main_ip_addr}")
 
     # "In particular, if you don't have Infiniband then also prepend ..."
-    # As of Feb 2025 Modal does not (yet) support Infiniband.
-    os.environ["NCCL_IB_DISABLE"] = "1"
+    # As of April 2025 Modal does support Infiniband, so we don't need to disable it.
+    os.environ["NCCL_IB_DISABLE"] = ""
 
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
