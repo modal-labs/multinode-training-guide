@@ -55,13 +55,13 @@ def export_rdma_env():
     os.environ["NCCL_IB_ADDR_FAMILY"] = "AF_INET"
     os.environ["NCCL_IB_GID_INDEX"] = "3"  # OCI's IPv4‑mapped GID index
     os.environ["NCCL_IB_HCA"] = (
-        "=mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_9,mlx5_10,mlx5_11,mlx5_12"
+        "mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
     )
-    os.environ["NCCL_IB_MERGE_NICS"] = "0"
 
 
 @app.function(
     gpu="H100:8",
+    # RDMA is currently only supported on OCI in us-chicago-1
     cloud="oci",
     region="us-chicago-1",
     image=image,

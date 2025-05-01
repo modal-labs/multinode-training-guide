@@ -25,7 +25,7 @@ base_image = (
     # as well as git, requiring that we annoyingly install without it the first time.
     #
     # ref: https://github.com/astral-sh/uv/issues/6437#issuecomment-2535324784
-    .apt_install("git")
+    .apt_install("git", "libibverbs-dev", "libibverbs1")
     # https://github.com/karpathy/nanoGPT?tab=readme-ov-file#install
     # TODO: why doesn't karpathy pin these?
     .pip_install("torch", "transformers", "datasets", "tiktoken", "wandb", "tqdm")
@@ -42,9 +42,42 @@ volume_model_output = modal.Volume.from_name(
 
 
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
-n_nodes = 4
+n_nodes = 2
 # Typically this matches the number of GPUs per container.
 n_proc_per_node = 8
+
+rdma_scheduling_constraints = {
+    "cloud": "oci",
+    "region": "us-chicago-1",
+    "experimental_options": {
+        "rdma_enabled": "1",
+    },
+}
+
+
+def export_rdma_env():
+    os.environ["LD_LIBRARY_PATH"] = (
+        f"{os.environ.get('LD_LIBRARY_PATH', '')}:/usr/local/lib"
+    )
+    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["LOGLEVEL"] = "DEBUG"
+    os.environ["NCCL_IB_SPLIT_DATA_ON_QPS"] = "0"
+    os.environ["NCCL_IB_QPS_PER_CONNECTION"] = "4"
+    os.environ["NCCL_IB_TC"] = "41"
+    os.environ["NCCL_IB_SL"] = "0"
+    os.environ["NCCL_IB_TIMEOUT"] = "22"
+
+    # Control‑plane (TCP) — stays on eth1, uses IPv6
+    os.environ["NCCL_SOCKET_IFNAME"] = "eth1"
+    os.environ["NCCL_SOCKET_FAMILY"] = "AF_INET6"
+
+    # Data‑plane (RDMA) — stays on the HCA ports, uses IPv4
+    os.environ["NCCL_IB_ADDR_FAMILY"] = "AF_INET"
+    os.environ["NCCL_IB_GID_INDEX"] = "3"  # OCI's IPv4‑mapped GID index
+    os.environ["NCCL_IB_HCA"] = (
+        "mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+    )
+
 
 MOUNTS = []
 
@@ -160,6 +193,8 @@ def speedrun_modded_single_node():
 def _train_multi_node() -> None:
     from torch.distributed.run import parse_args, run
 
+    export_rdma_env()
+
     cluster_info = modal.experimental.get_cluster_info()
     # which container am I?
     container_rank: int = cluster_info.rank
@@ -170,10 +205,6 @@ def _train_multi_node() -> None:
     print(f"hello from {container_id}, rank {container_rank} of {n_nodes}")
     if container_rank == 0:
         print(f"main container's address: {main_ip_addr}")
-
-    # "In particular, if you don't have Infiniband then also prepend ..."
-    # As of Feb 2025 Modal does not (yet) support Infiniband.
-    os.environ["NCCL_IB_DISABLE"] = "1"
 
     # Symlink the training data in our volume to the place that nanoGPT expects it.
     os.symlink("/vol/train.bin", "/root/data/openwebtext/train.bin")
@@ -202,6 +233,7 @@ def _train_multi_node() -> None:
         "/root/out": volume_model_output,
     },
     timeout=60 * 60 * 24,
+    **rdma_scheduling_constraints,
 )
 @modal.experimental.clustered(n_nodes)
 def train_multi_node():
@@ -222,6 +254,7 @@ def train_multi_node():
         "/root/out": volume_model_output,
     },
     timeout=60 * 60 * 24,
+    **rdma_scheduling_constraints,
 )
 @modal.experimental.clustered(n_nodes)
 def bench_multi_node():
@@ -245,6 +278,7 @@ def bench_multi_node():
         "/root/out": volume_model_output,
     },
     timeout=2 * 60 * 60,  # should always be faster than 2 hours
+    **rdma_scheduling_constraints,
 )
 @modal.experimental.clustered(n_nodes)
 def speedrun_multi_node():
