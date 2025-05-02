@@ -1,0 +1,23 @@
+name: sd-o1ema
+cluster:
+gpu_num:
+gpu_type:
+image: mosaicml/inference:latest
+replicas: 1
+integrations:
+  - integration_type: "git_repo"
+    git_repo: mosaicml/diffusion
+    git_branch: main
+    pip_install: .[all]
+model:
+  downloader: diffusion.inference.inference_model.download_checkpoint
+  download_parameters:
+    chkpt_path:  # Path to download the checkpoint to evaluate
+  model_handler: diffusion.inference.inference_model.StableDiffusionInference
+  model_parameters:
+    pretrained: false
+command: |
+  export PYTHONPATH=$PYTHONPATH:/code/diffusion
+  rm /usr/lib/python3/dist-packages/packaging-23.1.dist-info/REQUESTED
+  pip install --force-reinstall --no-deps packaging==23.1
+  pip install --upgrade xformers
