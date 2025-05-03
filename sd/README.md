@@ -32,10 +32,10 @@ Use `runc` for optimal performance.
 Performance without RDMA is around 2.8-2.95s/ba
 
 ```
-train 0%|         | 643/550000 [34:15<444:35:17,  2.91s/ba, loss/train/total=0
+train 0%|         | 643/550000 [34:15<444:35:17,  2.91ba/s, loss/train/total=0
 ```
 
-Performance with RDMA is around TODO
+Performance with RDMA is around 4.00ba/s, or about a 35% improvement 🚀.
 
 ```
 ...TODO

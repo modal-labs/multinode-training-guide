@@ -18,6 +18,12 @@ image = (
         "cd diffusion && pip install -e .",
     )
     .pip_install("jupyterlab")
+    .apt_install(
+        # Needed for RDMA.
+        "libibverbs-dev",
+        "libibverbs1",
+    )
+    .add_local_dir("diffusion", remote_path="/root/diffusion")
 )
 # This is in nathan-dev in production.
 latents_vol = modal.Volume.from_name("laion-aesthetics_v2_4.5-latents", version=2)
@@ -37,15 +43,41 @@ app = modal.App(
 n_gpus_per_node = 8
 n_nodes = 4
 
+def export_rdma_env():
+    os.environ["LD_LIBRARY_PATH"] = (
+        f"{os.environ.get('LD_LIBRARY_PATH', '')}:/usr/local/lib"
+    )
+    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["LOGLEVEL"] = "DEBUG"
+    os.environ["NCCL_IB_SPLIT_DATA_ON_QPS"] = "0"
+    os.environ["NCCL_IB_QPS_PER_CONNECTION"] = "4"
+    os.environ["NCCL_IB_TC"] = "41"
+    os.environ["NCCL_IB_SL"] = "0"
+    os.environ["NCCL_IB_TIMEOUT"] = "22"
+
+    # Control‑plane (TCP) — stays on eth1, uses IPv6
+    os.environ["NCCL_SOCKET_IFNAME"] = "eth1"
+    os.environ["NCCL_SOCKET_FAMILY"] = "AF_INET6"
+
+    # Data‑plane (RDMA) — stays on the HCA ports, uses IPv4
+    os.environ["NCCL_IB_ADDR_FAMILY"] = "AF_INET"
+    os.environ["NCCL_IB_GID_INDEX"] = "3"  # OCI's IPv4‑mapped GID index
+    os.environ["NCCL_IB_HCA"] = (
+        "mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
+    )
 
 @app.function(
-    mounts=[modal.Mount.from_local_dir("diffusion", remote_path="/root/diffusion")],
     timeout=60 * 60 * 24,
     gpu=f"H100:{n_gpus_per_node}",
     retries=modal.Retries(initial_delay=0.0, max_retries=10),
+    # RDMA is currently only supported on OCI in us-chicago-1
+    cloud="oci",
+    region="us-chicago-1",
+    image=image,
+    experimental_options={"rdma_enabled": "1"},
 )
 @modal.experimental.clustered(size=n_nodes)
-def train():
+def train(rdma: bool = False):
     multinode_flags = ""
     os.environ["HYDRA_FULL_ERROR"] = "1"
 
@@ -55,6 +87,10 @@ def train():
             "CLOUD_PROVIDER_OCI",
         ):
             raise ValueError("Only GCP and OCI are supported")
+
+        if rdma:
+            print("Exporting RDMA environment variables")
+            export_rdma_env()
 
         # os.environ["NCCL_TOPO_DUMP_FILE"] = "/latents/nccl_topo.txt"
         # os.environ["NCCL_GRAPH_DUMP_FILE"] = "/latents/nccl_graph.txt"
@@ -88,7 +124,6 @@ def wait_for_port(url: str, q: Queue):
 
 
 @app.function(
-    mounts=[modal.Mount.from_local_dir("diffusion", remote_path="/root/diffusion")],
     timeout=60 * 60 * 24,
     gpu="A100",
     cpu=8,
@@ -146,9 +181,9 @@ def verify_shard(shard_path: str):
 
 
 @app.local_entrypoint()
-def main():
+def main(rdma: bool = False):
     # To start the training job:
-    train.remote()
+    train.remote(rdma)
 
     # To verify MDS shard correctness:
     # verify_shard.remote("/latents/data")
