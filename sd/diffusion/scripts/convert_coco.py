@@ -5,6 +5,7 @@
 
 import json
 from argparse import ArgumentParser
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -28,8 +29,9 @@ args.add_argument('--remote', type=str, default='', help='Remote path to upload 
 def main(args):
     """Converts coco captions to MDS."""
     data_path = args.data_path
-    captions_path = args.captions_path
-    data = json.loads(captions_path)
+    captions_path = args.annotation_path
+    print(f"loading JSON from captions_path: {captions_path}")
+    data = json.loads(Path(captions_path).read_text(encoding="utf-8"))
 
     # create {image_id: list[captions]} dictionary
     coco_captions = {}

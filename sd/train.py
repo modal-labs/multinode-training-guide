@@ -29,7 +29,7 @@ image = (
 latents_vol = modal.Volume.from_name("laion-aesthetics_v2_4.5-latents", version=2)
 # This is in nathan-dev in dev_cluster.
 # latents_vol = modal.Volume.from_name("laion-aesthetics_v2_4.5-latents")
-# The Weigths & Biases secret 'wandb-secret-modal-labs' is in the nathan-dev namespace
+# The Weights & Biases secret 'wandb-secret-modal-labs' is in the nathan-dev namespace
 # and points at @thundergolfer's personal Weights & Biases account. 'wandb-secret' in the
 # nathan-dev namespace points at @thecodingwizard's personal Weights & Biases account.
 wandb_secret = modal.Secret.from_name("wandb-secret-modal-labs")
