@@ -16,6 +16,7 @@ LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_CODE_DIR = "/root/"
 REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 REMOTE_BENCH_SCRIPT_PATH = "/root/bench.py"
+REMOTE_INFERENCE_SCRIPT_PATH = "/root/sample.py"
 GPU_TYPE = "H100"
 
 
@@ -79,11 +80,7 @@ def export_rdma_env():
     )
 
 
-MOUNTS = []
-
-
 @app.function(
-    mounts=MOUNTS,
     timeout=3600,
     cpu=(0.2, 16),  # Set higher limit to avoid CPU bottleneck.
     volumes={
@@ -115,7 +112,6 @@ def _train_single_node():
 
 @app.function(
     gpu=f"A100:{n_proc_per_node}",
-    mounts=MOUNTS,
     secrets=[
         # Required for connecting to Weights & Biases from within the Modal container.
         modal.Secret.from_name("wandb-secret"),
@@ -138,7 +134,6 @@ def train_single_node():
 
 @app.function(
     gpu=f"H100:{n_proc_per_node}",
-    mounts=MOUNTS,
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -157,7 +152,6 @@ def speedrun_single_node():
 
 @app.function(
     gpu=f"H100!:{n_proc_per_node}",
-    mounts=MOUNTS,
     volumes={
         "/data/fineweb10B": volume,
     },
@@ -222,7 +216,6 @@ def _train_multi_node() -> None:
 
 @app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
-    mounts=MOUNTS,
     secrets=[
         # Required for connecting to Weights & Biases from within the Modal container.
         modal.Secret.from_name("wandb-secret"),
@@ -247,7 +240,6 @@ def train_multi_node():
 
 @app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
-    mounts=MOUNTS,
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -271,7 +263,6 @@ def bench_multi_node():
 
 @app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
-    mounts=MOUNTS,
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -292,7 +283,6 @@ def speedrun_multi_node():
 
 @app.function(
     gpu=GPU_TYPE,
-    mounts=MOUNTS,
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -318,3 +308,25 @@ def bench_single_gpu(profile: bool = False):
     ]
     print(f"Running torchrun with args: {' '.join(args)}")
     run(parse_args(args))
+
+
+@app.function(
+    gpu=GPU_TYPE,
+    volumes={
+        "/root/out": volume_model_output,
+    },
+)
+def run_inference(prompt: str | None = None):
+    """
+    Run the inference script, which generates text from a trained model
+    stored in a modal.Volume.
+    """
+    prompt = prompt or "What is the answer to life, the universe, and everything?"
+    args = [
+        "--init_from=resume",
+        "--out_dir=/root/out/ckpts",
+        "--num_samples=10",
+        "--max_new_tokens=100",
+        f"--start='{prompt}'",
+    ]
+    subprocess.run(["python", REMOTE_INFERENCE_SCRIPT_PATH, *args], check=True)
