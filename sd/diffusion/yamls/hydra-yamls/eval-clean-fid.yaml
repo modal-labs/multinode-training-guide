@@ -11,23 +11,21 @@ model: # This is the model to evaluate
   encode_latents_in_fp16: true
   fsdp: false
 eval_dataloader:
-  _target_: diffusion.datasets.build_streaming_image_caption_dataloader
-  remote:
-    - # Remote(s) for the evaluation dataset go here
-  local:
-    - # Local(s) for the evaluation dataset go here
+  _target_: diffusion.datasets.image_caption.build_streaming_image_caption_dataloader
+  remote: /vol/coco/mds/
+  local: /tmp/mds1/
   batch_size: ${batch_size}
   resize_size: ${image_size}
   image_key: image # This should be set to the image key specific to the eval dataset
   caption_key: captions # This should be set to the caption key specific to the eval dataset
-  transform: # How to transform the images for evaluation
-    - _target_ : diffusion.datasets.laion.transforms.LargestCenterSquare
-      size: ${image_size}
-    - _target_: torchvision.transforms.ToTensor
+  # transform: # How to transform the images for evaluation
+  #   - _target_ : diffusion.datasets.laion.transforms.LargestCenterSquare
+  #     size: ${image_size}
+  #   - _target_: torchvision.transforms.ToTensor
   dataloader_kwargs:
     drop_last: false
     shuffle: false
-    num_workers: 8
+    num_workers: 1
     pin_memory: true
   streaming_kwargs:
     shuffle: false
@@ -42,7 +40,7 @@ logger:
     group: ${name}
 evaluator:
   _target_: diffusion.evaluation.clean_fid_eval.CleanFIDEvaluator
-  load_path: # Path to the checkpoint to load and evaluate.
+  load_path: /models/latest-rank0.pt
   guidance_scales:
     - 1.0
     - 1.5

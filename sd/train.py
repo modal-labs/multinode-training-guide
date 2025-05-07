@@ -180,6 +180,25 @@ def verify_shard(shard_path: str):
     return True
 
 
+@app.function(
+    timeout=60 * 20,
+    volumes={"/vol": modal.Volume.from_name(
+        "sd-coco-volumefs1",
+        version=1,
+    ), "/models": modal.Volume.from_name("sd-checkpoints", version=1)},
+    gpu="H100",
+)
+def offline_eval():
+    # TODO: gave up on getting this working. Code has so many issues I think you'd have to understand almost all 
+    # of it to get it working. Just kept stepping into rakes.
+    subprocess.run(
+        "composer run_eval.py --config-path yamls/hydra-yamls --config-name eval-clean-fid",
+        shell=True,
+        check=True,
+        cwd="/root/diffusion/",
+    )
+
+
 @app.local_entrypoint()
 def main(rdma: bool = False):
     # To start the training job:

@@ -65,7 +65,7 @@ class CleanFIDEvaluator:
                  size: int = 256,
                  batch_size: int = 16,
                  image_key: str = 'image',
-                 caption_key: str = 'caption',
+                 caption_key: str = 'captions',
                  load_strict_model_weights: bool = True,
                  loggers: Optional[List[LoggerDestination]] = None,
                  seed: int = 17,
