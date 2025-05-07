@@ -1,0 +1,88 @@
+project: sd-2 # Insert wandb project name
+name: sd-2-train # Insert wandb run name
+seed: 17
+eval_first: false
+algorithms:
+  low_precision_groupnorm:
+    attribute: unet
+    precision: amp_fp16
+  low_precision_layernorm:
+    attribute: unet
+    precision: amp_fp16
+model:
+  _target_: diffusion.models.models.stable_diffusion_2
+  pretrained: false
+  precomputed_latents: true
+  encode_latents_in_fp16: true
+  fsdp: false  # Specify true if you want to use FSDP, and also uncomment the FSDP code below.
+  val_metrics:
+    - _target_: torchmetrics.MeanSquaredError
+dataset:
+  train_batch_size: 2048 # Global training batch size
+  eval_batch_size: 1024  # Global evaluation batch size
+  train_dataset:
+    _target_: diffusion.datasets.laion.laion.build_streaming_laion_dataloader
+    local: /tmp/mds-cache
+    remote: /latents/medium-256-512  # Change this path to reflect the path to the dataset (volume or local).
+    tokenizer_name_or_path: stabilityai/stable-diffusion-2-base
+    caption_drop_prob: 0.1
+    resize_size: 256
+    drop_last: true
+    shuffle: true
+    prefetch_factor: 2
+    num_workers: 8
+    persistent_workers: true
+    pin_memory: true
+    download_timeout: 300
+    num_canonical_nodes: 64
+  # eval_dataset:
+  #   _target_: diffusion.datasets.coco.coco_captions.build_streaming_cocoval_dataloader
+  #   remote:  # Path to object store bucket
+  #   local: # Path to local dataset cache
+  #   resize_size: 256
+  #   prefetch_factor: 2
+  #   num_workers: 8
+  #   persistent_workers: True
+  #   pin_memory: True
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.01
+scheduler:
+  _target_: composer.optim.LinearWithWarmupScheduler
+  t_warmup: 10000ba
+  alpha_f: 1.0
+logger:
+  wandb:
+    _target_: composer.loggers.wandb_logger.WandBLogger
+    name: sd-2
+    project: sd-2
+callbacks:
+  speed_monitor:
+    _target_: composer.callbacks.speed_monitor.SpeedMonitor
+    window_size: 10
+  lr_monitor:
+    _target_: composer.callbacks.lr_monitor.LRMonitor
+  memory_monitor:
+    _target_: composer.callbacks.memory_monitor.MemoryMonitor
+  runtime_estimator:
+    _target_: composer.callbacks.runtime_estimator.RuntimeEstimator
+  optimizer_monitor:
+    _target_: composer.callbacks.OptimizerMonitor
+trainer:
+  _target_: composer.Trainer
+  device: gpu
+  max_duration: 550000ba
+  eval_interval: 10000ba
+  device_train_microbatch_size: 64
+  run_name: ${name}
+  seed: ${seed}
+  save_folder:  /tmp/save # Insert path to save folder or bucket
+  save_interval: 10000ba
+  save_overwrite: true
+  autoresume: false
+  # profiler:  # Uncomment if you want to use the profiler, defined in diffusion/diffusion/profiler.py
+  #   _target_: diffusion.profiler.profiler
+  # parallelism_config:  # Uncomment if you want to use FSDP, and also uncomment the FSDP code above.
+  #   fsdp:
+  #     sharding_strategy: "SHARD_GRAD_OP"
