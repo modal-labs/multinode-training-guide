@@ -7,7 +7,7 @@ Simple NCCL bandwidth benchmark for Modal's multi-node training infrastructure. 
 **2 x 8 x H100, multi-node:**
 
 ```bash
-modal run main.py
+modal run modal_train.py
 ```
 
 ## Performance Metrics

@@ -35,45 +35,16 @@ image = (
 app = modal.App("multinode-benchmark")
 
 
-def export_rdma_env():
-    os.environ["LD_LIBRARY_PATH"] = (
-        f"{os.environ.get('LD_LIBRARY_PATH', '')}:/usr/local/lib"
-    )
-    os.environ["NCCL_DEBUG"] = "INFO"
-    os.environ["LOGLEVEL"] = "DEBUG"
-    os.environ["NCCL_IB_SPLIT_DATA_ON_QPS"] = "0"
-    os.environ["NCCL_IB_QPS_PER_CONNECTION"] = "4"
-    os.environ["NCCL_IB_TC"] = "41"
-    os.environ["NCCL_IB_SL"] = "0"
-    os.environ["NCCL_IB_TIMEOUT"] = "22"
-
-    # Control‑plane (TCP) — stays on eth1, uses IPv6
-    os.environ["NCCL_SOCKET_IFNAME"] = "eth1"
-    os.environ["NCCL_SOCKET_FAMILY"] = "AF_INET6"
-
-    # Data‑plane (RDMA) — stays on the HCA ports, uses IPv4
-    os.environ["NCCL_IB_ADDR_FAMILY"] = "AF_INET"
-    os.environ["NCCL_IB_GID_INDEX"] = "3"  # OCI's IPv4‑mapped GID index
-    os.environ["NCCL_IB_HCA"] = (
-        "mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17"
-    )
-
-
 @app.function(
     gpu="H100:8",
-    # RDMA is currently only supported on OCI in us-chicago-1
     cloud="oci",
-    region="us-chicago-1",
     image=image,
-    experimental_options={"rdma_enabled": "1"},
 )
-@modal.experimental.clustered(size=N_NODES)
+@modal.experimental.clustered(size=N_NODES, rdma=True)
 def run_benchmark():
     """Run a simple benchmark script that passes around a tensor of size 500000x2000."""
 
     from torch.distributed.run import parse_args, run
-
-    export_rdma_env()
 
     cluster_info = modal.experimental.get_cluster_info()
     # which container am I?
