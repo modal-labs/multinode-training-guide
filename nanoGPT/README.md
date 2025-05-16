@@ -11,10 +11,8 @@ GPU configurations:
 | 8xA100 | ~360ms | ~47.84% |
 | 8xH100 | ~230ms | ~25.4% |
 | 8xH200 | ~220ms | ~25.0% |
-| 2x8xH100 | 250-350ms | ~10.00% |
-
-> [!WARNING]
-> MFU performance on multi-node training is not yet optimized.
+| 2x8xH100 | 250-350ms | ~23.5% |
+| 4x8xH100 | ~180-200ms | ~17% |
 
 ### NanoGPT Speedrun Performance
 
@@ -24,13 +22,12 @@ GPU configurations:
 | Modal nanoGPT (this repo) | 1 | 8x A100 80BG SXM | 2025-02-16 | 45.62 mins | 0.99x |
 | Modal nanoGPT (this repo) | 1 | 8x H100 SXM | 2025-02-16 | 24.93 mins | 1.805x
 | Modal nanoGPT (this repo) | 1 | 8x H**2**00 SXM | 2025-02-16 | 23.97 mins | 1.88x |
-| Modal clustered nanoGPT (this repo) | 2 | 2x8xH100 SXM | 2025-04-11 | 23.41 mins | 1.88x ⚠️ |
-| Modal clustered nanoGPT (this repo) | 4 | 4x8xH100 SXM | 2025-04-11 | 46.34 mins | 0.96x ⚠️ | 
+| Modal clustered nanoGPT (this repo) | 2 | 2x8xH100 SXM | 2025-04-23 | 16.1 mins | 2.79x |
+| Modal clustered nanoGPT (this repo) | 4 | 4x8xH100 SXM | 2025-04-23 | 11 mins | 4.09x | 
 | [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` | 1 | 8x H100 SXM | 2025-02-01 | 2.997 mins | 15.01x |
 | [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` (on Modal, `gvisor`) | 1 | 8x H100 SXM | 2025-04-12 | 3.229 mins | 13.93x |
-| [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` (on Modal, `runc`) | 1 | 8x H100 SXM | 2025-04-12 | 3.03 mins | 14.85x |
+<!--| [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` (on Modal, legacy runtime) | 1 | 8x H100 SXM | 2025-04-12 | 3.03 mins | 14.85x | -->
 
-* ⚠️ Multi-node performance is currently suffering a lot from inter-node communication overhead. Run the PyTorch profiler to analyze.
 * There's a lot of room for improvement on single node performance by following [modded-nanogpt's](https://github.dev/KellerJordan/modded-nanogpt) lead. See `train_modded.py` for a copy of that repo's current record, modified trivially for running on Modal.
 * To reproduction the `gvisor` modded-nanogpt runs on Modal use `modal run modal_train.py::speedrun_modded_single_node`.
 
