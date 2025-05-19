@@ -1,7 +1,6 @@
 import os
 from imagenet_classes import IMAGENET2012_CLASS_INDEXES
 import modal
-import webdataset as wds
 
 app = modal.App(
     "imagenet-download",
@@ -9,6 +8,7 @@ app = modal.App(
         modal.Image.debian_slim()
         .pip_install("webdataset", "huggingface_hub[cli]", "hf_transfer")
         .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+        .add_local_python_source("imagenet_classes")
     ),
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
@@ -42,6 +42,7 @@ def imagenet_samples(dir: str, has_cls: bool = True):
 
 @app.function(timeout=60 * 60 * 24)
 def download_imagenet(split: str, file: str, start_shard: int):
+    import webdataset as wds
     assert split in ["train", "val", "test"]
 
     os.makedirs(f"/data/{split}", exist_ok=True)
