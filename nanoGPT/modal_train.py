@@ -101,7 +101,7 @@ def train_single_node():
 
 
 @app.function(
-    gpu=f"H100:{n_proc_per_node}",
+    gpu=f"H100!:{n_proc_per_node}",
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -227,6 +227,7 @@ def bench_multi_node():
     # Enable profiling.
     os.environ["NANOGPT_MAX_ITERS"] = "200"
     os.environ["NANOGPT_PROFILE"] = "true"
+    os.environ["NANOGPT_BENCH"] = "true"
     _train_multi_node()
 
 

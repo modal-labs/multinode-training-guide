@@ -31,6 +31,8 @@ from model import GPTConfig, GPT
 
 # Whether to do a https://github.dev/KellerJordan/modded-nanogpt style speedrun test.
 speedrun = os.environ.get("NANOGPT_SPEEDRUN", "false").lower() in ("true", "1")
+# Whether we're benchmarking - this calculates MFU on each iteration.
+bench = os.environ.get("NANOGPT_BENCH", "false").lower() in ("true", "1")
 speedrun_target_eval_loss = 3.28
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -111,9 +113,9 @@ if ddp:
     seed_offset = ddp_rank  # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert (
-        gradient_accumulation_steps % ddp_world_size == 0
-    ), f"{gradient_accumulation_steps=} must be divisible by {ddp_world_size=}"
+    assert gradient_accumulation_steps % ddp_world_size == 0, (
+        f"{gradient_accumulation_steps=} must be divisible by {ddp_world_size=}"
+    )
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
@@ -241,9 +243,9 @@ elif init_from.startswith("gpt2"):
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
-    model_args[
-        "block_size"
-    ] = block_size  # so that the checkpoint will have the right value
+    model_args["block_size"] = (
+        block_size  # so that the checkpoint will have the right value
+    )
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -268,7 +270,11 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(
+        model,
+        device_ids=[ddp_local_rank],
+        bucket_cap_mb=512,
+    )
 
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -317,7 +323,11 @@ if profile:
 
 def trace_handler(prof):
     print("Handling torch profiler trace...")
-    torch.profiler.tensorboard_trace_handler("/root/out/bench_log")(prof)
+    task_id = os.environ["MODAL_TASK_ID"]
+    rank = os.environ["RANK"]
+    torch.profiler.tensorboard_trace_handler(f"/root/out/bench_log/{task_id}/{rank}")(
+        prof
+    )
 
 
 profiler = (
@@ -353,8 +363,8 @@ training_time_ms = 0
 # Track another t0, separate from the original t0 which cares only about iter time.
 # This t0 cares about overall training time, and is used in speedrun mode.
 training_time_t0 = time.perf_counter()
-while True:
-    with profiler:
+with profiler:
+    while True:
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
@@ -449,16 +459,21 @@ while True:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * gradient_accumulation_steps
-            if local_iter_num >= 5:  # let the training loop settle a bit
+
+            out_str = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms"
+
+            # MFU calculation takes a ~70ms hit, so only do it if we're benchmarking.
+            if bench and local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(
                     batch_size * gradient_accumulation_steps, dt
                 )
                 running_mfu = (
                     mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
                 )
-            print(
-                f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
-            )
+                out_str += f", mfu {running_mfu * 100:.2f}%"
+
+            print(out_str)
+
         iter_num += 1
         local_iter_num += 1
 
