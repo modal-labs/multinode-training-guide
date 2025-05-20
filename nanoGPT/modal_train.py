@@ -21,7 +21,7 @@ GPU_TYPE = "H100"
 
 
 base_image = (
-    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
     # flash-attn has an undeclared dependency on PyPi packages 'torch' and 'packaging',
     # as well as git, requiring that we annoyingly install without it the first time.
     #
@@ -126,8 +126,11 @@ def speedrun_single_node():
     timeout=2 * 60 * 60,  # should always be faster than 2 hours
     image=(
         base_image.pip_install(
-            "torch==2.7.0.dev20250311+cu126",
-            index_url="https://download.pytorch.org/whl/nightly/cu126",
+            # Modded nanogpt requires a nightly version of torch which is no longer hosted.
+            # Use this custom hosted version instead.
+            # https://github.com/KellerJordan/modded-nanogpt/issues/91#issuecomment-2831908966
+            "https://github.com/YouJiacheng/pytorch-nightly-whl-archive/releases/download/v2.7.0.dev20250208/torch-2.7.0.dev20250208+cu126-cp312-cp312-manylinux_2_28_x86_64.whl",
+            extra_index_url="https://download.pytorch.org/whl/nightly/cu126",
         ).add_local_dir(
             LOCAL_CODE_DIR,
             remote_path=REMOTE_CODE_DIR,
