@@ -463,6 +463,7 @@ with profiler:
             out_str = f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms"
 
             # MFU calculation takes a ~70ms hit, so only do it if we're benchmarking.
+            # TODO(pawalt): figure out why mfu calculation is so expensive
             if bench and local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(
                     batch_size * gradient_accumulation_steps, dt

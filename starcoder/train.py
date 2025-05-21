@@ -110,6 +110,7 @@ def download_llama2(cache_dir: str | None = None):
     return model, tok
 
 
+# TODO(pawalt): offload this to a separate thread so it doesn't block the main training loop
 def build_packed_ds(data_dir: Path, tokenizer, buffer_size: int, block: int):
     """Builds a packed dataset for training by:
     1. Loading arrow files from Go and Rust directories
