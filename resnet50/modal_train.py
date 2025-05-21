@@ -17,7 +17,9 @@ image = (
     .apt_install("curl", "unzip", "vim", "git", "htop")
     .pip_install("torch==2.5.1", "torchvision==0.20.1", "nvidia-dali-cuda120==1.43.0")
     # needed until they update PyPI (https://github.com/webdataset/webdataset/issues/415)
-    .pip_install("git+https://github.com/thecodingwizard/webdataset.git@e16ee8ecc8824351281e933beda6c25e539e9794")
+    .pip_install(
+        "git+https://github.com/thecodingwizard/webdataset.git@e16ee8ecc8824351281e933beda6c25e539e9794"
+    )
     .pip_install("wandb==0.18.7")
     .pip_install("tqdm==4.67.0")
     .pip_install("pydantic==2.10.5")  # used by training.torchrun utility
@@ -32,7 +34,7 @@ app = modal.App(
         modal.Secret.from_name("huggingface-secret"),
         # Required for connecting to Weights & Biases from within the Modal container.
         # Uncomment the line below to use Weights & Biases.
-        modal.Secret.from_name("wandb"),
+        modal.Secret.from_name("wandb-secret"),
     ],
     volumes={
         "/data": modal.Volume.from_name("imagenet"),

@@ -16,7 +16,7 @@ model_vol = modal.Volume.from_name(
     create_if_missing=True,
 )
 
-hf_secret = modal.Secret.from_name("huggingface-token")
+hf_secret = modal.Secret.from_name("huggingface-secret")
 
 
 @app.function(

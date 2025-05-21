@@ -6,6 +6,7 @@
 
 - [ ] Example is documented with comments throughout, in a [_Literate Programming_](https://en.wikipedia.org/wiki/Literate_programming) style.
 - [ ] Example does _not_ require third-party dependencies to be installed locally
+- [ ] Example follows the [style guide](../STYLE_GUIDE.md)
 - [ ] Example pins its dependencies
   - [ ] Example pins container images to a stable tag, not a dynamic tag like `latest`
   - [ ] Example specifies a `python_version` for the base image, if it is used

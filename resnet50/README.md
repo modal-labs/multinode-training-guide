@@ -9,9 +9,7 @@ Training for more epochs should increase validation score to at least 80%.
 
 ## Step 1: Downloading Data
 
-You can experiment with `convert_to_webdataset.ipynb` locally to figure out how you want to download the data.
-
-To download the ImageNet dataset into a `modal.Volume` use `modal run imagenet_download.py`.
+To download the ImageNet dataset into a `modal.Volume` use `modal run imagenet_download.py::run_download`.
 After downloading has completed you should have contents in the `/data/` directory of your Volume like this:
 
 ```
@@ -28,6 +26,8 @@ After downloading has completed you should have contents in the `/data/` directo
 │ data/val_images.tar.gz     │ file │ 2024-10-18 22:29 UTC │ 6.2 GiB  │
 └────────────────────────────┴──────┴──────────────────────┴──────────┘
 ```
+
+To download other datasets you can experiment with `convert_to_webdataset.ipynb` locally.
 
 ## Step 2: Training
 

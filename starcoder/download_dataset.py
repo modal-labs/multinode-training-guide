@@ -12,7 +12,7 @@ vol = modal.Volume.from_name(
 )
 
 
-hf_secret = modal.Secret.from_name("huggingface-token")
+hf_secret = modal.Secret.from_name("huggingface-secret")
 
 app = modal.App(
     f"{DATASET_ID}-download",

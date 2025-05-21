@@ -25,7 +25,8 @@ model_vol = modal.Volume.from_name(
     create_if_missing=True,
 )
 
-hf_secret = modal.Secret.from_name("huggingface-token")
+hf_secret = modal.Secret.from_name("huggingface-secret")
+wandb_secret = modal.Secret.from_name("wandb-secret")
 
 app = modal.App(
     f"{DATASET_ID}-train",
@@ -52,8 +53,8 @@ class LaunchType(Enum):
         MODEL_MOUNT_PATH: model_vol,
     },
     secrets=[
-        modal.Secret.from_name("wandb-secret"),
-        modal.Secret.from_name("huggingface-token"),
+        wandb_secret,
+        hf_secret,
     ],
     cloud="oci",
     gpu="H100:8",

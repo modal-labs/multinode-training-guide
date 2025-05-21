@@ -6,7 +6,12 @@ app = modal.App(
     "imagenet-download",
     image=(
         modal.Image.debian_slim()
-        .pip_install("webdataset==0.2.111", "huggingface_hub[cli]==0.31.4", "hf_transfer==0.1.9", "nvidia-dali-cuda120==1.43.0")
+        .pip_install(
+            "webdataset==0.2.111",
+            "huggingface_hub[cli]==0.31.4",
+            "hf_transfer==0.1.9",
+            "nvidia-dali-cuda120==1.43.0",
+        )
         .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
         .add_local_python_source("imagenet_classes")
     ),
@@ -43,6 +48,7 @@ def imagenet_samples(dir: str, has_cls: bool = True):
 @app.function(timeout=60 * 60 * 24)
 def download_imagenet(split: str, file: str, start_shard: int):
     import webdataset as wds
+
     assert split in ["train", "val", "test"]
 
     os.makedirs(f"/data/{split}", exist_ok=True)
@@ -74,8 +80,8 @@ def download_imagenet(split: str, file: str, start_shard: int):
     print(f"Done with {file}")
 
 
-@app.local_entrypoint()
-def main():
+@app.function(timeout=60 * 60 * 24)
+def run_download():
     data_to_download = {
         "train": [
             "train_images_0.tar.gz",

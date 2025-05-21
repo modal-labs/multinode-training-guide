@@ -10,7 +10,7 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
 LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_CODE_DIR = "/root/"
-REMOTE_BENCH_SCRIPT_PATH = "/root/benchmark.py"
+REMOTE_BENCH_SCRIPT_PATH = "/root/train.py"
 
 N_NODES = 2
 N_PROC_PER_NODE = 8
