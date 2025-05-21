@@ -94,12 +94,11 @@ You can modify various aspects of the training:
 Sample consumption scales with the number of nodes and GPUs.
 This scaling is sublinear but can be improved by increasing the global batch size and tuning FSDP configurations.
 
-| Nodes | GPUs | Samples per minute |
-|-------|------|--------------------|
-| 2     | 8    | 7675               |
-| 4     | 8    | 4981               |
-| 8     | 8    | 2898               |
-
+| Nodes | GPUs | Samples per minute | Tokens per minute |
+|-------|------|--------------------|------------------|
+| 2     | 8    | 2898               | 6,151,645        |
+| 4     | 8    | 4981               | 10,625,570       |
+| 8     | 8    | 7675               | 16,357,785       |
 
 ## Contributing
 

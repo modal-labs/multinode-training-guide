@@ -61,7 +61,7 @@ class LaunchType(Enum):
     timeout=60 * 60 * 24,
 )
 @modal.experimental.clustered(n_nodes, rdma=True)
-def train_multi_node(launch_type: str):
+def train_multi_node(launch_type: str = "torchrun", profile: bool = False):
     """
     Performs multi-node training using either torchrun or Hugging Face Accelerate.
     Launch type can be either 'torchrun' or 'accelerate'.
@@ -113,6 +113,23 @@ def train_multi_node(launch_type: str):
             f"Weights & Biases: Project='{wandb_project_name}', Run='{current_run_name}'"
         )
 
+    script_args = [
+        "--data_dir",
+        DATASET_MOUNT_PATH,
+        "--output_dir",
+        f"{MODEL_MOUNT_PATH}/{current_run_name}",
+        "--epochs",
+        "2",
+        "--batch_per_device",
+        str(per_device_batch_size_config),
+        "--grad_accum",
+        str(grad_accum_config),
+        "--model_cache_dir",
+        MODEL_CACHE_DIR,
+    ]
+    if profile:
+        script_args.append("--profile")
+
     def _train_torchrun() -> None:
         from torch.distributed.run import parse_args, run
 
@@ -123,18 +140,7 @@ def train_multi_node(launch_type: str):
             f"--master-addr={main_ip_addr}",
             f"--master-port={main_port}",
             REMOTE_TRAIN_SCRIPT_PATH,
-            "--data_dir",
-            DATASET_MOUNT_PATH,
-            "--output_dir",
-            f"{MODEL_MOUNT_PATH}/{current_run_name}",
-            "--epochs",
-            "2",
-            "--batch_per_device",
-            str(per_device_batch_size_config),
-            "--grad_accum",
-            str(grad_accum_config),
-            "--model_cache_dir",
-            MODEL_CACHE_DIR,
+            *script_args,
         ]
         print(f"Executing torchrun with args: {' '.join(args)}")
         run(parse_args(args))
@@ -156,18 +162,7 @@ def train_multi_node(launch_type: str):
             "--mixed_precision",
             "bf16",
             REMOTE_TRAIN_SCRIPT_PATH,
-            "--data_dir",
-            DATASET_MOUNT_PATH,
-            "--output_dir",
-            f"{MODEL_MOUNT_PATH}/{current_run_name}",
-            "--epochs",
-            "2",
-            "--batch_per_device",
-            str(per_device_batch_size_config),
-            "--grad_accum",
-            str(grad_accum_config),
-            "--model_cache_dir",
-            MODEL_CACHE_DIR,
+            *script_args,
         ]
         print(f"Executing accelerate launch with: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)

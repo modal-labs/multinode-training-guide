@@ -40,6 +40,14 @@ from transformers import (
     AutoModelForCausalLM,
     DataCollatorForLanguageModeling,
 )
+
+from torch.profiler import (
+    profile,
+    schedule,
+    ProfilerActivity,
+    tensorboard_trace_handler,
+)
+from transformers.trainer_callback import TrainerCallback
 from trl import SFTTrainer, SFTConfig
 
 if os.environ.get("WANDB_PROJECT"):
@@ -47,6 +55,37 @@ if os.environ.get("WANDB_PROJECT"):
 
 
 MODEL_NAME = "meta-llama/Llama-2-7b-hf"
+
+
+class TorchProfilerCallback(TrainerCallback):
+    def __init__(
+        self,
+        wait,
+        warmup,
+        active,
+        repeat,
+        out_dir,
+        activities=(ProfilerActivity.CPU, ProfilerActivity.CUDA),
+    ):
+        self.prof = profile(
+            activities=list(activities),
+            schedule=schedule(wait=wait, warmup=warmup, active=active, repeat=repeat),
+            on_trace_ready=tensorboard_trace_handler(out_dir),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_flops=True,
+            with_modules=False,
+        )
+        self.prof.__enter__()
+
+    # 1 step == 1 optimizer update
+    def on_step_end(self, *_, **__):
+        self.prof.step()
+
+    # make sure files are flushed even on KeyboardInterrupt
+    def on_train_end(self, *_, **__):
+        self.prof.__exit__(None, None, None)
 
 
 def download_llama2(cache_dir: str | None = None):
@@ -144,6 +183,7 @@ def parse_args():
     p.add_argument("--batch_per_device", type=int, default=4)
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--block_size", type=int, default=4096, help="Context length tokens")
+    p.add_argument("--profile", action="store_true", help="Enable profiling")
 
     return p.parse_args()
 
@@ -173,6 +213,19 @@ def main():
     collator = DataCollatorForLanguageModeling(
         tokenizer, mlm=False, pad_to_multiple_of=8
     )
+
+    callbacks = []
+    if args.profile:
+        print("🔎 Profiling enabled")
+        profiler_callback = TorchProfilerCallback(
+            # Start profiling after 5 iterations. Profile 3 steps 3 times then stop.
+            warmup=5,
+            active=3,
+            repeat=3,
+            wait=0,
+            out_dir=f"{args.output_dir}/traces/{os.environ['MODAL_TASK_ID']}/{os.environ['RANK']}",
+        )
+        callbacks.append(profiler_callback)
 
     cfg = SFTConfig(
         output_dir=args.output_dir,
@@ -212,6 +265,7 @@ def main():
         train_dataset=train_ds,
         args=cfg,
         data_collator=collator,
+        callbacks=callbacks,
     )
 
     trainer.train()
