@@ -41,6 +41,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from trl import SFTTrainer, SFTConfig
+from torch.profiler import (
+    profile,
+    schedule,
+    ProfilerActivity,
+    tensorboard_trace_handler,
+)
+from transformers.trainer_callback import TrainerCallback
 
 if os.environ.get("WANDB_PROJECT"):
     import wandb
@@ -49,15 +56,51 @@ if os.environ.get("WANDB_PROJECT"):
 MODEL_NAME = "meta-llama/Llama-2-7b-hf"
 
 
+# New Profiler Callback Class
+class TorchProfilerCallback(TrainerCallback):
+    def __init__(
+        self,
+        wait,
+        warmup,
+        active,
+        repeat,
+        out_dir,
+        activities=(ProfilerActivity.CPU, ProfilerActivity.CUDA),
+    ):
+        self.prof = profile(
+            activities=list(activities),
+            schedule=schedule(wait=wait, warmup=warmup, active=active, repeat=repeat),
+            on_trace_ready=tensorboard_trace_handler(out_dir),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_flops=True,
+            with_modules=False,
+        )
+        self.prof.__enter__()
+
+    # 1 step == 1 optimizer update
+    def on_step_end(self, *_, **__):
+        self.prof.step()
+
+    # make sure files are flushed even on KeyboardInterrupt
+    def on_train_end(self, *_, **__):
+        self.prof.__exit__(None, None, None)
+
+
+def get_tokenizer():
+    tok = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        token=os.environ["HF_TOKEN"],
+        cache_dir=os.environ.get("MODEL_CACHE_DIR"),
+    )
+    tok.pad_token = tok.eos_token
+    return tok
+
+
 def download_llama2(cache_dir: str | None = None):
     """Fetch Llama‑2‑7B weights & tokenizer; returns (model, tokenizer)."""
     token = os.environ["HF_TOKEN"]
-    tok = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        token=token,
-        cache_dir=cache_dir,
-    )
-    tok.pad_token = tok.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -68,10 +111,10 @@ def download_llama2(cache_dir: str | None = None):
     # KV caching breaks activation checkpointing
     model.config.use_cache = False
 
-    return model, tok
+    return model
 
 
-def build_packed_ds(data_dir: Path, tokenizer, buffer_size: int, block: int):
+def build_packed_ds(data_dir: Path, buffer_size: int, block: int):
     """Builds a packed dataset for training by:
     1. Loading arrow files from Go and Rust directories
     2. Shuffling the data with a buffer
@@ -86,9 +129,14 @@ def build_packed_ds(data_dir: Path, tokenizer, buffer_size: int, block: int):
         block: Fixed sequence length for packed sequences
     """
 
-    eos_id = tokenizer.eos_token_id
-
     def gen():
+        worker = torch.utils.data.get_worker_info()
+        rank = worker.id if worker else 0
+        n_ranks = worker.num_workers if worker else 1
+
+        tokenizer = get_tokenizer()
+        eos_id = tokenizer.eos_token_id
+
         data_files = []
         for lang_dir in ["go", "rust"]:
             data_files.extend(
@@ -104,7 +152,10 @@ def build_packed_ds(data_dir: Path, tokenizer, buffer_size: int, block: int):
         )
 
         # Shuffle the dataset so we don't overtrain on a single shard.
-        ds_iterable = ds_iterable.shuffle(buffer_size=buffer_size, seed=44)
+        ds_iterable = ds_iterable.shuffle(buffer_size=buffer_size, seed=44).shard(
+            num_shards=n_ranks,
+            index=rank,
+        )
 
         buf = []
         consumed_samples = 0
@@ -144,11 +195,16 @@ def parse_args():
     p.add_argument("--batch_per_device", type=int, default=4)
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--block_size", type=int, default=4096, help="Context length tokens")
+    p.add_argument("--profile", action="store_true", help="Enable profiling")
 
     return p.parse_args()
 
 
 def main():
+    # Disable tokenizer parallelism to avoid deadlocks. We're offloading
+    # tokenization to the workers, so we don't need to parallelize.
+    # os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
     args = parse_args()
 
     # Explicitly initialize the process group to avoid warnings about
@@ -162,17 +218,29 @@ def main():
 
     print(f"Rank {os.environ.get('RANK')} using GPU {torch.cuda.current_device()}")
 
-    model, tokenizer = download_llama2(args.model_cache_dir)
+    model = download_llama2(args.model_cache_dir)
+    tokenizer = get_tokenizer()
 
     # Buffer size for shuffling data
     BUFFER_SIZE = 20_000
-    train_ds = build_packed_ds(
-        Path(args.data_dir), tokenizer, BUFFER_SIZE, args.block_size
-    )
+    train_ds = build_packed_ds(Path(args.data_dir), BUFFER_SIZE, args.block_size)
 
     collator = DataCollatorForLanguageModeling(
         tokenizer, mlm=False, pad_to_multiple_of=8
     )
+
+    callbacks = []
+    if args.profile:
+        print("🔎 Profiling enabled")
+        profiler_callback = TorchProfilerCallback(
+            # Start profiling after 5 iterations. Profile 10 times then stop.
+            warmup=5,
+            active=3,
+            repeat=3,
+            wait=0,
+            out_dir=f"{args.output_dir}/traces/{os.environ.get('MODAL_TASK_ID', 'local')}/{os.environ.get('RANK', '0')}",
+        )
+        callbacks.append(profiler_callback)
 
     cfg = SFTConfig(
         output_dir=args.output_dir,
@@ -205,6 +273,11 @@ def main():
         # Training loop exit conditions
         num_train_epochs=args.epochs,
         max_steps=10000,
+        # Use dataloader workers so we don't block training on data loading.
+        dataloader_num_workers=1,
+        dataloader_prefetch_factor=4,
+        dataloader_pin_memory=True,
+        dataloader_multiprocessing_context="fork",
     )
 
     trainer = SFTTrainer(
@@ -212,6 +285,7 @@ def main():
         train_dataset=train_ds,
         args=cfg,
         data_collator=collator,
+        callbacks=callbacks,
     )
 
     trainer.train()

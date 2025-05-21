@@ -3,6 +3,10 @@ import os
 import shutil
 from typing import Union
 from collections import defaultdict
+from datasets import load_dataset, Features, Sequence, Value
+from transformers import AutoTokenizer
+import multiprocessing as mp
+from tqdm import tqdm
 
 from common import DATASET_ID, DATASET_VOLUME_NAME, DATASET_MOUNT_PATH
 
@@ -18,12 +22,106 @@ app = modal.App(
     f"{DATASET_ID}-download",
 )
 
+# -------- ADDED constants --------
+MODEL_NAME = "meta-llama/Llama-2-7b-hf"
+BLOCK_SIZE = int(os.getenv("BLOCK_SIZE", "4096"))
+TOKENIZED_DIR_PREFIX = "tokenized/"
+# ---------------------------------
+
 hf_image = (
     modal.Image.debian_slim()
-    .pip_install("huggingface_hub", "hf_transfer", "datasets")
+    .pip_install("huggingface_hub", "hf_transfer", "datasets", "transformers", "tqdm")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     .add_local_python_source("common")
 )
+
+
+# -------- NEW helper: tokenise+pack one in-memory Dataset --------
+def _tokenise_and_pack(ds, tokenizer):
+    eos_id = tokenizer.eos_token_id
+
+    def tok_fn(batch):
+        ids = tokenizer(batch["content"], add_special_tokens=False)["input_ids"]
+        return {"ids": [x + [eos_id] for x in ids]}
+
+    ds = ds.map(
+        tok_fn, batched=True, num_proc=mp.cpu_count(), remove_columns=["content"]
+    )
+
+    def pack(batch):
+        # Concat all batch items into a single list
+        flat = sum(batch["ids"], [])
+        n = len(flat) // BLOCK_SIZE
+        if n == 0:
+            return {"input_ids": [], "attention_mask": []}
+        # Split the flat list into n blocks of BLOCK_SIZE
+        return {
+            "input_ids": [
+                flat[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE] for i in range(n)
+            ],
+            "attention_mask": [[1] * BLOCK_SIZE] * n,
+        }
+
+    ds = ds.map(pack, batched=True, batch_size=10, remove_columns=["ids"])
+
+    return ds.cast(
+        Features(
+            {
+                "input_ids": Sequence(Value("uint16")),
+                "attention_mask": Sequence(Value("uint8")),
+            }
+        )
+    )
+
+
+# -----------------------------------------------------------------
+
+
+@app.function(
+    image=hf_image,
+    secrets=[hf_secret],
+    volumes={DATASET_MOUNT_PATH: vol},
+    max_containers=50,
+)
+def preprocess_code_shard(file_path: str):
+    """
+    For shards inside go/ or rust/, load the already-downloaded Arrow file from
+    the volume, tokenise + pack, then save to tokenized/{file_path}.
+    Returns the new relative path if tokenized, else the original file_path.
+    """
+    import os
+    from datasets import load_from_disk, Dataset
+
+    if not (file_path.startswith("go/") or file_path.startswith("rust/")):
+        # Nothing to do.
+        return file_path
+
+    original_load_path = f"{DATASET_MOUNT_PATH}/{file_path}"
+
+    # Define the new save path for tokenized data
+    tokenized_relative_save_path = f"{TOKENIZED_DIR_PREFIX}{file_path}"
+    tokenized_absolute_save_path = (
+        f"{DATASET_MOUNT_PATH}/{tokenized_relative_save_path}"
+    )
+
+    print(f"Tokenising {original_load_path} to {tokenized_absolute_save_path} …")
+    vol.reload()
+
+    # Create parent directory for the tokenized file
+    os.makedirs(os.path.dirname(tokenized_absolute_save_path), exist_ok=True)
+
+    raw_ds = load_from_disk(original_load_path)["train"]
+
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME, token=os.getenv("HF_TOKEN"))
+    tok.pad_token = tok.eos_token
+
+    proc_ds = _tokenise_and_pack(raw_ds, tok)
+
+    # Overwrite; save to the new tokenized path.
+    proc_ds.save_to_disk(tokenized_absolute_save_path)
+    vol.commit()
+    print(f"✔ Tokenised & saved {tokenized_relative_save_path}")
+    return tokenized_relative_save_path
 
 
 @app.function(image=hf_image, secrets=[hf_secret])
@@ -171,7 +269,12 @@ def write_metadata_file(total_samples: int):
 def _get_top_level_directory(file_path: str) -> str:
     import os
 
-    parent_dir = os.path.dirname(file_path)
+    # If the path starts with TOKENIZED_DIR_PREFIX, remove it for directory calculation
+    path_to_process = file_path
+    if path_to_process.startswith(TOKENIZED_DIR_PREFIX):
+        path_to_process = path_to_process[len(TOKENIZED_DIR_PREFIX) :]
+
+    parent_dir = os.path.dirname(path_to_process)
 
     if not parent_dir or parent_dir == ".":
         return "<root_dataset_dir>"
@@ -315,8 +418,16 @@ def ingest_dataset():
         download_results.append(result)
     print(f"Done downloading {len(download_results)} items.")
 
-    # Pass the original file_paths list to validation
+    # --- NEW: tokenise only go/ & rust/ shards ------------------
+    print("Starting tokenisation of code shards …")
+    processed_file_paths = []
+    for result in preprocess_code_shard.map(download_results):
+        processed_file_paths.append(result)
+    print("Finished tokenising code shards.")
+    # ------------------------------------------------------------
+
+    # Pass the processed_file_paths list to validation
     print("Starting dataset structure validation...")
-    orchestrate_validation.remote(file_paths)
+    orchestrate_validation.remote(processed_file_paths)
 
     print("Done with all operations.")

@@ -20,7 +20,7 @@ base_image = (
         "trl",
         "wandb",
         "huggingface_hub",
-        "torch",
+        "torch==2.6.0",
         "accelerate",
     )
     .add_local_python_source("common")
