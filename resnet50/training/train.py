@@ -40,7 +40,7 @@ log_every = max(1, (32768 // 256) // batch_multiplier)
 # The main/leader container will log to wandb (Weights & Biases).
 # Note that using Weights & Biases requires populating the WANDB_API_KEY environment variable
 # using a modal.Secret passed to the modal.App or the modal.Function.
-use_wandb = rank == 0 and not config.debug
+use_wandb = rank == 0 and not config.debug and "WANDB_API_KEY" in os.environ
 
 if config.debug:
     # Only make deterministic during debugging. Otherwise, when preempted, the

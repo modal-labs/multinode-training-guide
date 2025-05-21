@@ -15,13 +15,14 @@ training_code_dir = Path(__file__).parent / "training"
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
     .apt_install("curl", "unzip", "vim", "git", "htop")
-    .pip_install("torch", "torchvision", "nvidia-dali-cuda120")
-    # needed until they update PyPI
-    .pip_install("git+https://github.com/thecodingwizard/webdataset.git")
-    .pip_install("wandb")
-    .pip_install("tqdm")
-    .pip_install("pydantic")  # used by training.torchrun utility
+    .pip_install("torch==2.5.1", "torchvision==0.20.1", "nvidia-dali-cuda120==1.43.0")
+    # needed until they update PyPI (https://github.com/webdataset/webdataset/issues/415)
+    .pip_install("git+https://github.com/thecodingwizard/webdataset.git@e16ee8ecc8824351281e933beda6c25e539e9794")
+    .pip_install("wandb==0.18.7")
+    .pip_install("tqdm==4.67.0")
+    .pip_install("pydantic==2.10.5")  # used by training.torchrun utility
     .add_local_dir(training_code_dir, remote_path="/root/training")
+    .add_local_python_source("torchrun_util")
 )
 app = modal.App(
     f"resnet50-{config.run_name}",
@@ -30,7 +31,8 @@ app = modal.App(
         # Required for downloading the ImageNet dataset.
         modal.Secret.from_name("huggingface-secret"),
         # Required for connecting to Weights & Biases from within the Modal container.
-        modal.Secret.from_name("wandb-secret-modal-labs"),
+        # Uncomment the line below to use Weights & Biases.
+        modal.Secret.from_name("wandb"),
     ],
     volumes={
         "/data": modal.Volume.from_name("imagenet"),
@@ -39,7 +41,7 @@ app = modal.App(
 
 
 @app.function(
-    gpu=modal.gpu.H100(count=config.gpus_per_node),
+    gpu=f"H100:{config.gpus_per_node}",
     timeout=60 * 60 * 6,
     retries=modal.Retries(initial_delay=0.0, max_retries=10),
 )

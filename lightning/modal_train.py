@@ -16,10 +16,10 @@ REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
     .pip_install(
-        "click",  # Required by Lightning 'fabric' CLI
-        "torch",
-        "lightning~=2.4.0",
-        "requests",  # Required by Lightning demo code
+        "click==8.1.8",  # Required by Lightning 'fabric' CLI
+        "torch==2.6.0",
+        "lightning==2.4.0",
+        "requests==2.32.3",  # Required by Lightning demo code
     )
     .add_local_dir(
         LOCAL_CODE_DIR,

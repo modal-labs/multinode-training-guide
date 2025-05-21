@@ -6,7 +6,7 @@ app = modal.App(
     "imagenet-download",
     image=(
         modal.Image.debian_slim()
-        .pip_install("webdataset==0.2.111", "huggingface_hub[cli]==0.31.4", "hf_transfer==0.1.9")
+        .pip_install("webdataset==0.2.111", "huggingface_hub[cli]==0.31.4", "hf_transfer==0.1.9", "nvidia-dali-cuda120==1.43.0")
         .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
         .add_local_python_source("imagenet_classes")
     ),
@@ -67,9 +67,9 @@ def download_imagenet(split: str, file: str, start_shard: int):
             sink.write(sample)
 
     # 4. Create indexes
-    # print(f"Creating indexes for {file}...")
+    print(f"Creating indexes for {file}...")
     # todo fix: only create indexes for files we made
-    # os.system(f'for file in /data/{split}/*.tar; do wds2idx "$file"; done')
+    os.system(f'for file in /data/{split}/*.tar; do wds2idx "$file"; done')
 
     print(f"Done with {file}")
 
