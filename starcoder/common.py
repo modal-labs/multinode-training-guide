@@ -33,4 +33,4 @@ REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 train_image = base_image.add_local_dir(
     LOCAL_CODE_DIR,
     remote_path=REMOTE_CODE_DIR,
-)
+).add_local_file("../utils/mlx_monitor.py", remote_path="/root/mlx_monitor.py")
