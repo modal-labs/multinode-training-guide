@@ -205,9 +205,9 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert (
-            t <= self.config.block_size
-        ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        )
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
         # forward the GPT model itself
@@ -300,9 +300,9 @@ class GPT(nn.Module):
         ]
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(
-            sd_keys
-        ), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len(sd_keys), (
+            f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        )
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -370,7 +370,7 @@ class GPT(nn.Module):
             if "A100" in gpu_model:
                 # See FP16 FLOPS section of A100 datasheet (ignore sparsity)
                 # https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-nvidia-us-2188504-web.pdf
-                flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS (without sparsity)
+                self.flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS (without sparsity)
             elif "H100" in gpu_model or "H200" in gpu_model:
                 # See FP16 FLOPS section of H100 datasheet (ignore sparsity)
                 # https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet
@@ -380,14 +380,15 @@ class GPT(nn.Module):
                 #
                 # Also see Liger Kernel repo:
                 # https://github.com/linkedin/Liger-Kernel/blob/fc88dc6ccec6fabb4153cfe84f17307846ef06b0/examples/medusa/callback.py#L373
-                flops_promised = 989e12  # H100 GPU bfloat16 peak flops is 989 TFLOPS (without sparsity)
+                self.flops_promised = 989e12  # H100 GPU bfloat16 peak flops is 989 TFLOPS (without sparsity)
             else:
                 print(f"WARNING: Unknown GPU model {gpu_model}, assuming A100")
-                flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        else:
-            flops_promised = self.flops_promised
+                self.flops_promised = (
+                    312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
+                )
+
         flops_achieved = flops_per_iter * (1.0 / dt)  # per second
-        mfu = flops_achieved / flops_promised
+        mfu = flops_achieved / self.flops_promised
         return mfu
 
     @torch.no_grad()
