@@ -6,6 +6,8 @@ GPU configurations:
 
 ### MFU Performance
 
+<!-- TODO(pawalt): fix up these MFU numbers since we've sped up the code significantly -->
+
 | GPU Config | Time per iteration | MFU |
 |------------|-------------------|-----|
 | 8xA100 | ~360ms | ~47.84% |
@@ -24,6 +26,7 @@ GPU configurations:
 | Modal nanoGPT (this repo) | 1 | 8x H**2**00 SXM | 2025-02-16 | 23.97 mins | 1.88x |
 | Modal clustered nanoGPT (this repo) | 2 | 2x8xH100 SXM | 2025-04-23 | 10.54 mins | 4.32x |
 | Modal clustered nanoGPT (this repo) | 4 | 4x8xH100 SXM | 2025-04-23 | 5.88 mins | 7.65x | 
+| Modal clustered nanoGPT (this repo) | 8 | 8x8xH100 SXM | 2025-05-28 | 3.38 mins | 13.31x | 
 | [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` | 1 | 8x H100 SXM | 2025-02-01 | 2.997 mins | 15.01x |
 | [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` (on Modal, `gvisor`) | 1 | 8x H100 SXM | 2025-04-12 | 3.229 mins | 13.93x |
 <!--| [modded-nanogpt](https://github.dev/KellerJordan/modded-nanogpt) at `64d8eb51` (on Modal, legacy runtime) | 1 | 8x H100 SXM | 2025-04-12 | 3.03 mins | 14.85x | -->
