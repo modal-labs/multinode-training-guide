@@ -22,7 +22,7 @@ image = (
         "libibverbs1",
     )
     .pip_install(
-        "torch",
+        "torch==2.6.0",
         "numpy",
         "importlib-metadata",
     )

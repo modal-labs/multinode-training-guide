@@ -28,7 +28,14 @@ base_image = (
     # ref: https://github.com/astral-sh/uv/issues/6437#issuecomment-2535324784
     .apt_install("git", "libibverbs-dev", "libibverbs1")
     # https://github.com/karpathy/nanoGPT?tab=readme-ov-file#install
-    .pip_install("torch==2.7.0", "transformers==4.51.3", "datasets==3.6.0", "tiktoken==0.9.0", "wandb==0.19.11", "tqdm==4.67.1")
+    .pip_install(
+        "torch==2.6.0",
+        "transformers==4.51.3",
+        "datasets==3.6.0",
+        "tiktoken==0.9.0",
+        "wandb==0.19.11",
+        "tqdm==4.67.1",
+    )
 )
 image = base_image.add_local_dir(
     LOCAL_CODE_DIR,
