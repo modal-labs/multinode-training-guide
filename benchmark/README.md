@@ -35,3 +35,13 @@ The benchmark automatically configures RDMA settings for OCI's infrastructure:
 - Uses IPv4 for data plane (RDMA) communication
 - Configures optimal NCCL parameters for IB/RDMA
 - Sets appropriate HCA device ordering
+
+## Runtime Cluster Configuration
+
+This directory also contains an example of configuring the cluster definition at runtime in [modal_train_runtime_cfg.py](./modal_train_runtime_cfg.py). To run the NCCL bandwidth benchmark on a 2-node 8xB200 cluster:
+
+```bash
+python modal_train_runtime_cfg.py 2 8 --gpu-type B200
+```
+
+The `--gpu-type` parameter can be any of `H100`, `H200`, or `B200`.
