@@ -9,27 +9,32 @@ import modal.experimental
 tag = "12.8.1-devel-ubuntu22.04"
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .apt_install(
-        "libibverbs-dev",
-        "libibverbs1",
-    )
+    .apt_install("libibverbs-dev", "libibverbs1")
     .run_commands(
         "uv pip install --system -U uv",
-        "uv pip install --system blobfile==3.0.0",
+        "uv pip install --system blobfile==3.0.0 requests==2.32.4",
         # using nightly until they cut a new release (current stable is v0.9.2)
         # we need this vllm commit to use pipeline parallelism with kimi:
         # https://github.com/vllm-project/vllm/commit/ad6c2e1a0b56c29065c7d70ff2e736e4f2fb03af
-        "uv pip install --system --pre vllm --extra-index-url https://wheels.vllm.ai/nightly",
-        "uv pip install --system --pre -U torch==2.7.1",
+        "uv pip install --system --torch-backend cu128 --pre vllm --extra-index-url https://wheels.vllm.ai/nightly",
+        # avoiding cursed torch==2.7.0
+        "uv pip install --system --torch-backend cu128 --pre -U torch==2.7.1",
         # known bug for H100s when using NCCL 2.26.x with CUDA>12.6, when NVLS enabled (default),
         # and when 2+ processes participate in collective ops. upgrading to 2.27+ fixes this
         "uv pip install --system -U nvidia-nccl-cu12==2.27.6",
     )
-    .env(
-        {
-            "RAY_DISABLE_DOCKER_CPU_WARNING": "1",
-        }
+    .apt_install("git", "build-essential", "g++")
+    .run_commands(
+        # recursive bc DeepGEMM vendors CUTLASS for the build
+        "git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git",
+        "uv pip install --system ./DeepGEMM",
     )
+    .run_commands(
+        "uv pip install --system nvidia-nvshmem-cu12==3.3.9",
+        "git clone https://github.com/deepseek-ai/DeepEP.git",
+        "NVSHMEM_DIR=$(python -c 'import nvidia.nvshmem; import os; print(os.path.dirname(nvidia.nvshmem.__file__))' 2>/dev/null) CXX=g++ uv pip install --system ./DeepEP --no-build-isolation",
+    )
+    .env({"RAY_DISABLE_DOCKER_CPU_WARNING": "1", "VLLM_USE_DEEPGEMM": "1"})
 )
 
 app = modal.App("k2-multinode-inference", image=image)
@@ -40,38 +45,95 @@ vllm_cache_volume = modal.Volume.from_name(
     "k2-multinode-vllmcache", create_if_missing=True, version=2
 )
 
-# Number of nodes and GPUs configuration
-N_NODES = 4
-GPUS_PER_NODE = 8
-GPU_TYPE = "H100"
-
 # Ray configuration
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 VLLM_PORT = 8000
 
-# vllm
 MODEL = "moonshotai/Kimi-K2-Instruct"
-TP_SIZE = 16
-PP_SIZE = 2
-MAX_MODEL_LEN = 16384
-MAX_SEQS = 32
+
+with image.imports():
+    import requests
 
 
-@app.function(
-    image=image,
-    gpu=f"{GPU_TYPE}:{GPUS_PER_NODE}",
-    volumes={
-        "/root/.cache/huggingface": hf_cache_volume,
-        "/root/.cache/vllm": vllm_cache_volume,
-    },
-    timeout=60 * 60 * 1,
-)
-@modal.experimental.clustered(size=N_NODES, rdma=True)
-def run_vllm_inference():
+class K2Inference:
     """
     Run vLLM inference across multiple nodes with Ray orchestration.
     """
+
+    tp_size: int
+    pp_size: int
+    dp_size: int
+    max_seqs: int
+    max_model_len: int = 128000
+    enable_expert_parallel: bool = False
+
+    @modal.enter()
+    def setup(self):
+        container_rank = _spawn_ray_nodes()
+        vllm_cmd = _build_vllm_cmd(
+            self.tp_size,
+            self.pp_size,
+            self.dp_size,
+            self.max_seqs,
+            self.max_model_len,
+            self.enable_expert_parallel,
+        )
+        if container_rank == 0:
+            # Run vLLM server and open a Flash tunnel for it
+            try:
+                vllm_process = subprocess.Popen(vllm_cmd)
+                self.flash_handle = modal.experimental.flash_forward(8000)
+                vllm_process.wait()
+                if vllm_process.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        vllm_process.returncode,
+                        cmd=vllm_cmd,
+                        output=vllm_process.stdout,
+                        stderr=vllm_process.stderr,
+                    )
+            except subprocess.CalledProcessError as e:
+                print(f"vLLM server failed: {e}")
+                raise
+
+    @modal.method()
+    def server(self):
+        pass
+
+    @modal.exit()
+    def cleanup(self):
+        cluster_info = modal.experimental.get_cluster_info()
+        if cluster_info.rank == 0:
+            self.flash_handle.stop()
+
+            deadline = time.time() + 60  # 1 minute deadline
+            while time.time() < deadline:
+                try:
+                    response = requests.get("http://localhost:8000/load")
+                    if response.status_code == 200:
+                        load_metrics = response.json()
+                        server_load = load_metrics.get("server_load")
+                        print(f"Server load: {server_load} requests")
+                        if server_load is None:
+                            raise RuntimeError(
+                                f"Server load expected from /load response, but found None: {load_metrics}"
+                            )
+                        if server_load == 0:
+                            print("Server load is 0, continuing...")
+                            break
+                    else:
+                        print(f"Failed to get load metrics: {response.status_code}")
+                except Exception as e:
+                    print(f"Error getting load metrics: {e}")
+
+                time.sleep(1)  # Wait 1 second before next check
+            else:
+                print("Deadline reached, continuing regardless of server load...")
+
+            self.flash_handle.close()
+
+
+def _spawn_ray_nodes():
     # Get cluster information
     cluster_info = modal.experimental.get_cluster_info()
     container_rank = cluster_info.rank
@@ -128,36 +190,122 @@ def run_vllm_inference():
         # Check Ray cluster status
         subprocess.run(["ray", "status"], check=True)
 
-        # Start vLLM with distributed configuration
-        print("Starting vLLM server on head node...")
-        vllm_cmd = [
-            "vllm",
-            "serve",
-            MODEL,
-            "--download-dir",
-            "/root/.cache/huggingface",
-            "--trust-remote-code",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(VLLM_PORT),
-            "--distributed-executor-backend",
-            "ray",
-            "--tensor-parallel-size",
-            str(TP_SIZE),
-            "--pipeline-parallel-size",
-            str(PP_SIZE),
-            "--max-model-len",
-            str(MAX_MODEL_LEN),
-            "--max-num-seqs",
-            str(MAX_SEQS),
-        ]
+    return container_rank
 
-        print(f"vLLM command: {' '.join(vllm_cmd)}")
 
-        # Run vLLM server
-        try:
-            subprocess.run(vllm_cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"vLLM server failed: {e}")
-            raise
+def _build_vllm_cmd(
+    tp_size: int,
+    pp_size: int,
+    dp_size: int,
+    max_seqs: int,
+    max_model_len: int,
+    enable_expert_parallel: bool,
+):
+    # Start vLLM with distributed configuration
+    print("Starting vLLM server on head node...")
+    vllm_cmd = [
+        "vllm",
+        "serve",
+        MODEL,
+        "--download-dir",
+        "/root/.cache/huggingface",
+        "--model-name",
+        "kimi-k2",
+        "--trust-remote-code",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(VLLM_PORT),
+        "--distributed-executor-backend",
+        "ray",
+        "--tensor-parallel-size",
+        str(tp_size),
+        "--pipeline-parallel-size",
+        str(pp_size),
+        "--max-model-len",
+        str(max_model_len),
+        "--max-num-seqs",
+        str(max_seqs),
+    ]
+    if dp_size > 1:
+        vllm_cmd.extend(
+            [
+                "--data-parallel-backend",
+                "ray",
+                "--data-parallel-size",
+                str(dp_size),
+            ]
+        )
+    if enable_expert_parallel:
+        vllm_cmd.append("--enable-expert-parallel")
+
+    print(f"vLLM command: {' '.join(vllm_cmd)}")
+    return vllm_cmd
+
+
+# probably not a great idea due to potential expert load imbalance issues,
+# but worth a test
+@app.cls(
+    image=image,
+    gpu="H100:8",
+    volumes={
+        "/root/.cache/huggingface": hf_cache_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+    },
+    timeout=60 * 60 * 1,
+    experimental_options={"flash": "us-east"},
+)
+@modal.experimental.clustered(size=2, rdma=True)
+class K2Tp8Ep2(K2Inference):
+    # 2x8H100
+    # tp=8,pp=1,ep=2,dp=1
+    tp_size = 8
+    pp_size = 1
+    dp_size = 1
+    max_seqs = 256
+    enable_expert_parallel = True
+
+
+@app.cls(
+    image=image,
+    gpu="H100:8",
+    volumes={
+        "/root/.cache/huggingface": hf_cache_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+    },
+    timeout=60 * 60 * 1,
+    experimental_options={"flash": "us-east"},
+)
+@modal.experimental.clustered(size=4, rdma=True)
+class K2Tp8Ep4(K2Inference):
+    # low-latency
+    # 4x8H100
+    # tp=8,pp=1,ep=4,dp=1
+    tp_size = 8
+    pp_size = 1
+    dp_size = 1
+    max_seqs = 256
+    enable_expert_parallel = True
+
+
+@app.cls(
+    image=image,
+    gpu="H100:8",
+    volumes={
+        "/root/.cache/huggingface": hf_cache_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+    },
+    timeout=60 * 60 * 1,
+    experimental_options={"flash": "us-east"},
+)
+@modal.experimental.clustered(size=4, rdma=True)
+class K2Tp8Ep2Dp2(K2Inference):
+    # high throughput
+    # 4x8H100
+    # tp=8,pp=1,ep=2,dp=2
+    tp_size = 8
+    pp_size = 1
+    dp_size = 2
+    max_seqs = 256
+    enable_expert_parallel = True
+>>>>>>> Conflict 2 of 2 ends
