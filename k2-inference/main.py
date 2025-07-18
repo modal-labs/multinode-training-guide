@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import time
 
@@ -12,7 +13,8 @@ image = (
     .apt_install("libibverbs-dev", "libibverbs1")
     .run_commands(
         "uv pip install --system -U uv",
-        "uv pip install --system blobfile==3.0.0 requests==2.32.4",
+        "uv pip install --system blobfile==3.0.0 requests==2.32.4 psutil",
+        "uv pip install --system ray[default]",
         # using nightly until they cut a new release (current stable is v0.9.2)
         # we need this vllm commit to use pipeline parallelism with kimi:
         # https://github.com/vllm-project/vllm/commit/ad6c2e1a0b56c29065c7d70ff2e736e4f2fb03af
@@ -23,16 +25,22 @@ image = (
         # and when 2+ processes participate in collective ops. upgrading to 2.27+ fixes this
         "uv pip install --system -U nvidia-nccl-cu12==2.27.6",
     )
-    .apt_install("git", "build-essential", "g++")
+    .apt_install("git", "build-essential", "g++", "wget")
     .run_commands(
+        "uv pip install --system cuda-bindings",
         # recursive bc DeepGEMM vendors CUTLASS for the build
-        "git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git",
+        "git clone https://github.com/deepseek-ai/DeepGEMM.git",
+        # latest commit on main broke authless recursive clone, thus:
+        "cd DeepGEMM && git checkout 03d0be3d2d03b6eed3c99d683c0620949a13a826",
+        "cd DeepGEMM && git submodule update --init --recursive",
         "uv pip install --system ./DeepGEMM",
     )
     .run_commands(
         "uv pip install --system nvidia-nvshmem-cu12==3.3.9",
         "git clone https://github.com/deepseek-ai/DeepEP.git",
-        "NVSHMEM_DIR=$(python -c 'import nvidia.nvshmem; import os; print(os.path.dirname(nvidia.nvshmem.__file__))' 2>/dev/null) CXX=g++ uv pip install --system ./DeepEP --no-build-isolation",
+        # nvidia-nvshmem-cu12 ships with versioned binaries, but the DeepEP build process expects unversioned. sigh...
+        "cd $(python -c 'import nvidia.nvshmem; import os; print(nvidia.nvshmem.__path__[0])') && cp lib/libnvshmem_host.so.3 lib/libnvshmem_host.so",
+        "NVSHMEM_DIR=$(python -c 'import nvidia.nvshmem; import os; print(nvidia.nvshmem.__path__[0])') CXX=g++ uv pip install --system ./DeepEP --no-build-isolation",
     )
     .env({"RAY_DISABLE_DOCKER_CPU_WARNING": "1", "VLLM_USE_DEEPGEMM": "1"})
 )
@@ -42,7 +50,8 @@ app = modal.App("k2-multinode-inference", image=image)
 # Volume for Hugging Face cache
 hf_cache_volume = modal.Volume.from_name("big-model-hfcache")
 vllm_cache_volume = modal.Volume.from_name(
-    "k2-multinode-vllmcache", create_if_missing=True, version=2
+    "k2-multinode-vllmcache",
+    create_if_missing=True,
 )
 
 # Ray configuration
@@ -53,6 +62,7 @@ VLLM_PORT = 8000
 MODEL = "moonshotai/Kimi-K2-Instruct"
 
 with image.imports():
+    import psutil
     import requests
 
 
@@ -65,16 +75,18 @@ class K2Inference:
     pp_size: int
     dp_size: int
     max_seqs: int
+    nodes: int
     max_model_len: int = 128000
     enable_expert_parallel: bool = False
 
     @modal.enter()
     def setup(self):
-        container_rank = _spawn_ray_nodes()
+        container_rank = _spawn_ray_nodes(self.nodes)
         vllm_cmd = _build_vllm_cmd(
             self.tp_size,
             self.pp_size,
             self.dp_size,
+            self.nodes,
             self.max_seqs,
             self.max_model_len,
             self.enable_expert_parallel,
@@ -102,8 +114,13 @@ class K2Inference:
 
     @modal.exit()
     def cleanup(self):
-        cluster_info = modal.experimental.get_cluster_info()
-        if cluster_info.rank == 0:
+        _, container_rank = get_overlay0_address()
+        if container_rank is None:
+            print(
+                "WARNING: Failed to infer container rank, exiting early. Any processing requests will be cancelled."
+            )
+            return
+        if container_rank == 0:
             self.flash_handle.stop()
 
             deadline = time.time() + 60  # 1 minute deadline
@@ -133,13 +150,31 @@ class K2Inference:
             self.flash_handle.close()
 
 
-def _spawn_ray_nodes():
+def get_overlay0_address():
+    """Get the IP address of overlay0 interface using psutil"""
+    try:
+        interfaces = psutil.net_if_addrs()
+        if "overlay0" in interfaces:
+            for addr in interfaces["overlay0"]:
+                if addr.family == 2:  # AF_INET (IPv4)
+                    ip_parts = addr.address.split(".")
+                    last_octet = int(ip_parts[-1])
+                    return addr.address, last_octet - 1
+        return None, None
+    except Exception as e:
+        print(f"Error: {e}")
+        return None, None
+
+
+def _spawn_ray_nodes(num_nodes):
     # Get cluster information
-    cluster_info = modal.experimental.get_cluster_info()
-    container_rank = cluster_info.rank
-    container_v4_ips = [
-        f"10.100.0.{rank + 1}" for rank in range(len(cluster_info.container_ips))
-    ]
+    ipv4_addr, container_rank = get_overlay0_address()
+    if ipv4_addr is None:
+        raise RuntimeError(
+            "Could not infer container rank, because `overlay0` network interface is missing"
+        )
+
+    container_v4_ips = [f"10.100.0.{rank + 1}" for rank in range(num_nodes)]
     main_addr_v4 = container_v4_ips[0]
     this_v4 = container_v4_ips[container_rank]
 
@@ -159,6 +194,7 @@ def _spawn_ray_nodes():
             f"--port={RAY_PORT}",  # 6379
             "--dashboard-host=0.0.0.0",
             f"--dashboard-port={RAY_DASHBOARD_PORT}",  # 8265
+            "--include-dashboard=True",
             "--block",
         ]
     else:
@@ -197,6 +233,7 @@ def _build_vllm_cmd(
     tp_size: int,
     pp_size: int,
     dp_size: int,
+    num_nodes: int,
     max_seqs: int,
     max_model_len: int,
     enable_expert_parallel: bool,
@@ -209,31 +246,40 @@ def _build_vllm_cmd(
         MODEL,
         "--download-dir",
         "/root/.cache/huggingface",
-        "--model-name",
+        "--served-model-name",
         "kimi-k2",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "kimi_k2",
         "--trust-remote-code",
         "--host",
         "0.0.0.0",
         "--port",
         str(VLLM_PORT),
+        "--max-model-len",
+        str(max_model_len),
+        "--max-num-seqs",
+        str(max_seqs),
+        "--gpu-memory-utilization",
+        "0.95",
         "--distributed-executor-backend",
         "ray",
         "--tensor-parallel-size",
         str(tp_size),
         "--pipeline-parallel-size",
         str(pp_size),
-        "--max-model-len",
-        str(max_model_len),
-        "--max-num-seqs",
-        str(max_seqs),
     ]
     if dp_size > 1:
+        dp_size_local = dp_size // num_nodes if dp_size >= num_nodes else 1
+
         vllm_cmd.extend(
             [
                 "--data-parallel-backend",
                 "ray",
                 "--data-parallel-size",
                 str(dp_size),
+                "--data-parallel-size-local",
+                str(dp_size_local),
             ]
         )
     if enable_expert_parallel:
@@ -243,29 +289,6 @@ def _build_vllm_cmd(
     return vllm_cmd
 
 
-# probably not a great idea due to potential expert load imbalance issues,
-# but worth a test
-@app.cls(
-    image=image,
-    gpu="H100:8",
-    volumes={
-        "/root/.cache/huggingface": hf_cache_volume,
-        "/root/.cache/vllm": vllm_cache_volume,
-    },
-    timeout=60 * 60 * 1,
-    experimental_options={"flash": "us-east"},
-)
-@modal.experimental.clustered(size=2, rdma=True)
-class K2Tp8Ep2(K2Inference):
-    # 2x8H100
-    # tp=8,pp=1,ep=2,dp=1
-    tp_size = 8
-    pp_size = 1
-    dp_size = 1
-    max_seqs = 256
-    enable_expert_parallel = True
-
-
 @app.cls(
     image=image,
     gpu="H100:8",
@@ -277,35 +300,36 @@ class K2Tp8Ep2(K2Inference):
     experimental_options={"flash": "us-east"},
 )
 @modal.experimental.clustered(size=4, rdma=True)
-class K2Tp8Ep4(K2Inference):
-    # low-latency
-    # 4x8H100
-    # tp=8,pp=1,ep=4,dp=1
-    tp_size = 8
-    pp_size = 1
-    dp_size = 1
-    max_seqs = 256
-    enable_expert_parallel = True
-
-
-@app.cls(
-    image=image,
-    gpu="H100:8",
-    volumes={
-        "/root/.cache/huggingface": hf_cache_volume,
-        "/root/.cache/vllm": vllm_cache_volume,
-    },
-    timeout=60 * 60 * 1,
-    experimental_options={"flash": "us-east"},
-)
-@modal.experimental.clustered(size=4, rdma=True)
-class K2Tp8Ep2Dp2(K2Inference):
-    # high throughput
+class K2Tp8Dp2Ep2(K2Inference):
     # 4x8H100
     # tp=8,pp=1,ep=2,dp=2
     tp_size = 8
     pp_size = 1
     dp_size = 2
-    max_seqs = 256
+    nodes = 4
+    max_seqs = 4
+    max_model_len = 48000
     enable_expert_parallel = True
->>>>>>> Conflict 2 of 2 ends
+
+
+@app.cls(
+    image=image,
+    gpu="H100:8",
+    volumes={
+        "/root/.cache/huggingface": hf_cache_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+    },
+    timeout=60 * 60 * 1,
+    experimental_options={"flash": "us-east"},
+)
+@modal.experimental.clustered(size=4, rdma=True)
+class K2Tp8Pp2Ep2(K2Inference):
+    # 4x8H100
+    # tp=8,pp=2,ep=2,dp=1
+    tp_size = 8
+    pp_size = 2
+    dp_size = 1
+    nodes = 4
+    max_seqs = 256
+    max_model_len = 64000
+    enable_expert_parallel = True
