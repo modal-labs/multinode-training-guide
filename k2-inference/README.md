@@ -16,18 +16,18 @@ The setup runs Kimi-K2-Instruct with:
 **Run the inference server:**
 
 ```bash
-modal run main.py
+modal deploy main.py::K2Tp8Pp4Ep
 ```
 
-This will start a vLLM server accessible at port 8000 on the head node, exposed via the URL displayed by the CLI.
+This will start a vLLM server accessible at port 8000 on the head node, exposed via the Flash URL reported by the CLI output. This particular configuration shards the model with 8-way tensor parallelism and 4-way pipeline parallelism, see `main.py` for other options.
 
 **Curl the web endpoint:**
 
 ```bash
-curl -X POST https://{WORKSPACE}-{ENVIRONMENT}--k2-multinode-inference-run-vllm-inference.modal.run/v1/chat/completions \
+curl -X POST https://{WORKSPACE}-{ENVIRONMENT}--k2-multinode-inference-k2tp8pp4ep-dev.modal.run/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "moonshotai/Kimi-K2-Instruct",
+    "model": "kimi-k2",
     "messages": [
       {
         "role": "system",
@@ -47,10 +47,10 @@ curl -X POST https://{WORKSPACE}-{ENVIRONMENT}--k2-multinode-inference-run-vllm-
 
 The example is pre-configured for Kimi-K2-Instruct with:
 - Model: `moonshotai/Kimi-K2-Instruct`
-- Context length: 16,384 tokens
-- Max sequences: 32
-- Tensor parallel: 16 GPUs
-- Pipeline parallel: 2 nodes
+- Context length: 128,000 tokens
+- Max sequences: 256
+- Tensor parallel: 8 GPUs
+- Pipeline parallel: 4 nodes
 
 To modify these settings, edit the constants in `main.py`:
 ```python

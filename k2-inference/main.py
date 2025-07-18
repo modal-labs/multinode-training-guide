@@ -1,5 +1,5 @@
 import os
-import re
+
 import subprocess
 import time
 
@@ -62,7 +62,6 @@ VLLM_PORT = 8000
 MODEL = "moonshotai/Kimi-K2-Instruct"
 
 with image.imports():
-    import psutil
     import requests
 
 
@@ -81,12 +80,13 @@ class K2Inference:
 
     @modal.enter()
     def setup(self):
-        container_rank = _spawn_ray_nodes(self.nodes)
+        cluster_info = _spawn_ray_nodes()
+        container_rank = cluster_info.rank
         vllm_cmd = _build_vllm_cmd(
             self.tp_size,
             self.pp_size,
             self.dp_size,
-            self.nodes,
+            len(cluster_info.container_ips),
             self.max_seqs,
             self.max_model_len,
             self.enable_expert_parallel,
@@ -114,13 +114,9 @@ class K2Inference:
 
     @modal.exit()
     def cleanup(self):
-        _, container_rank = get_overlay0_address()
-        if container_rank is None:
-            print(
-                "WARNING: Failed to infer container rank, exiting early. Any processing requests will be cancelled."
-            )
-            return
-        if container_rank == 0:
+        cluster_info = modal.experimental.get_cluster_info()
+
+        if cluster_info.rank == 0:
             self.flash_handle.stop()
 
             deadline = time.time() + 60  # 1 minute deadline
@@ -150,31 +146,13 @@ class K2Inference:
             self.flash_handle.close()
 
 
-def get_overlay0_address():
-    """Get the IP address of overlay0 interface using psutil"""
-    try:
-        interfaces = psutil.net_if_addrs()
-        if "overlay0" in interfaces:
-            for addr in interfaces["overlay0"]:
-                if addr.family == 2:  # AF_INET (IPv4)
-                    ip_parts = addr.address.split(".")
-                    last_octet = int(ip_parts[-1])
-                    return addr.address, last_octet - 1
-        return None, None
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, None
-
-
-def _spawn_ray_nodes(num_nodes):
+def _spawn_ray_nodes():
     # Get cluster information
-    ipv4_addr, container_rank = get_overlay0_address()
-    if ipv4_addr is None:
-        raise RuntimeError(
-            "Could not infer container rank, because `overlay0` network interface is missing"
-        )
-
-    container_v4_ips = [f"10.100.0.{rank + 1}" for rank in range(num_nodes)]
+    cluster_info = modal.experimental.get_cluster_info()
+    container_rank = cluster_info.rank
+    container_v4_ips = [
+        f"10.100.0.{rank + 1}" for rank in range(len(cluster_info.container_ips))
+    ]
     main_addr_v4 = container_v4_ips[0]
     this_v4 = container_v4_ips[container_rank]
 
@@ -226,7 +204,7 @@ def _spawn_ray_nodes(num_nodes):
         # Check Ray cluster status
         subprocess.run(["ray", "status"], check=True)
 
-    return container_rank
+    return cluster_info
 
 
 def _build_vllm_cmd(
@@ -300,15 +278,17 @@ def _build_vllm_cmd(
     experimental_options={"flash": "us-east"},
 )
 @modal.experimental.clustered(size=4, rdma=True)
-class K2Tp8Dp2Ep2(K2Inference):
+class K2Tp8Pp4Ep(K2Inference):
+    # RECOMMENDED
+    # single request decodes at ~40 tokens/s
     # 4x8H100
-    # tp=8,pp=1,ep=2,dp=2
+    # tp=ep=8,pp=4,dp=1
     tp_size = 8
-    pp_size = 1
-    dp_size = 2
+    pp_size = 4
+    dp_size = 1
     nodes = 4
-    max_seqs = 4
-    max_model_len = 48000
+    max_seqs = 256
+    max_model_len = 128000
     enable_expert_parallel = True
 
 
@@ -323,13 +303,38 @@ class K2Tp8Dp2Ep2(K2Inference):
     experimental_options={"flash": "us-east"},
 )
 @modal.experimental.clustered(size=4, rdma=True)
-class K2Tp8Pp2Ep2(K2Inference):
+class K2Tp16Pp2Ep(K2Inference):
     # 4x8H100
-    # tp=8,pp=2,ep=2,dp=1
-    tp_size = 8
+    # tp=ep=16,pp=2,dp=1
+    # trading more comm for less risk of pipeline bubbles
+    tp_size = 16
     pp_size = 2
     dp_size = 1
     nodes = 4
     max_seqs = 256
-    max_model_len = 64000
+    max_model_len = 128000
+    enable_expert_parallel = True
+
+
+@app.cls(
+    image=image,
+    gpu="H100:8",
+    volumes={
+        "/root/.cache/huggingface": hf_cache_volume,
+        "/root/.cache/vllm": vllm_cache_volume,
+    },
+    timeout=60 * 60 * 1,
+    experimental_options={"flash": "us-east"},
+)
+@modal.experimental.clustered(size=4, rdma=True)
+class K2Tp8Dp4Ep(K2Inference):
+    # 4x8H100
+    # tp=ep=8,pp=1,dp=4
+    # awful latency, why?
+    tp_size = 8
+    pp_size = 1
+    dp_size = 4
+    nodes = 4
+    max_seqs = 8
+    max_model_len = 128000
     enable_expert_parallel = True
