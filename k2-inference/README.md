@@ -16,14 +16,14 @@ The setup runs Kimi-K2-Instruct with:
 **Run the inference server:**
 
 ```bash
-modal deploy main.py::K2Tp8Pp4Ep
+modal deploy modal_infer.py
 ```
 
 This will start a vLLM server accessible at port 8000 on the head node, exposed via the Flash URL reported by the CLI output. This particular configuration shards the model with 8-way tensor parallelism and 4-way pipeline parallelism, see `main.py` for other options.
 
 **Curl the web endpoint:**
 
-```bash
+```console
 curl -X POST https://{WORKSPACE}-{ENVIRONMENT}--k2-multinode-inference-k2tp8pp4ep-dev.modal.run/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -52,10 +52,31 @@ The example is pre-configured for Kimi-K2-Instruct with:
 - Tensor parallel: 8 GPUs
 - Pipeline parallel: 4 nodes
 
-To modify these settings, edit the constants in `main.py`:
-```python
-MODEL = "moonshotai/Kimi-K2-Instruct"
-TP_SIZE = 16
-PP_SIZE = 2
-MAX_MODEL_LEN = 8192 * 2
+To modify these settings, inherit from `K2Inference` and set the `tp_size`, `pp_size`, `dp_size`, `nodes` `max_seqs`, `max_model_len`, and `enable_expert_parallel` class attributes. See `alt_deployments/k2_pp2.py` for an example.
+
+## Load Testing
+
+Test performance and identify bottlenecks using Locust:
+
+```bash
+# Basic load test
+modal run load_test.py --target-url https://your-deployment.modal.run
+
+# High-load distributed test
+modal run load_test.py --target-url https://your-deployment.modal.run \
+  --distributed --workers 8 --users 1000 --time 15m
 ```
+
+**Parameters:**
+- `--users`: Concurrent users (default: 100)
+- `--spawn-rate`: Users/second spawn rate (default: 10) 
+- `--time`: Test duration, e.g. "5m", "2h" (default: 5m)
+- `--distributed`: Enable multi-worker testing
+- `--workers`: Worker processes for distributed tests (default: 4)
+
+**Endpoints tested:**
+- `/v1/chat/completions` (standard + streaming)
+- `/v1/models` 
+- `/health`
+
+Results auto-saved to Modal volume `k2-loadtest-results` with CSV stats, HTML reports, and logs. Expected baseline: ~40 tokens/s single request, scales with `max_seqs=256`.
