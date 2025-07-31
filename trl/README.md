@@ -1,0 +1,1 @@
+`modal run --detach main.py --trainer-script=trainer_script_grpo.py --config-file=config_grpo.yaml`
