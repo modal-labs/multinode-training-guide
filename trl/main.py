@@ -1,4 +1,5 @@
 from constants import NUM_NODES
+from requests.exceptions import ConnectionError
 
 import modal
 import modal.experimental
@@ -31,20 +32,14 @@ image = (
     .add_local_file("constants.py", remote_path="/root/constants.py")
 )
 
-# ## Caching HuggingFace, vLLM, and storing model weights
-# We create Modal Volumes to persist:
-# - HuggingFace downloads
-# - vLLM cache
-# - Model weights
+with image.imports():
+    import wandb
 
 HF_CACHE_DIR = "/root/.cache/huggingface"
 HF_CACHE_VOL = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 
 VLLM_CACHE_DIR = "/root/.cache/vllm"
 VLLM_CACHE_VOL = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-
-WEIGHTS_DIR = "/root/multinode_rl_weights"
-WEIGHTS_VOL = modal.Volume.from_name("multinode-rl-weights", create_if_missing=True)
 
 MODEL_NAME = "Qwen/Qwen3-30B-A3B"
 MODEL_REVISION = "ae659febe817e4b3ebd7355f47792725801204c9"
@@ -73,6 +68,7 @@ def run_vllm_server():
     )
     vllm_process.wait()
 
+
 def _generate_node_config(
     machine_rank, leader_ip, leader_port, template_path, target_path
 ):
@@ -84,7 +80,10 @@ def _generate_node_config(
         ) from None
 
     formatted_config_content = accelerate_config_template.format(
-        rank=machine_rank, leader_ip=leader_ip, leader_port=leader_port, num_nodes=NUM_NODES - 1
+        rank=machine_rank,
+        leader_ip=leader_ip,
+        leader_port=leader_port,
+        num_nodes=NUM_NODES - 1,
     )
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(formatted_config_content)
@@ -92,18 +91,17 @@ def _generate_node_config(
 
 def run_trainer(cluster_info):
     """Runs the training process on rank 0, waiting for the vLLM server."""
-
-    from requests.exceptions import ConnectionError
-
     parent_dir = pathlib.Path(__file__).parent
     accelerate_config_path = parent_dir / "config_grpo_multinode.yaml"
     generated_accelerate_config_path = parent_dir / "zero3.yaml"
     trainer_script = parent_dir / "trainer_script_grpo.py"
 
-    vllm_server_host_ip = f"10.100.0.{NUM_NODES}" # 10.100.0.{rank + 1}, we run the vllm server on the last node.
+    vllm_server_host_ip = f"10.100.0.{NUM_NODES}"  # 10.100.0.{rank + 1}, we run the vllm server on the last node.
     vllm_server_url = f"http://{vllm_server_host_ip}:8000"
 
-    accelerate_leader_ip = "10.100.0.1" # we run the accelerate leader on the first node.
+    accelerate_leader_ip = (
+        "10.100.0.1"  # we run the accelerate leader on the first node.
+    )
     accelerate_leader_port = 29500
 
     rank = cluster_info.rank
@@ -142,7 +140,7 @@ def run_trainer(cluster_info):
         "--vllm_server_host",
         f"{vllm_server_host_ip}",
     ]
-  
+
     print(
         f"Container Modal rank {rank} (Trainer): "
         f"Launching train command: {' '.join(train_cmd)}"
@@ -170,7 +168,8 @@ def run_trainer(cluster_info):
     else:
         print(
             f"Container Modal rank {rank} (Trainer) process exited with code {train_process.returncode}."
-        )           
+        )
+
 
 @app.function(
     gpu="H100:8",
@@ -178,15 +177,13 @@ def run_trainer(cluster_info):
     volumes={
         HF_CACHE_DIR: HF_CACHE_VOL,
         VLLM_CACHE_DIR: VLLM_CACHE_VOL,
-        WEIGHTS_DIR: WEIGHTS_VOL,
     },
     timeout=3600,
+    cloud="oci",
     secrets=[modal.Secret.from_name("wandb-secret", environment_name="main")],
 )
 @modal.experimental.clustered(NUM_NODES, rdma=True)
-def train_fn(trainer_script: str, config_file: str):    
-    import wandb
-
+def train_fn(trainer_script: str, config_file: str):
     with open("/root/trainer_script_grpo.py", "w") as f:
         f.write(trainer_script)
     with open("/root/config_grpo_multinode.yaml", "w") as f:
@@ -202,7 +199,7 @@ def train_fn(trainer_script: str, config_file: str):
     elif rank < NUM_NODES - 1:
         run_trainer(cluster_info)
     else:
-        print(f"Container rank {rank} has no specific role in this setup.") 
+        print(f"Container rank {rank} has no specific role in this setup.")
 
 
 @app.local_entrypoint()
@@ -219,4 +216,3 @@ def main(
         config_content = f.read()
 
     train_fn.remote(trainer_content, config_content)
-
