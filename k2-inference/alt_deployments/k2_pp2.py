@@ -1,6 +1,10 @@
+import pathlib
 import modal
 import modal.experimental
-from modal_infer import K2Inference, app, hf_cache_volume, image, vllm_cache_volume
+from inference import K2Inference, app, hf_cache_volume, image, vllm_cache_volume
+
+local_path = pathlib.Path(__file__).parent.parent / "inference.py"
+image = image.add_local_file(local_path, "/root/inference.py")
 
 
 @app.cls(
@@ -11,6 +15,7 @@ from modal_infer import K2Inference, app, hf_cache_volume, image, vllm_cache_vol
         "/root/.cache/vllm": vllm_cache_volume,
     },
     timeout=60 * 60 * 1,
+    min_containers=1,
     experimental_options={"flash": "us-east"},
 )
 @modal.experimental.clustered(size=4, rdma=True)
