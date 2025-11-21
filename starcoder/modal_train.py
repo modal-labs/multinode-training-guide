@@ -56,7 +56,6 @@ class LaunchType(Enum):
         wandb_secret,
         hf_secret,
     ],
-    cloud="oci",
     gpu="H100:8",
     timeout=60 * 60 * 24,
 )

@@ -37,7 +37,6 @@ app = modal.App("multinode-benchmark")
 
 @app.function(
     gpu="H100:8",
-    cloud="oci",
     image=image,
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)

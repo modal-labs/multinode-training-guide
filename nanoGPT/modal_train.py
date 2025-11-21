@@ -201,7 +201,6 @@ def _train_multi_node() -> None:
         "/root/out": volume_model_output,
     },
     timeout=60 * 60 * 24,
-    cloud="oci",
 )
 @modal.experimental.clustered(n_nodes, rdma=True)
 def train_multi_node():
@@ -221,7 +220,6 @@ def train_multi_node():
         "/root/out": volume_model_output,
     },
     timeout=60 * 60 * 24,
-    cloud="oci",
 )
 @modal.experimental.clustered(n_nodes, rdma=True)
 def bench_multi_node():
@@ -245,7 +243,6 @@ def bench_multi_node():
         "/root/out": volume_model_output,
     },
     timeout=2 * 60 * 60,  # should always be faster than 2 hours
-    cloud="oci",
 )
 @modal.experimental.clustered(n_nodes, rdma=True)
 def speedrun_multi_node():
