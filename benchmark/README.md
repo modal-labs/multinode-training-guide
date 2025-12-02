@@ -29,9 +29,28 @@ For more details on these metrics, see the [NVIDIA NCCL Tests documentation](htt
 
 ## Environment Configuration
 
-The benchmark automatically configures RDMA settings for OCI's infrastructure:
+The benchmark automatically configures RDMA settings for Modal's infrastructure:
 
 - Uses IPv6 for control plane (TCP) communication
 - Uses IPv4 for data plane (RDMA) communication
 - Configures optimal NCCL parameters for IB/RDMA
 - Sets appropriate HCA device ordering
+
+## EFA Support
+
+Modal can schedule RDMA-enabled workloads on instances with AWS EFA enabled. Enabling EFA
+deepens the pool of available instances for RDMA-enabled workloads, but it requires configuration
+at the container level.
+
+`modal_train_efa.py` is configured to work both with regular RoCE-based Infiniband and EFA. The
+function logic detects whether EFA is enabled and configures the appropriate libraries.
+
+The Image built from `modal_train_efa.py` will work properly on both Infiniband and EFA instances. This
+means there are no downsides to using this image, but we provide it separately to show the difference
+between standard Infiniband and EFA.
+
+Note that the image build will take ~15 minutes, but it will be cached permanently once it is built.
+
+```bash
+modal run modal_train_efa.py::run_benchmark_efa
+```
