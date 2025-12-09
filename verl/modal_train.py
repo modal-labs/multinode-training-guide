@@ -15,6 +15,8 @@ image = (
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
     .apt_install("libibverbs-dev", "libibverbs1")
+    .uv_pip_install("verl[vllm]==0.6.1")
+    .entrypoint([])
 )
 
 DATA_PATH: Path = Path("/data")
@@ -27,27 +29,49 @@ checkpoints_volume: modal.Volume = modal.Volume.from_name(
 )
 
 
-MODEL_ID = 
+MODEL_ID: str = "Qwen/Qwen3-32B"
+HF_MODEL_DIR: Path = MODELS_PATH / "hf_models" / MODEL_ID
+MCORE_MODEL_DIR: Path = MODELS_PATH / "mcore_models" / MODEL_ID
 
 
 download_image = (
-    modal.Image.debian_slim()
-    .uv_pip_install("huggingface_hub[hf_transfer]==1.2.1")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install("huggingface_hub==1.2.1")
+    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
 
 @app.function(
     volumes={MODELS_PATH.as_posix(): checkpoints_volume},
     image=download_image,
+    timeout=60 * 60 * 24,
 )
 def download_model(
-    repo_id: str = "hf-internal-testing/tiny-random-GPTNeoXForCausalLM",
+    repo_id: str = MODEL_ID,
     revision: Optional[str] = None,  # include a revision to prevent surprises!
 ):
     from huggingface_hub import snapshot_download
 
-    snapshot_download(repo_id=repo_id, local_dir=MODEL_DIR / repo_id, revision=revision)
-    print(f"Model downloaded to {MODEL_DIR / repo_id}")
+    snapshot_download(repo_id=repo_id, local_dir=HF_MODEL_DIR, revision=revision)
+    print(f"Model downloaded to {HF_MODEL_DIR}")
+
+    checkpoints_volume.commit()
+
+
+@app.function(image=image, gpu="H100:2", timeout=60 * 60 * 24, volumes={MODELS_PATH.as_posix(): checkpoints_volume})
+def convert_hf_to_mcore() -> None:
+    checkpoints_volume.reload()
+    subprocess.run(
+        [
+            "python",
+            VERL_REPO_PATH / "scripts" / "converter_hf_to_mcore.py",
+            "--hf_model_path",
+            str(HF_MODEL_DIR),
+            "--output_path",
+            str(MCORE_MODEL_DIR),
+        ],
+        check=True,
+    )
+    checkpoints_volume.commit()
 
 
 @app.function(image=image, volumes={DATA_PATH: data_volume})
