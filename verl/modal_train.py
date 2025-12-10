@@ -9,12 +9,69 @@ import modal.experimental
 
 app = modal.App("example-grpo-verl")
 
+
+def make_image_with_efa(image: modal.Image) -> modal.Image:
+    EFA_INSTALLER_VERSION = "1.44.0"
+    AWS_OFI_NCCL_VERSION = "1.17.2"
+    INSTALL_DIR = "/tmp"
+
+    return (
+        image
+        .apt_install(
+            "libibverbs-dev",
+            "libibverbs1",
+            "wget",
+            "ca-certificates",
+            "curl",
+        )
+        .apt_install(
+            "build-essential",
+            "devscripts",
+            "debhelper",
+            "check",
+            "libsubunit-dev",
+            "fakeroot",
+            "pkg-config",
+            "dkms",
+            "libhwloc-dev",
+            "cuda-toolkit-12-9",
+        )
+        .run_commands(
+            # Install AWS EFA userspace libraries.
+            f"""cd {INSTALL_DIR} && \
+            curl -O https://efa-installer.amazonaws.com/aws-efa-installer-{EFA_INSTALLER_VERSION}.tar.gz && \
+            tar -xf {INSTALL_DIR}/aws-efa-installer-{EFA_INSTALLER_VERSION}.tar.gz && \
+            cd aws-efa-installer && \
+            ./efa_installer.sh -y -d --skip-kmod --skip-limit-conf --no-verify
+            """,
+        )
+        .run_commands(
+            # Install AWS OFI NCCL libraries.
+            f"""cd {INSTALL_DIR} && \
+            wget https://github.com/aws/aws-ofi-nccl/releases/download/v{AWS_OFI_NCCL_VERSION}/aws-ofi-nccl-{AWS_OFI_NCCL_VERSION}.tar.gz && \
+            tar xf {INSTALL_DIR}/aws-ofi-nccl-{AWS_OFI_NCCL_VERSION}.tar.gz && \
+            cd aws-ofi-nccl-{AWS_OFI_NCCL_VERSION} && \
+            ./configure --with-libfabric=/opt/amazon/efa/ --with-cuda=/usr/local/cuda --prefix=/opt/amazon/ofi-nccl --disable-nccl-net-symlink && \
+            make && \
+            make install
+            """,
+        )
+        .run_commands(
+            # Remove EFA and OFI libraries from the default library path so they're not used on non-EFA hardware.
+            "rm -f /etc/ld.so.conf.d/000_efa.conf",
+            "rm -f /etc/ld.so.conf.d/100_ofinccl.conf",
+        )
+    )
+
+
+
 VERL_REPO_PATH: Path = Path("/root/verl")
 image = (
-    modal.Image.from_registry("verlai/verl:vllm011.latest")
+    make_image_with_efa(
+        modal.Image.from_registry("verlai/verl:vllm011.latest")
+    )
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
-    .apt_install("libibverbs-dev", "libibverbs1")
     .uv_pip_install("verl[vllm]==0.6.1")
     .entrypoint([])
 )
@@ -194,8 +251,11 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.actor.megatron.context_parallel_size=1",
         "actor_rollout_ref.actor.megatron.expert_model_parallel_size=1",
         "actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1",
-        "actor_rollout_ref.actor.megatron.dtype=float16",
-        "actor_rollout_ref.actor.megatron.use_mbridge=True",
+
+        # NOTE TO PEYTON - THIS IS USING BF16
+        # enable this to use HF hceckpoints natively
+        "actor_rollout_ref.actor.megatron.dtype=bfloat16",
+        # "actor_rollout_ref.actor.megatron.use_mbridge=True",
 
         # Offload to keep 32B comfortable on 16×H100
         "actor_rollout_ref.actor.megatron.param_offload=True",
@@ -219,7 +279,7 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
         "actor_rollout_ref.rollout.data_parallel_size=1",
         "actor_rollout_ref.rollout.expert_parallel_size=1",
-        "actor_rollout_ref.rollout.dtype=float16",
+        "actor_rollout_ref.rollout.dtype=bfloat16",
         # Make vLLM lighter so Megatron can breathe
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
@@ -252,27 +312,6 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096",
-
-        # ===== CRITIC (Megatron) =====
-        "critic.strategy=megatron",
-        f"critic.model.path={HF_MODEL_DIR}",
-        "critic.optim.lr=1e-5",
-        "critic.ppo_micro_batch_size_per_gpu=2",
-        "critic.megatron.pipeline_model_parallel_size=2",
-        "critic.megatron.tensor_model_parallel_size=4",
-        "critic.megatron.context_parallel_size=1",
-        "critic.megatron.expert_model_parallel_size=1",
-        "critic.megatron.expert_tensor_parallel_size=1",
-        "critic.megatron.param_offload=True",
-        "critic.megatron.grad_offload=True",
-        "critic.megatron.optimizer_offload=True",
-        "critic.megatron.use_dist_checkpointing=True",
-        f"critic.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
-        "critic.megatron.dtype=float16",
-        "critic.megatron.use_mbridge=True",
-
-        # Critic checkpoint: also only save model
-        'critic.checkpoint.save_contents=["model"]',
 
         # ===== Algo / trainer / reward =====
         "algorithm.use_kl_in_reward=False",
@@ -389,8 +428,17 @@ N_NODES = 2
     image=image,
     gpu="H100:8",
     volumes={MODELS_PATH: checkpoints_volume, DATA_PATH: data_volume},
-    secrets=[modal.Secret.from_name("wandb-secret")],
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_dict({
+            "LD_LIBRARY_PATH": "/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib",
+            "NCCL_NET_PLUGIN": "ofi",
+        })
+    ],
     timeout=24 * 60 * 60,
+    experimental_options={
+        "efa_enabled": True,
+    },
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
 async def train_multi_node(*arglist):
