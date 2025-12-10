@@ -32,6 +32,7 @@ checkpoints_volume: modal.Volume = modal.Volume.from_name(
 MODEL_ID: str = "Qwen/Qwen3-32B"
 HF_MODEL_DIR: Path = MODELS_PATH / "hf_models" / MODEL_ID
 MCORE_MODEL_DIR: Path = MODELS_PATH / "mcore_models" / MODEL_ID
+TRAINING_CHECKPOINT_DIR: Path = MODELS_PATH / "training_checkpoints" / MODEL_ID
 
 
 download_image = (
@@ -129,7 +130,7 @@ def extract_solution(
 
 
 def compute_reward(
-    data_source: str, solution_str: str, ground_truth: str, extra_info: dict
+    data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **kwargs
 ) -> float:
     """Compute binary reward for GSM8K math problems.
 
@@ -151,62 +152,144 @@ REWARD_FUNCTION_NAME: str = "compute_reward"
 
 
 def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
-    """Build the verl trainer command for GRPO training on GSM8K.
+    """Build the verl trainer command for GRPO training on GSM8K with Qwen3-32B + Megatron.
 
-    Configures Qwen2.5-0.5B with FSDP for the actor, vLLM for rollout generation,
-    and the custom reward function. Additional CLI args can be passed via arglist.
+    Uses:
+      - Megatron backend for actor / critic / ref
+      - HF path for the base model
+      - mcore (dist) checkpoint for fast Megatron weight loading
+      - vLLM for rollout
     """
     cmd: list[str] = [
         "python",
         "-u",
         "-m",
         "verl.trainer.main_ppo",
+        # Use Megatron trainer config
+        "--config-path=config",
+        "--config-name=ppo_megatron_trainer.yaml",
+
+        # GRPO on GSM8K
         "algorithm.adv_estimator=grpo",
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'test.parquet'}",
+
+        # llm
+        "data.prompt_key=prompt",
+        "data.return_raw_chat=True",
+
+
         "data.train_batch_size=128",
-        "data.max_prompt_length=64",
+        "data.max_prompt_length=512",
         "data.max_response_length=1024",
         "data.filter_overlong_prompts=True",
         "data.truncation=error",
-        "actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B",
+
+        # Base model: Qwen3-32B (HF path)
+        f"actor_rollout_ref.model.path={HF_MODEL_DIR}",
+
+        # === Actor (Megatron) ===
+        "actor_rollout_ref.actor.strategy=megatron",
+        # "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.actor.optim.lr=1e-6",
-        "actor_rollout_ref.model.use_remove_padding=False",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=128",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16",
-        "actor_rollout_ref.actor.checkpoint.save_contents=\\'model,optimizer,extra,hf_model\\'",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=32",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.actor.use_kl_loss=True",
-        "actor_rollout_ref.actor.entropy_coeff=0",
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
-        "actor_rollout_ref.model.enable_gradient_checkpointing=True",
-        "actor_rollout_ref.actor.fsdp_config.param_offload=False",
-        "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=2",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16",
+        "actor_rollout_ref.actor.entropy_coeff=0",
+        "actor_rollout_ref.actor.loss_agg_mode=token-mean",
+
+        # Parallelism: 16 GPUs total → DP=2, TP=4, PP=2, CP=1, EP=1
+        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2",
+        "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4",
+        "actor_rollout_ref.actor.megatron.context_parallel_size=1",
+        "actor_rollout_ref.actor.megatron.expert_model_parallel_size=1",
+        "actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1",
+
+        # Offload to keep 32B comfortable on 16×H100
+        "actor_rollout_ref.actor.megatron.param_offload=True",
+        "actor_rollout_ref.actor.megatron.grad_offload=True",
+        "actor_rollout_ref.actor.megatron.optimizer_offload=True",
+
+        # Load from dist (mcore) checkpoint we converted earlier
+        "actor_rollout_ref.actor.megatron.use_dist_checkpointing=True",
+        f"actor_rollout_ref.actor.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
+
+        # Optional: dynamic batch size for better throughput
+        "actor_rollout_ref.actor.use_dynamic_bsz=True",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192",
+
+        # === vLLM rollout (still using HF weights) ===
         "actor_rollout_ref.rollout.name=vllm",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4",
+        "actor_rollout_ref.rollout.mode=async",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
+        "actor_rollout_ref.rollout.data_parallel_size=1",
+        "actor_rollout_ref.rollout.expert_parallel_size=1",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
+        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",
+        "actor_rollout_ref.rollout.enable_chunked_prefill=True",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=4096",
         "actor_rollout_ref.rollout.n=4",
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16",
-        "actor_rollout_ref.ref.fsdp_config.param_offload=True",
+        "actor_rollout_ref.rollout.temperature=1.0",
+        "actor_rollout_ref.rollout.top_p=1.0",
+        "actor_rollout_ref.rollout.top_k=-1",
+        "actor_rollout_ref.rollout.val_kwargs.temperature=1.0",
+        "actor_rollout_ref.rollout.val_kwargs.top_p=0.7",
+        "actor_rollout_ref.rollout.val_kwargs.top_k=-1",
+        "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
+        "actor_rollout_ref.rollout.val_kwargs.n=1",
+
+        # === Reference model (Megatron as well, sharing dist ckpt) ===
+        "actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=2",
+        "actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4",
+        "actor_rollout_ref.ref.megatron.context_parallel_size=1",
+        "actor_rollout_ref.ref.megatron.expert_model_parallel_size=1",
+        "actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1",
+        "actor_rollout_ref.ref.megatron.param_offload=True",
+        "actor_rollout_ref.ref.megatron.use_dist_checkpointing=True",
+        f"actor_rollout_ref.ref.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True",
+        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192",
+
+        # === Critic (Megatron) ===
+        "critic.strategy=megatron",
+        f"critic.model.path={HF_MODEL_DIR}",
+        # "critic.model.enable_gradient_checkpointing=True",
+        "critic.optim.lr=1e-5",
+        "critic.ppo_micro_batch_size_per_gpu=2",
+        "critic.megatron.pipeline_model_parallel_size=2",
+        "critic.megatron.tensor_model_parallel_size=4",
+        "critic.megatron.context_parallel_size=1",
+        "critic.megatron.expert_model_parallel_size=1",
+        "critic.megatron.expert_tensor_parallel_size=1",
+        "critic.megatron.param_offload=True",
+        "critic.megatron.grad_offload=True",
+        "critic.megatron.optimizer_offload=True",
+        "critic.megatron.use_dist_checkpointing=True",
+        f"critic.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
+
+        # === Algo / trainer ===
         "algorithm.use_kl_in_reward=False",
         "trainer.critic_warmup=0",
         "trainer.logger=[console,wandb]",
-        "trainer.project_name=verl_grpo_example_qwen2.5-0.5b",
-        "trainer.experiment_name=qwen2.5-0.5b_example",
+        "trainer.project_name=verl_grpo_qwen3_32b",
+        "trainer.experiment_name=qwen3_32b_megatron_gsm8k",
         "trainer.n_gpus_per_node=8",
         f"trainer.nnodes={n_nodes}",
         "trainer.test_freq=5",
-        f"trainer.default_local_dir={MODELS_PATH}",
+        f"trainer.default_local_dir={TRAINING_CHECKPOINT_DIR}",
         "trainer.resume_mode=auto",
-        # Parameters chosen to ensure easy automated testing. Remove if needed.
         "trainer.save_freq=1",
-        # "trainer.total_training_steps=1",
-        # "trainer.total_epochs=1",
-        # For the custom reward function.
+
+        # Custom reward function
         f"custom_reward_function.path={str(PATH_TO_REWARD_FUNCTION)}",
         f"custom_reward_function.name={REWARD_FUNCTION_NAME}",
     ]
+
     if arglist:
         cmd.extend(arglist)
 
