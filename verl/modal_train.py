@@ -16,8 +16,7 @@ def make_image_with_efa(image: modal.Image) -> modal.Image:
     INSTALL_DIR = "/tmp"
 
     return (
-        image
-        .apt_install(
+        image.apt_install(
             "libibverbs-dev",
             "libibverbs1",
             "wget",
@@ -64,15 +63,14 @@ def make_image_with_efa(image: modal.Image) -> modal.Image:
     )
 
 
-
 VERL_REPO_PATH: Path = Path("/root/verl")
 image = (
-    make_image_with_efa(
-        modal.Image.from_registry("verlai/verl:vllm011.latest")
-    )
+    make_image_with_efa(modal.Image.from_registry("verlai/verl:vllm011.latest"))
     .apt_install("git")
-    .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
-    .uv_pip_install("verl[vllm]==0.6.1")
+    .run_commands(
+        f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}",
+    )
+    .uv_pip_install(f"{VERL_REPO_PATH}")
     .entrypoint([])
 )
 
@@ -98,6 +96,7 @@ download_image = (
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
 
+
 @app.function(
     volumes={MODELS_PATH.as_posix(): checkpoints_volume},
     image=download_image,
@@ -115,7 +114,12 @@ def download_model(
     checkpoints_volume.commit()
 
 
-@app.function(image=image, gpu="H100:2", timeout=60 * 60 * 24, volumes={MODELS_PATH.as_posix(): checkpoints_volume})
+@app.function(
+    image=image,
+    gpu="H100:2",
+    timeout=60 * 60 * 24,
+    volumes={MODELS_PATH.as_posix(): checkpoints_volume},
+)
 def convert_hf_to_mcore() -> None:
     checkpoints_volume.reload()
     subprocess.run(
@@ -132,7 +136,7 @@ def convert_hf_to_mcore() -> None:
     checkpoints_volume.commit()
 
 
-@app.function(image=image, volumes={DATA_PATH: data_volume})
+@app.function(image=image, volumes={DATA_PATH.as_posix(): data_volume})
 def prep_dataset() -> None:
     """Download and preprocess GSM8K math dataset into train/test parquet files.
 
@@ -218,23 +222,29 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "verl.trainer.main_ppo",
         "--config-path=config",
         "--config-name=ppo_megatron_trainer.yaml",
-
         # ----- Data / algorithm -----
         "algorithm.adv_estimator=grpo",
         f"data.train_files={DATA_PATH / 'train.parquet'}",
         f"data.val_files={DATA_PATH / 'test.parquet'}",
         "data.prompt_key=prompt",
         "data.return_raw_chat=True",
-        "data.train_batch_size=512",
-        "data.max_prompt_length=256",
-        "data.max_response_length=512",
+        "data.max_prompt_length=768",
+        "data.max_response_length=8192",
         "data.filter_overlong_prompts=True",
         "data.truncation=error",
-
         # ----- Base model (HF view) -----
         f"actor_rollout_ref.model.path={HF_MODEL_DIR}",
-
+        "actor_rollout_ref.model.use_fused_kernels=True",
+        # ===== Resource Layout =====
+        f"trainer.nnodes={n_nodes}",
+        "trainer.n_gpus_per_node=8",
+        # ===== Batching =====
+        # EITHER actor_rollout_ref.rollout.n should be an integer divisor of: trainer.n_gpus_per_node * trainer.nnodes
+        # OR actor_rollout_ref.rollout.n * data.train_batch_size should be evenly divisible by: trainer.n_gpus_per_node * trainer.nnodes
+        "actor_rollout_ref.rollout.n=4",
+        "data.train_batch_size=512",
         # ===== ACTOR (Megatron) =====
+        # TODO vllm placement
         "actor_rollout_ref.actor.strategy=megatron",
         "actor_rollout_ref.actor.optim.lr=1e-6",
         "actor_rollout_ref.actor.ppo_mini_batch_size=16",
@@ -244,40 +254,33 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
         "actor_rollout_ref.actor.entropy_coeff=0",
         "actor_rollout_ref.actor.loss_agg_mode=token-mean",
-
         # Parallelism: 16 GPUs total → DP=2, TP=4, PP=2, CP=1, EP=1
-        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4",
-        "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4",
+        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1",
+        "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=8",
         "actor_rollout_ref.actor.megatron.context_parallel_size=1",
         "actor_rollout_ref.actor.megatron.expert_model_parallel_size=1",
         "actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1",
-
         # NOTE TO PEYTON - THIS IS USING BF16
         # enable this to use HF hceckpoints natively
         "actor_rollout_ref.actor.megatron.dtype=bfloat16",
         # "actor_rollout_ref.actor.megatron.use_mbridge=True",
-
         # Offload to keep 32B comfortable on 16×H100
         # removing these for now to see if it works without them
         "actor_rollout_ref.actor.megatron.param_offload=False",
         # i oomed so now i'm tryin ggrad offload
         "actor_rollout_ref.actor.megatron.grad_offload=False",
-
         # keep optimizer offload for now to see what memory footprint is like
         "actor_rollout_ref.actor.megatron.optimizer_offload=False",
-
         # Load from dist (mcore) checkpoint we converted earlier
         "actor_rollout_ref.actor.megatron.use_dist_checkpointing=True",
         f"actor_rollout_ref.actor.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
-
         # Dynamic batch size to balance MFU vs memory
         "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096",
-
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8960",
         # ----- Actor checkpoint: save *only* model, no optimizer -----
         'actor_rollout_ref.actor.checkpoint.save_contents=["model"]',
-
         # ===== ROLLOUT (vLLM) =====
+        # TODO
         "actor_rollout_ref.rollout.name=vllm",
         "actor_rollout_ref.rollout.mode=async",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=4",
@@ -285,14 +288,14 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.rollout.expert_parallel_size=1",
         "actor_rollout_ref.rollout.dtype=bfloat16",
         # Make vLLM lighter so Megatron can breathe
+        # TODO vllm placement
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
-        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096",
+        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8960",
         "actor_rollout_ref.rollout.enable_chunked_prefill=True",
         "actor_rollout_ref.rollout.max_num_batched_tokens=2048",
         # Sampling params
-        "actor_rollout_ref.rollout.n=4",
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.top_p=1.0",
         "actor_rollout_ref.rollout.top_k=-1",
@@ -301,38 +304,33 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.rollout.val_kwargs.top_k=-1",
         "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
         "actor_rollout_ref.rollout.val_kwargs.n=1",
-
         # ===== REF MODEL (Megatron) =====
-        "actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=4",
-        "actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4",
+        "actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=1",
+        "actor_rollout_ref.ref.megatron.tensor_model_parallel_size=8",
         "actor_rollout_ref.ref.megatron.context_parallel_size=1",
         "actor_rollout_ref.ref.megatron.expert_model_parallel_size=1",
         "actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1",
         # removing these for now to see if it works without them
         # had to turn it back on to get it to work
-        "actor_rollout_ref.ref.megatron.param_offload=False",
+        "actor_rollout_ref.ref.megatron.param_offload=True",
         "actor_rollout_ref.ref.megatron.use_dist_checkpointing=True",
         f"actor_rollout_ref.ref.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
         "actor_rollout_ref.ref.megatron.dtype=bfloat16",
         # "actor_rollout_ref.ref.megatron.use_mbridge=True",
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True",
-        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096",
-
+        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8960",  # 8192 + 768
         # ===== Algo / trainer / reward =====
         "algorithm.use_kl_in_reward=False",
         "trainer.critic_warmup=0",
         "trainer.logger=[console,wandb]",
         "trainer.project_name=verl_grpo_qwen3_32b",
         "trainer.experiment_name=qwen3_32b_megatron_gsm8k",
-        "trainer.n_gpus_per_node=8",
-        f"trainer.nnodes={n_nodes}",
         "trainer.test_freq=5",
         f"trainer.default_local_dir={TRAINING_CHECKPOINT_DIR}",
         # disable periodic checkpoint saves for now (you can bump >0 later)
         "trainer.save_freq=-1",
         "trainer.resume_mode=auto",
-
         f"custom_reward_function.path={str(PATH_TO_REWARD_FUNCTION)}",
         f"custom_reward_function.name={REWARD_FUNCTION_NAME}",
     ]
@@ -341,7 +339,6 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         cmd.extend(arglist)
 
     return cmd
-
 
 
 with image.imports():
@@ -414,9 +411,7 @@ async def run_training(n_nodes: int, arglist: list[str]):
     client = JobSubmissionClient()
 
     verl_cmd = generate_verl_cmd(n_nodes, arglist)
-    job_id = client.submit_job(
-        entrypoint=" ".join(verl_cmd),
-    )
+    job_id = client.submit_job(entrypoint=" ".join(verl_cmd))
     print(f"Job submitted with ID: {job_id}")
 
     async for line in client.tail_job_logs(job_id):
@@ -432,10 +427,14 @@ N_NODES = 4
     volumes={MODELS_PATH: checkpoints_volume, DATA_PATH: data_volume},
     secrets=[
         modal.Secret.from_name("wandb-secret"),
-        modal.Secret.from_dict({
-            "LD_LIBRARY_PATH": "/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib",
-            "NCCL_NET_PLUGIN": "ofi",
-        })
+        modal.Secret.from_dict(
+            {
+                "LD_LIBRARY_PATH": "/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib",
+                "NCCL_NET_PLUGIN": "ofi",
+                # "NCCL_DEBUG": "INFO",
+                "VLLM_LOGGING_LEVEL": "INFO",
+            }
+        ),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
