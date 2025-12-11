@@ -225,7 +225,7 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         f"data.val_files={DATA_PATH / 'test.parquet'}",
         "data.prompt_key=prompt",
         "data.return_raw_chat=True",
-        "data.train_batch_size=32",
+        "data.train_batch_size=512",
         "data.max_prompt_length=256",
         "data.max_response_length=512",
         "data.filter_overlong_prompts=True",
@@ -237,8 +237,8 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         # ===== ACTOR (Megatron) =====
         "actor_rollout_ref.actor.strategy=megatron",
         "actor_rollout_ref.actor.optim.lr=1e-6",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
@@ -246,7 +246,7 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.actor.loss_agg_mode=token-mean",
 
         # Parallelism: 16 GPUs total → DP=2, TP=4, PP=2, CP=1, EP=1
-        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2",
+        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4",
         "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4",
         "actor_rollout_ref.actor.megatron.context_parallel_size=1",
         "actor_rollout_ref.actor.megatron.expert_model_parallel_size=1",
@@ -258,9 +258,13 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         # "actor_rollout_ref.actor.megatron.use_mbridge=True",
 
         # Offload to keep 32B comfortable on 16×H100
-        "actor_rollout_ref.actor.megatron.param_offload=True",
-        "actor_rollout_ref.actor.megatron.grad_offload=True",
-        "actor_rollout_ref.actor.megatron.optimizer_offload=True",
+        # removing these for now to see if it works without them
+        "actor_rollout_ref.actor.megatron.param_offload=False",
+        # i oomed so now i'm tryin ggrad offload
+        "actor_rollout_ref.actor.megatron.grad_offload=False",
+
+        # keep optimizer offload for now to see what memory footprint is like
+        "actor_rollout_ref.actor.megatron.optimizer_offload=False",
 
         # Load from dist (mcore) checkpoint we converted earlier
         "actor_rollout_ref.actor.megatron.use_dist_checkpointing=True",
@@ -282,7 +286,7 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.rollout.dtype=bfloat16",
         # Make vLLM lighter so Megatron can breathe
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096",
         "actor_rollout_ref.rollout.enable_chunked_prefill=True",
@@ -299,17 +303,19 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "actor_rollout_ref.rollout.val_kwargs.n=1",
 
         # ===== REF MODEL (Megatron) =====
-        "actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=2",
+        "actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=4",
         "actor_rollout_ref.ref.megatron.tensor_model_parallel_size=4",
         "actor_rollout_ref.ref.megatron.context_parallel_size=1",
         "actor_rollout_ref.ref.megatron.expert_model_parallel_size=1",
         "actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=1",
-        "actor_rollout_ref.ref.megatron.param_offload=True",
+        # removing these for now to see if it works without them
+        # had to turn it back on to get it to work
+        "actor_rollout_ref.ref.megatron.param_offload=False",
         "actor_rollout_ref.ref.megatron.use_dist_checkpointing=True",
         f"actor_rollout_ref.ref.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
-        "actor_rollout_ref.ref.megatron.dtype=float16",
-        "actor_rollout_ref.ref.megatron.use_mbridge=True",
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2",
+        "actor_rollout_ref.ref.megatron.dtype=bfloat16",
+        # "actor_rollout_ref.ref.megatron.use_mbridge=True",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True",
         "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096",
 
@@ -366,10 +372,6 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
             ]
         )
 
-        tunnel = modal.forward(RAY_DASHBOARD_PORT).__enter__()
-        dashboard_url = tunnel.url
-        print(f"Dashboard URL: {dashboard_url}")
-
         for _ in range(10):
             try:
                 ray.init(address="auto")
@@ -380,7 +382,7 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
         else:
             raise Exception("Failed to connect to Ray")
 
-        for _ in range(10):
+        for _ in range(60):
             print("Waiting for worker nodes to connect...")
             alive_nodes = [n for n in ray.nodes() if n["Alive"]]
             print(f"Alive nodes: {alive_nodes}")
@@ -421,7 +423,7 @@ async def run_training(n_nodes: int, arglist: list[str]):
         print(line, end="", flush=True)
 
 
-N_NODES = 2
+N_NODES = 4
 
 
 @app.function(
@@ -462,7 +464,11 @@ async def train_multi_node(*arglist):
     _init_ray(cluster_info.rank, ray_main_node_addr, my_ip_addr, N_NODES)
 
     if cluster_info.rank == 0:
-        await run_training(N_NODES, list(arglist))
+        with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
+            dashboard_url = tunnel.url
+            print(f"Dashboard URL: {dashboard_url}")
+
+            await run_training(N_NODES, list(arglist))
     else:
         # We have to keep the worker node alive until the training is complete. Once rank 0
         # finishes, all workers will be terminated.
