@@ -1,6 +1,6 @@
-# [wip] Verl multi-node training guide
+# VERL Multi-node Training Guide
 
-I'll flesh this out once I have a working example with Megatron.
+Example of full-finetuning of Qwen3-32B via RLVR on GSM.
 
 ## Quickstart
 
