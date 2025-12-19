@@ -229,7 +229,7 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         "data.prompt_key=prompt",
         "data.return_raw_chat=True",
         "data.max_prompt_length=768",
-        "data.max_response_length=8192",
+        "data.max_response_length=2048",
         "data.filter_overlong_prompts=True",
         "data.truncation=error",
         # ----- Base model (HF view) -----
@@ -242,13 +242,16 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         # EITHER actor_rollout_ref.rollout.n should be an integer divisor of: trainer.n_gpus_per_node * trainer.nnodes
         # OR actor_rollout_ref.rollout.n * data.train_batch_size should be evenly divisible by: trainer.n_gpus_per_node * trainer.nnodes
         "actor_rollout_ref.rollout.n=4",
-        "data.train_batch_size=512",
+        "data.train_batch_size=128",
         # ===== ACTOR (Megatron) =====
         # TODO vllm placement
         "actor_rollout_ref.actor.strategy=megatron",
         "actor_rollout_ref.actor.optim.lr=1e-6",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=128",
+        # "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16",
+        # Dynamic batch size to balance MFU vs memory
+        "actor_rollout_ref.actor.use_dynamic_bsz=True",
+        f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={2816 * 4}",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
@@ -274,9 +277,6 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         # Load from dist (mcore) checkpoint we converted earlier
         "actor_rollout_ref.actor.megatron.use_dist_checkpointing=True",
         f"actor_rollout_ref.actor.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
-        # Dynamic batch size to balance MFU vs memory
-        "actor_rollout_ref.actor.use_dynamic_bsz=True",
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8960",
         # ----- Actor checkpoint: save *only* model, no optimizer -----
         'actor_rollout_ref.actor.checkpoint.save_contents=["model"]',
         # ===== ROLLOUT (vLLM) =====
@@ -290,11 +290,10 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         # Make vLLM lighter so Megatron can breathe
         # TODO vllm placement
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.25",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+        # "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64",
         "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
-        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8960",
+        f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={2048 * 18}",
         "actor_rollout_ref.rollout.enable_chunked_prefill=True",
-        "actor_rollout_ref.rollout.max_num_batched_tokens=2048",
         # Sampling params
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.top_p=1.0",
@@ -317,9 +316,9 @@ def generate_verl_cmd(n_nodes: int, arglist: list[str]) -> list[str]:
         f"actor_rollout_ref.ref.megatron.dist_checkpointing_path={MCORE_MODEL_DIR}",
         "actor_rollout_ref.ref.megatron.dtype=bfloat16",
         # "actor_rollout_ref.ref.megatron.use_mbridge=True",
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64",
         "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True",
-        "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8960",  # 8192 + 768
+        f"actor_rollout_ref.ref.log_prob_max_token_len_per_gpu={2048 * 18}",  # 8192 + 768
         # ===== Algo / trainer / reward =====
         "algorithm.use_kl_in_reward=False",
         "trainer.critic_warmup=0",
