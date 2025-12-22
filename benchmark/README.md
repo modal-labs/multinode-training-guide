@@ -54,3 +54,13 @@ Note that the image build will take ~15 minutes, but it will be cached permanent
 ```bash
 modal run modal_train_efa.py::run_benchmark_efa
 ```
+
+## Runtime Cluster Configuration
+
+This directory also contains an example of configuring the cluster definition at runtime in [modal_train_runtime_cfg.py](./modal_train_runtime_cfg.py). To run the NCCL bandwidth benchmark on a 2-node 8xB200 cluster:
+
+```bash
+python modal_train_runtime_cfg.py 2 8 --gpu-type B200
+```
+
+The `--gpu-type` parameter can be any of `H100`, `H200`, or `B200`.
