@@ -3,6 +3,11 @@ import os
 import modal
 import modal.experimental
 
+cuda_version = "12.4.0"  # should be no greater than host CUDA version
+flavor = "devel"  #  includes full CUDA toolkit
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
 LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTE_CODE_DIR = "/root/"
 REMOTE_BENCH_SCRIPT_PATH = "/root/train.py"
@@ -11,13 +16,12 @@ N_NODES = 2
 N_PROC_PER_NODE = 8
 
 image = (
-    modal.Image.debian_slim()
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
     .apt_install(
         "libibverbs-dev",
         "libibverbs1",
-        "wget",
-        "ca-certificates",
-        "curl",
+        "libhwloc15",
+        "libnl-route-3-200",
     )
     .uv_pip_install(
         "torch==2.6.0",
@@ -33,8 +37,14 @@ image = (
 app = modal.App("multinode-benchmark")
 
 @app.function(
-    gpu="H200:8",
+    gpu="H100:8",
     image=image,
+    # Enabling EFA unlocks extra capacity of H100 clusters. This only requires that the container
+    # has a CUDA runtime installed and packages libhwloc15 and libnl-route-3-200.
+    experimental_options={
+        "efa_enabled": True,
+    },
+    timeout=60 * 60, # 1 hour
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
 def run_benchmark():
