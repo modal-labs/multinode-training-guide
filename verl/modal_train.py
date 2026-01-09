@@ -10,62 +10,9 @@ import modal.experimental
 app = modal.App("example-grpo-verl")
 
 
-def make_image_with_efa(image: modal.Image) -> modal.Image:
-    EFA_INSTALLER_VERSION = "1.44.0"
-    AWS_OFI_NCCL_VERSION = "1.17.2"
-    INSTALL_DIR = "/tmp"
-
-    return (
-        image.apt_install(
-            "libibverbs-dev",
-            "libibverbs1",
-            "wget",
-            "ca-certificates",
-            "curl",
-        )
-        .apt_install(
-            "build-essential",
-            "devscripts",
-            "debhelper",
-            "check",
-            "libsubunit-dev",
-            "fakeroot",
-            "pkg-config",
-            "dkms",
-            "libhwloc-dev",
-            "cuda-toolkit-12-9",
-        )
-        .run_commands(
-            # Install AWS EFA userspace libraries.
-            f"""cd {INSTALL_DIR} && \
-            curl -O https://efa-installer.amazonaws.com/aws-efa-installer-{EFA_INSTALLER_VERSION}.tar.gz && \
-            tar -xf {INSTALL_DIR}/aws-efa-installer-{EFA_INSTALLER_VERSION}.tar.gz && \
-            cd aws-efa-installer && \
-            ./efa_installer.sh -y -d --skip-kmod --skip-limit-conf --no-verify
-            """,
-        )
-        .run_commands(
-            # Install AWS OFI NCCL libraries.
-            f"""cd {INSTALL_DIR} && \
-            wget https://github.com/aws/aws-ofi-nccl/releases/download/v{AWS_OFI_NCCL_VERSION}/aws-ofi-nccl-{AWS_OFI_NCCL_VERSION}.tar.gz && \
-            tar xf {INSTALL_DIR}/aws-ofi-nccl-{AWS_OFI_NCCL_VERSION}.tar.gz && \
-            cd aws-ofi-nccl-{AWS_OFI_NCCL_VERSION} && \
-            ./configure --with-libfabric=/opt/amazon/efa/ --with-cuda=/usr/local/cuda --prefix=/opt/amazon/ofi-nccl --disable-nccl-net-symlink && \
-            make && \
-            make install
-            """,
-        )
-        .run_commands(
-            # Remove EFA and OFI libraries from the default library path so they're not used on non-EFA hardware.
-            "rm -f /etc/ld.so.conf.d/000_efa.conf",
-            "rm -f /etc/ld.so.conf.d/100_ofinccl.conf",
-        )
-    )
-
-
 VERL_REPO_PATH: Path = Path("/root/verl")
 image = (
-    make_image_with_efa(modal.Image.from_registry("verlai/verl:vllm011.latest"))
+    modal.Image.from_registry("verlai/verl:vllm011.latest")
     .apt_install("git")
     .run_commands(
         f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}",
@@ -426,14 +373,6 @@ N_NODES = 4
     volumes={MODELS_PATH: checkpoints_volume, DATA_PATH: data_volume},
     secrets=[
         modal.Secret.from_name("wandb-secret"),
-        modal.Secret.from_dict(
-            {
-                "LD_LIBRARY_PATH": "/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib",
-                "NCCL_NET_PLUGIN": "ofi",
-                # "NCCL_DEBUG": "INFO",
-                "VLLM_LOGGING_LEVEL": "INFO",
-            }
-        ),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
