@@ -148,8 +148,8 @@ def main():
             save=f"{args.checkpoints_dir}/glm47_lora_{args.run_id}",
             pretrained_checkpoint=args.megatron_checkpoint,
             ckpt_format="torch_dist",
-            fully_parallel_save=False,  # Must be False - Modal multiprocessing is limited
-            async_save=False,  # Disable async save - Modal queue issues
+            fully_parallel_save=False,
+            async_save=False,
         ),
         rng=RNGConfig(seed=5678),
         peft=lora_config,

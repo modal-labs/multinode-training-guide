@@ -33,14 +33,14 @@ PREPROCESSED_DIR = f"{DATA_DIR}/glaive-code-assistant"
 # Simple image for downloading
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("huggingface_hub", "transformers", "torch", "safetensors", "sentencepiece")
+    .uv_pip_install("huggingface_hub", "transformers", "torch", "safetensors", "sentencepiece")
     .env({
         "HF_HOME": "/models/huggingface",
         "HF_XET_HIGH_PERFORMANCE": "1",  # Enable fast data transfer from HF Hub
     })
 )
 
-# NeMo 25.11 with fixes
+# NeMo 25.11
 nemo_image = (
     modal.Image.from_registry("nvcr.io/nvidia/nemo:25.11")
     .apt_install(
@@ -49,15 +49,7 @@ nemo_image = (
         "libhwloc-dev",
         "libnl-route-3-200",
     )
-    .pip_install("wandb", "datasets")
-    .run_commands(
-        # Fix missing 'warnings' import bug in Megatron-Core
-        "sed -i '1s/^/import warnings\\n/' /opt/megatron-lm/megatron/core/model_parallel_config.py",
-        # Fix Manager().Queue() crash in Modal
-        r"""sed -i 's/_results_queue = ctx.Manager().Queue()/_results_queue = ctx.Queue()/' /opt/megatron-lm/megatron/core/dist_checkpointing/strategies/filesystem_async.py""",
-        # Disable fully_parallel_save by default - Modal multiprocessing is limited
-        r"""sed -i 's/fully_parallel_save: bool = True/fully_parallel_save: bool = False/' /opt/Megatron-Bridge/src/megatron/bridge/training/config.py""",
-    )
+    .uv_pip_install("wandb", "datasets")
     .env({"HF_HOME": "/models/huggingface"})
     .add_local_dir(LOCAL_CODE_DIR, remote_path=REMOTE_CODE_DIR)
 )
@@ -147,6 +139,7 @@ MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"  # Checkpoint is in ch
     volumes={MODELS_DIR: models_volume, CHECKPOINTS_DIR: checkpoints_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=21600,  # 6 hours for conversion
+    cpu=16,
     memory=1048576,  # 1TB max - Modal limit
     ephemeral_disk=2048000,  # 2TB scratch disk for checkpoint writes
 )
@@ -183,7 +176,7 @@ try:
     print("Converting to Megatron format...")
     megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
 
-    # Save with torch_dist format (fully_parallel_save disabled via image patch)
+    # Save with torch_dist format
     print("Saving checkpoint in torch_dist format...")
     save_megatron_model(
         megatron_model,
