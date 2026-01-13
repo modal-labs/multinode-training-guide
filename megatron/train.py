@@ -126,7 +126,7 @@ def main():
         ddp=DistributedDataParallelConfig(check_for_nan_in_grad=True),
         dataset=FinetuningDatasetConfig(
             dataset_root=args.preprocessed_dir,
-            seq_length=131072,  # 128k context
+            seq_length=8192,  # 8k context - suitable for code assistant conversations
             seed=5678,
             dataloader_type="batch",
             num_workers=1,
@@ -158,13 +158,13 @@ def main():
 
     print("Config created successfully")
 
-    # Parallelism for GLM-4.7 on 32 GPUs (TP=2 x PP=1 x EP=8 x CP=2 = 32)
+    # Parallelism for GLM-4.7 on 32 GPUs (TP=2 x PP=1 x EP=8 x DP=2 = 32)
     config.model.tensor_model_parallel_size = 2
     config.model.pipeline_model_parallel_size = 1
     config.model.expert_model_parallel_size = 8
-    config.model.context_parallel_size = 2  # 64k per GPU
+    config.model.context_parallel_size = 1  # No CP needed for 8k sequences
     # config.model.cp_comm_type = "a2a+p2p"
-    config.model.calculate_per_token_loss = True  # Required for CP>1
+    config.model.calculate_per_token_loss = False  # CP=1, no need for per-token loss
     config.model.sequence_parallel = True
     config.model.attention_backend = "flash"
 
@@ -179,7 +179,7 @@ def main():
     config.model.recompute_method = "uniform"
     config.model.recompute_num_layers = 1  # Must be 1 for MTP (Multi-Token Prediction)
     # Sequence length
-    config.model.seq_length = 131072  # 128k context
+    config.model.seq_length = 8192  # 8k context - suitable for code assistant conversations
 
     print("Config:")
     print("  Model: GLM-4.7 (358B MoE)")

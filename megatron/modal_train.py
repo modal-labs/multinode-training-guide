@@ -2,10 +2,9 @@
 GLM-4.7 LoRA Training on Modal
 
 Usage:
-    modal run train_glm47.py --download        # Download model (4+ hours)
-    modal run train_glm47.py --convert         # Convert HF to Megatron
-    modal run preprocess_dataset.py            # Build dataset indexes (single process)
-    modal run --detach train_glm47.py --train  # Run distributed training
+    modal run --detach modal_train.py --download-convert  # Download + convert (run detached)
+    modal run modal_train.py --prep-dataset               # Download and preprocess dataset
+    modal run --detach modal_train.py --train             # Run distributed training
 """
 
 import os
@@ -21,20 +20,24 @@ app = modal.App("glm47-lora")
 
 # Volumes - separate from GLM-4.5 to avoid conflicts
 models_volume = modal.Volume.from_name("glm47-models", create_if_missing=True)
-data_volume = modal.Volume.from_name("glm45-training-data")  # Reuse training data
+data_volume = modal.Volume.from_name("glm47-training-data", create_if_missing=True)
 checkpoints_volume = modal.Volume.from_name("glm47-checkpoints", create_if_missing=True)
 
 MODELS_DIR = "/models"
 DATA_DIR = "/data"
 CHECKPOINTS_DIR = "/checkpoints"
 HF_MODEL = "zai-org/GLM-4.7"
-PREPROCESSED_DIR = f"{DATA_DIR}/preprocessed_glm47"
+HF_DATASET = "glaiveai/glaive-code-assistant"
+PREPROCESSED_DIR = f"{DATA_DIR}/glaive-code-assistant"
 
 # Simple image for downloading
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("huggingface_hub", "transformers", "torch", "safetensors", "sentencepiece")
-    .env({"HF_HOME": "/models/huggingface"})
+    .env({
+        "HF_HOME": "/models/huggingface",
+        "HF_XET_HIGH_PERFORMANCE": "1",  # Enable fast data transfer from HF Hub
+    })
 )
 
 # NeMo 25.11 with fixes
@@ -46,7 +49,7 @@ nemo_image = (
         "libhwloc-dev",
         "libnl-route-3-200",
     )
-    .pip_install("wandb")
+    .pip_install("wandb", "datasets")
     .run_commands(
         # Fix missing 'warnings' import bug in Megatron-Core
         "sed -i '1s/^/import warnings\\n/' /opt/megatron-lm/megatron/core/model_parallel_config.py",
@@ -85,6 +88,54 @@ def download_model():
     print(f"Downloaded to: {path}")
     models_volume.commit()
     return {"path": path}
+
+
+@app.function(
+    image=nemo_image,
+    volumes={DATA_DIR: data_volume, MODELS_DIR: models_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=3600,
+    cpu=4,
+)
+def prep_dataset_fn():
+    """Download and prepare glaive-code-assistant for Megatron training."""
+    import json
+    import os
+
+    from datasets import load_dataset
+
+    data_volume.reload()
+
+    # Create output directory
+    os.makedirs(PREPROCESSED_DIR, exist_ok=True)
+
+    # Download dataset from HuggingFace
+    print(f"Downloading dataset: {HF_DATASET}")
+    dataset = load_dataset(HF_DATASET, split="train")
+    print(f"Dataset loaded: {len(dataset)} examples")
+
+    # Save as JSONL for FinetuningDatasetConfig
+    # Use standard naming convention
+    train_jsonl = f"{PREPROCESSED_DIR}/train.jsonl"
+    print(f"Saving to: {train_jsonl}")
+
+    with open(train_jsonl, "w") as f:
+        for example in dataset:
+            # Format as instruction-following conversation
+            question = example.get("question", "")
+            answer = example.get("answer", "")
+            # Combine into single text with clear delimiters
+            text = f"### Question:\n{question}\n\n### Answer:\n{answer}"
+            json.dump({"text": text}, f)
+            f.write("\n")
+
+    # Report file size
+    size = os.path.getsize(train_jsonl)
+    print(f"Created {train_jsonl} ({size:,} bytes)")
+    print(f"Total examples: {len(dataset)}")
+
+    data_volume.commit()
+    return {"preprocessed_dir": PREPROCESSED_DIR, "examples": len(dataset)}
 
 
 MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"  # Checkpoint is in checkpoints volume
@@ -158,6 +209,20 @@ finally:
     return {"megatron_path": MEGATRON_CHECKPOINT}
 
 
+@app.function(image=modal.Image.debian_slim(), timeout=36000)
+def download_and_convert():
+    """Orchestrate download (CPU) then convert (GPU) as separate steps."""
+    print("Step 1/2: Downloading model (on CPU)...")
+    download_result = download_model.remote()
+    print(f"Download complete: {download_result}")
+
+    print("Step 2/2: Converting to Megatron format (on GPU)...")
+    convert_result = convert_to_megatron.remote()
+    print(f"Convert complete: {convert_result}")
+
+    return {"download": download_result, "convert": convert_result}
+
+
 # 358B MoE needs more GPUs than 106B
 # Estimate: ~3x the parallelism of GLM-4.5-Air
 N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
@@ -165,7 +230,7 @@ N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
 
 @app.function(
     image=nemo_image,
-    gpu="B200:8",
+    gpu="H100:8",
     volumes={
         MODELS_DIR: models_volume,
         DATA_DIR: data_volume,
@@ -213,7 +278,7 @@ def train_lora(run_id: str):
     if not os.path.exists(PREPROCESSED_DIR):
         raise RuntimeError(
             f"Preprocessed data not found at {PREPROCESSED_DIR}. "
-            "Run: modal run preprocess_dataset.py first!"
+            "Run: modal run modal_train.py --prep-dataset first!"
         )
 
     print(f"Using pre-built dataset from: {PREPROCESSED_DIR}")
@@ -263,16 +328,19 @@ def train_lora(run_id: str):
 def main(
     download: bool = False,
     convert: bool = False,
+    download_convert: bool = False,
+    prep_dataset: bool = False,
     train: bool = False,
 ):
     """
     GLM-4.7 LoRA Training
 
     Usage:
-        modal run train_glm47.py --download        # Download model (4+ hours)
-        modal run train_glm47.py --convert         # Convert HF to Megatron
-        modal run preprocess_dataset.py            # Build dataset indexes
-        modal run --detach train_glm47.py --train  # Run training
+        modal run modal_train.py --download           # Download model only
+        modal run modal_train.py --convert            # Convert HF to Megatron only
+        modal run --detach modal_train.py --download-convert  # Download + convert (run detached)
+        modal run modal_train.py --prep-dataset       # Download and preprocess dataset
+        modal run --detach modal_train.py --train     # Run distributed training
     """
     if download:
         print("Downloading GLM-4.7 (358B) - this will take several hours...")
@@ -282,19 +350,26 @@ def main(
         print("Converting GLM-4.7 to Megatron format...")
         result = convert_to_megatron.remote()
         print(f"Done: {result}")
+    elif download_convert:
+        print("Downloading and converting GLM-4.7 (358B) - this will take many hours...")
+        result = download_and_convert.remote()
+        print(f"Done: {result}")
+    elif prep_dataset:
+        print(f"Downloading and preprocessing dataset: {HF_DATASET}")
+        result = prep_dataset_fn.remote()
+        print(f"Done: {result}")
     elif train:
         print("Starting GLM-4.7 LoRA training with pre-built dataset...")
-        # Generate WandB run_id locally, pass to all nodes
-        import wandb
-        wandb.init(project="glm47-lora")
-        run_id = wandb.run.id
-        print(f"Generated WandB run_id: {run_id}")
-        wandb.finish()
+        # Generate unique run_id locally, pass to all nodes
+        import uuid
+        run_id = uuid.uuid4().hex[:8]
+        print(f"Generated run_id: {run_id}")
         result = train_lora.remote(run_id=run_id)
         print(f"Done: {result}")
     else:
         print("Usage:")
-        print("  modal run train_glm47.py --download        # Download model")
-        print("  modal run train_glm47.py --convert         # Convert to Megatron")
-        print("  modal run preprocess_dataset.py            # Build dataset indexes")
-        print("  modal run --detach train_glm47.py --train  # Run training")
+        print("  modal run modal_train.py --download              # Download model only")
+        print("  modal run modal_train.py --convert               # Convert to Megatron only")
+        print("  modal run --detach modal_train.py --download-convert  # Download + convert")
+        print("  modal run modal_train.py --prep-dataset          # Prep dataset")
+        print("  modal run --detach modal_train.py --train        # Run training")
