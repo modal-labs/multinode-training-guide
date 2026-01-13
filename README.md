@@ -14,6 +14,19 @@
 Well documented examples of running distributed training jobs on [Modal](https://modal.com).
 Use this repository to learn how to build distributed training jobs on Modal.
 
+## Example of Async RL using slime on Modal
+
+```
+modal profile activate modal-labs
+modal config set-environment clairez-dev
+modal deploy slime/tests/modal_train.py
+modal run slime/tests/modal_train.py::prepare
+modal run slime/tests/modal_train.py::execute
+```
+<!-- prepare_dataset
+download_model
+train -->
+
 # Examples
 
 - [**`benchmark/`**](/benchmark/) contains performance and reliability testing, using AWS EFA by default.
@@ -39,3 +52,5 @@ Other relevant documentation in our guide:
 ## License
 
 The [MIT license](LICENSE).
+
+
