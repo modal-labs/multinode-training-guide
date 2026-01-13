@@ -18,9 +18,9 @@ Use this repository to learn how to build distributed training jobs on Modal.
 
 ```
 modal profile activate modal-labs
-modal config set-environment clairez-dev
-modal deploy slime/tests/modal_train.py
-modal run slime/tests/modal_train.py::prepare
+modal config set-environment clairez-dev 
+modal deploy slime/tests/modal_train.py # once
+modal run slime/tests/modal_train.py::prepare # once
 modal run slime/tests/modal_train.py::execute
 ```
 <!-- prepare_dataset

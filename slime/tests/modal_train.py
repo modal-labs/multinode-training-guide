@@ -2,7 +2,7 @@ import os
 import modal
 import modal.experimental
 
-app = modal.App("example-grpo-slime-1-12")
+app = modal.App("example-grpo-slime")
 
 
 # copied from verl modal_train
@@ -11,15 +11,11 @@ from pathlib import Path
 CONTAINER_HOME: Path = Path("/home/ec2-user")
 SLIME_REPO_PATH: Path = CONTAINER_HOME / "slime"
 
-cuda_version = "12.4.0"  # should be no greater than host CUDA version
-flavor = "devel"  #  includes full CUDA toolkit
-operating_sys = "ubuntu22.04"
-tag = f"{cuda_version}-{flavor}-{operating_sys}"
 image = (
     modal.Image.from_registry("slimerl/slime:nightly-dev-20260106a")
     .run_commands(
         # Update slime from GitHub to get the latest version with onload_weights
-        "cd /root/slime && git pull origin main && pip install -e ."
+        "cd /root/slime && git remote set-url origin https://github.com/czhang-modal/slime.git && git fetch origin && git checkout claire/slime && pip install -e ."
     )
     .entrypoint([])
 )
