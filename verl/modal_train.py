@@ -7,8 +7,16 @@ import time
 import modal
 import modal.experimental
 
-app = modal.App("eone https://github.com/volcengine/verl {VERL_REPO_PATH}",
-    ) 
+app = modal.App("example-grpo-verl")
+
+
+VERL_REPO_PATH: Path = Path("/root/verl")
+image = (
+    modal.Image.from_registry("verlai/verl:vllm011.latest")
+    .apt_install("git")
+    .run_commands(
+        f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}",
+    )
     .uv_pip_install(f"{VERL_REPO_PATH}")
     .entrypoint([])
 )
@@ -147,7 +155,7 @@ def compute_reward(
             return 0.0
 
 
-PATH_TO_REWARD_FUNCTION: Path = CONTAINER_HOME / "multinode-training-guide/verl/modal_train.py"
+PATH_TO_REWARD_FUNCTION: Path = Path("/root/modal_train.py")
 REWARD_FUNCTION_NAME: str = "compute_reward"
 
 

@@ -3,8 +3,6 @@ import os
 import modal
 import modal.experimental
 
-app = modal.App("multinode-benchmark-2-nodes")
-
 cuda_version = "12.4.0"  # should be no greater than host CUDA version
 flavor = "devel"  #  includes full CUDA toolkit
 operating_sys = "ubuntu22.04"
@@ -35,6 +33,8 @@ image = (
         remote_path=REMOTE_CODE_DIR,
     )
 )
+
+app = modal.App("multinode-benchmark")
 
 @app.function(
     gpu="H100:8",
