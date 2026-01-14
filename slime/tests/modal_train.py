@@ -42,7 +42,7 @@ N_NODES = 4
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
-MASTER_ADDR = "127.0.0.1"
+SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 
 
 
@@ -352,8 +352,8 @@ async def train_single_node(*arglist):
     checkpoints_volume.reload()
     data_volume.reload()
 
-    _init_ray(0, "127.0.0.1", "127.0.0.1", 1)
+    _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
 
     with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
         print(f"Dashboard URL: {tunnel.url}")
-        await run_training(1, list(arglist), "127.0.0.1")
+        await run_training(1, list(arglist), SINGLE_NODE_MASTER_ADDR)
