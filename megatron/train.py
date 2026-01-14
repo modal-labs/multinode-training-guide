@@ -35,9 +35,15 @@ from megatron.bridge.training.gpt_step import forward_step
 def parse_args():
     p = argparse.ArgumentParser(description="GLM-4.7 LoRA Training")
 
-    p.add_argument("--preprocessed_dir", required=True, help="Path to preprocessed dataset")
-    p.add_argument("--megatron_checkpoint", required=True, help="Path to Megatron checkpoint")
-    p.add_argument("--checkpoints_dir", required=True, help="Directory to save checkpoints")
+    p.add_argument(
+        "--preprocessed_dir", required=True, help="Path to preprocessed dataset"
+    )
+    p.add_argument(
+        "--megatron_checkpoint", required=True, help="Path to Megatron checkpoint"
+    )
+    p.add_argument(
+        "--checkpoints_dir", required=True, help="Directory to save checkpoints"
+    )
     p.add_argument("--hf_model", default="zai-org/GLM-4.7", help="HuggingFace model ID")
 
     return p.parse_args()
@@ -175,7 +181,9 @@ def main():
     config.model.recompute_method = "uniform"
     config.model.recompute_num_layers = 1  # Must be 1 for MTP (Multi-Token Prediction)
     # Sequence length
-    config.model.seq_length = 8192  # 8k context - suitable for code assistant conversations
+    config.model.seq_length = (
+        8192  # 8k context - suitable for code assistant conversations
+    )
 
     print("Config:")
     print("  Model: GLM-4.7 (358B MoE)")

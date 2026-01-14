@@ -41,11 +41,19 @@ N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
 # Simple image for downloading
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .uv_pip_install("huggingface_hub==0.36.0", "transformers==4.57.4", "torch==2.9.1", "safetensors==0.7.0", "sentencepiece==0.2.1")
-    .env({
-        "HF_HOME": "/models/huggingface",
-        "HF_XET_HIGH_PERFORMANCE": "1",  # Enable fast data transfer from HF Hub
-    })
+    .uv_pip_install(
+        "huggingface_hub==0.36.0",
+        "transformers==4.57.4",
+        "torch==2.9.1",
+        "safetensors==0.7.0",
+        "sentencepiece==0.2.1",
+    )
+    .env(
+        {
+            "HF_HOME": "/models/huggingface",
+            "HF_XET_HIGH_PERFORMANCE": "1",  # Enable fast data transfer from HF Hub
+        }
+    )
 )
 
 # NeMo 25.11
@@ -172,7 +180,6 @@ def prep_dataset():
 def convert_to_megatron():
     """Convert GLM-4.7 HF to Megatron format."""
     import torch
-    import torch.distributed as dist
     from megatron.bridge import AutoBridge
     from megatron.bridge.training.model_load_save import save_megatron_model
 
@@ -190,7 +197,9 @@ def convert_to_megatron():
     )
 
     print("Converting to Megatron format...")
-    megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
+    megatron_model = bridge.to_megatron_model(
+        wrap_with_ddp=False, use_cpu_initialization=True
+    )
 
     print("Saving checkpoint in torch_dist format...")
     save_megatron_model(
@@ -218,8 +227,6 @@ def download_and_convert():
     print(f"Convert complete: {convert_result}")
 
     return {"download": download_result, "convert": convert_result}
-
-
 
 
 @app.function(
@@ -257,7 +264,9 @@ def train_lora():
     cluster_info = modal.experimental.get_cluster_info()
     node_rank = cluster_info.rank
     num_nodes = N_NODES
-    master_addr = cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
+    master_addr = (
+        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
+    )
     master_port = 29500
 
     print(f"Node {node_rank}/{num_nodes}, Master: {master_addr}:{master_port}")
@@ -281,10 +290,14 @@ def train_lora():
         raise RuntimeError(f"Checkpoint not found at {MEGATRON_CHECKPOINT}")
 
     script_args = [
-        "--preprocessed_dir", PREPROCESSED_DIR,
-        "--megatron_checkpoint", MEGATRON_CHECKPOINT,
-        "--checkpoints_dir", CHECKPOINTS_DIR,
-        "--hf_model", HF_MODEL,
+        "--preprocessed_dir",
+        PREPROCESSED_DIR,
+        "--megatron_checkpoint",
+        MEGATRON_CHECKPOINT,
+        "--checkpoints_dir",
+        CHECKPOINTS_DIR,
+        "--hf_model",
+        HF_MODEL,
     ]
 
     cmd = [
