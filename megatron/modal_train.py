@@ -2,12 +2,15 @@
 GLM-4.7 LoRA Training on Modal
 
 Usage:
-    modal run --detach modal_train.py --download-convert  # Download + convert (run detached)
-    modal run modal_train.py --prep-dataset               # Download and preprocess dataset
-    modal run --detach modal_train.py --train             # Run distributed training
+    modal run --detach modal_train.py::download_and_convert  # Download + convert
+    modal run modal_train.py::prep_dataset                   # Download and preprocess dataset
+    modal run --detach modal_train.py::train_lora            # Run distributed training
 """
 
+import glob
+import json
 import os
+import subprocess
 
 import modal
 import modal.experimental
@@ -18,22 +21,27 @@ REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 
 app = modal.App("glm47-lora")
 
-# Volumes - separate from GLM-4.5 to avoid conflicts
+# Volumes for model, data, and checkpoints
 models_volume = modal.Volume.from_name("glm47-models", create_if_missing=True)
 data_volume = modal.Volume.from_name("glm47-training-data", create_if_missing=True)
 checkpoints_volume = modal.Volume.from_name("glm47-checkpoints", create_if_missing=True)
 
+# In-container paths for model, data, and checkpoints
 MODELS_DIR = "/models"
 DATA_DIR = "/data"
 CHECKPOINTS_DIR = "/checkpoints"
 HF_MODEL = "zai-org/GLM-4.7"
 HF_DATASET = "glaiveai/glaive-code-assistant"
 PREPROCESSED_DIR = f"{DATA_DIR}/glaive-code-assistant"
+MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"
+
+# Number of nodes in the cluster
+N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
 
 # Simple image for downloading
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .uv_pip_install("huggingface_hub", "transformers", "torch", "safetensors", "sentencepiece")
+    .uv_pip_install("huggingface_hub==0.36.0", "transformers==4.57.4", "torch==2.9.1", "safetensors==0.7.0", "sentencepiece==0.2.1")
     .env({
         "HF_HOME": "/models/huggingface",
         "HF_XET_HIGH_PERFORMANCE": "1",  # Enable fast data transfer from HF Hub
@@ -49,7 +57,7 @@ nemo_image = (
         "libhwloc-dev",
         "libnl-route-3-200",
     )
-    .uv_pip_install("wandb", "datasets")
+    .uv_pip_install("wandb==0.23.1", "datasets==3.1.0")
     .env({"HF_HOME": "/models/huggingface"})
     .add_local_dir(LOCAL_CODE_DIR, remote_path=REMOTE_CODE_DIR)
 )
@@ -63,7 +71,6 @@ nemo_image = (
 )
 def download_model():
     """Download GLM-4.7 (358B) to volume."""
-    import os
     from huggingface_hub import snapshot_download
 
     models_volume.reload()
@@ -89,12 +96,11 @@ def download_model():
     timeout=3600,
     cpu=4,
 )
-def prep_dataset_fn():
+def prep_dataset():
     """Download and prepare glaive-code-assistant for Megatron training."""
-    import json
-    import os
 
     from datasets import load_dataset
+    from megatron.bridge.data.datasets.utils import build_index_files
 
     data_volume.reload()
 
@@ -123,14 +129,12 @@ def prep_dataset_fn():
     print(f"Total examples: {len(dataset)}")
 
     # Remove any existing index files before rebuilding
-    import glob
     for idx_file in glob.glob(f"{train_jsonl}.idx*"):
         print(f"Removing old index file: {idx_file}")
         os.remove(idx_file)
 
     # Build index files using Megatron's official API
     print("Building index files...")
-    from megatron.bridge.data.datasets.utils import build_index_files
 
     build_index_files(
         dataset_paths=[train_jsonl],
@@ -155,12 +159,9 @@ def prep_dataset_fn():
     return {"preprocessed_dir": PREPROCESSED_DIR, "examples": len(dataset)}
 
 
-MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"  # Checkpoint is in checkpoints volume
-
-
 @app.function(
     image=nemo_image,
-    gpu="B200",  # Single GPU - avoids distributed checkpoint bugs
+    gpu="B200",
     volumes={MODELS_DIR: models_volume, CHECKPOINTS_DIR: checkpoints_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=21600,  # 6 hours for conversion
@@ -170,58 +171,36 @@ MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"  # Checkpoint is in ch
 )
 def convert_to_megatron():
     """Convert GLM-4.7 HF to Megatron format."""
-    import subprocess
-    import sys
+    import torch
+    import torch.distributed as dist
+    from megatron.bridge import AutoBridge
+    from megatron.bridge.training.model_load_save import save_megatron_model
 
     models_volume.reload()
 
     print(f"Converting {HF_MODEL} (358B) to Megatron format...")
     print(f"Output: {MEGATRON_CHECKPOINT}")
 
-    cmd = [
-        sys.executable,
-        "-c",
-        f"""
-import torch
-import torch.distributed as dist
-from megatron.bridge import AutoBridge
-from megatron.bridge.training.model_load_save import save_megatron_model
-
-try:
-    # Load HF model
     print("Loading HuggingFace model...")
     bridge = AutoBridge.from_hf_pretrained(
-        "{HF_MODEL}",
+        HF_MODEL,
         dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
 
-    # Convert to Megatron model
     print("Converting to Megatron format...")
     megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
 
-    # Save with torch_dist format
     print("Saving checkpoint in torch_dist format...")
     save_megatron_model(
         megatron_model,
-        "{MEGATRON_CHECKPOINT}",
+        MEGATRON_CHECKPOINT,
         ckpt_format="torch_dist",
-        hf_tokenizer_path="{HF_MODEL}",
+        hf_tokenizer_path=HF_MODEL,
     )
-    print("Conversion complete!")
-finally:
-    # Clean up distributed process group if initialized
-    if dist.is_initialized():
-        dist.destroy_process_group()
-"""
-    ]
 
-    print("Running conversion...")
-    result = subprocess.run(cmd, capture_output=False, text=True)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Conversion failed with code {result.returncode}")
+    print("Conversion complete! Saving checkpoint to volume...")
 
     checkpoints_volume.commit()
     return {"megatron_path": MEGATRON_CHECKPOINT}
@@ -241,9 +220,6 @@ def download_and_convert():
     return {"download": download_result, "convert": convert_result}
 
 
-# 358B MoE needs more GPUs than 106B
-# Estimate: ~3x the parallelism of GLM-4.5-Air
-N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
 
 
 @app.function(
@@ -262,12 +238,20 @@ N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
     experimental_options={"efa_enabled": True},
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
-def train_lora(run_id: str):
-    """Train GLM-4.7 with pre-built dataset (no dataset construction)."""
-    import subprocess
-    import os
+def train_lora():
+    """Train GLM-4.7 with LoRA on pre-built dataset."""
 
-    # Disable fused attn to avoid cudnn bugs:
+    # The following environment variables are required to avoid OOMs when training large models.
+    # These can be tuned to improve performance, but they need to be tuned along with TP, PP, EP, and DP settings.
+    #
+    # Disable `torch.compile` to allocate less memory for the model.
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
+    # Enable expandable segments for more efficient memory allocations
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # Disable NVLS to avoid allocating extra memory during NCCL communication.
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+
+    # Disable fused attn to avoid cudnn bugs with GLM-4.7
     os.environ["NVTE_FUSED_ATTN"] = "0"
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -282,7 +266,7 @@ def train_lora(run_id: str):
     if not os.path.exists(PREPROCESSED_DIR):
         raise RuntimeError(
             f"Preprocessed data not found at {PREPROCESSED_DIR}. "
-            "Run: modal run modal_train.py --prep-dataset first!"
+            "Run: modal run modal_train.py::prep_dataset first!"
         )
 
     print(f"Using pre-built dataset from: {PREPROCESSED_DIR}")
@@ -296,11 +280,7 @@ def train_lora(run_id: str):
     if not os.path.exists(MEGATRON_CHECKPOINT):
         raise RuntimeError(f"Checkpoint not found at {MEGATRON_CHECKPOINT}")
 
-    # run_id passed from local entrypoint - same for all nodes
-    print(f"Using run_id: {run_id}")
-
     script_args = [
-        "--run_id", run_id,
         "--preprocessed_dir", PREPROCESSED_DIR,
         "--megatron_checkpoint", MEGATRON_CHECKPOINT,
         "--checkpoints_dir", CHECKPOINTS_DIR,
@@ -326,54 +306,3 @@ def train_lora(run_id: str):
     # Persist training checkpoints to volume
     checkpoints_volume.commit()
     return {"status": "training_complete"}
-
-
-@app.local_entrypoint()
-def main(
-    download: bool = False,
-    convert: bool = False,
-    download_convert: bool = False,
-    prep_dataset: bool = False,
-    train: bool = False,
-):
-    """
-    GLM-4.7 LoRA Training
-
-    Usage:
-        modal run modal_train.py --download           # Download model only
-        modal run modal_train.py --convert            # Convert HF to Megatron only
-        modal run --detach modal_train.py --download-convert  # Download + convert (run detached)
-        modal run modal_train.py --prep-dataset       # Download and preprocess dataset
-        modal run --detach modal_train.py --train     # Run distributed training
-    """
-    if download:
-        print("Downloading GLM-4.7 (358B) - this will take several hours...")
-        result = download_model.remote()
-        print(f"Done: {result}")
-    elif convert:
-        print("Converting GLM-4.7 to Megatron format...")
-        result = convert_to_megatron.remote()
-        print(f"Done: {result}")
-    elif download_convert:
-        print("Downloading and converting GLM-4.7 (358B) - this will take many hours...")
-        result = download_and_convert.remote()
-        print(f"Done: {result}")
-    elif prep_dataset:
-        print(f"Downloading and preprocessing dataset: {HF_DATASET}")
-        result = prep_dataset_fn.remote()
-        print(f"Done: {result}")
-    elif train:
-        print("Starting GLM-4.7 LoRA training with pre-built dataset...")
-        # Generate unique run_id locally, pass to all nodes
-        import uuid
-        run_id = uuid.uuid4().hex[:8]
-        print(f"Generated run_id: {run_id}")
-        result = train_lora.remote(run_id=run_id)
-        print(f"Done: {result}")
-    else:
-        print("Usage:")
-        print("  modal run modal_train.py --download              # Download model only")
-        print("  modal run modal_train.py --convert               # Convert to Megatron only")
-        print("  modal run --detach modal_train.py --download-convert  # Download + convert")
-        print("  modal run modal_train.py --prep-dataset          # Prep dataset")
-        print("  modal run --detach modal_train.py --train        # Run training")

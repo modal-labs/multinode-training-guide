@@ -35,7 +35,6 @@ from megatron.bridge.training.gpt_step import forward_step
 def parse_args():
     p = argparse.ArgumentParser(description="GLM-4.7 LoRA Training")
 
-    p.add_argument("--run_id", required=True, help="WandB run ID")
     p.add_argument("--preprocessed_dir", required=True, help="Path to preprocessed dataset")
     p.add_argument("--megatron_checkpoint", required=True, help="Path to Megatron checkpoint")
     p.add_argument("--checkpoints_dir", required=True, help="Directory to save checkpoints")
@@ -51,13 +50,11 @@ def main():
 
     # Only rank 0 initializes WandB
     if rank == 0:
-        wandb.init(project="glm47-lora", id=args.run_id, resume="allow")
-        print(f"WandB initialized with run_id: {args.run_id}")
-
-    print(f"[Rank {rank}] Using run_id: {args.run_id}")
+        run = wandb.init(project="glm47-lora")
+        print(f"WandB initialized: {run.name} ({run.id})")
 
     print("=" * 60)
-    print(f"GLM-4.7 (358B MoE) - Run: {args.run_id}")
+    print("GLM-4.7 (358B MoE) LoRA Training")
     print("=" * 60)
 
     # Monkey-patch for PP=1 + Recompute + Frozen Base gradient fix
@@ -137,7 +134,6 @@ def main():
             log_interval=1,
             tensorboard_dir="/tmp/tensorboard",
             wandb_project="glm47-lora",
-            wandb_exp_name=args.run_id,
         ),
         tokenizer=TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
