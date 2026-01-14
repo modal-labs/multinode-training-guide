@@ -1,4 +1,7 @@
 import os
+import subprocess
+from pathlib import Path
+import time
 import modal
 import modal.experimental
 
@@ -20,6 +23,10 @@ image = (
     .entrypoint([])
 )
 
+with image.imports():
+    import ray
+    from ray.job_submission import JobSubmissionClient
+
 DATA_PATH: Path = Path("/data")
 data_volume: modal.Volume = modal.Volume.from_name(
     "grpo-slime-example-data", create_if_missing=True
@@ -28,51 +35,94 @@ MODELS_PATH: Path = Path("/models")
 checkpoints_volume: modal.Volume = modal.Volume.from_name(
     "grpo-slime-example-checkpoints", create_if_missing=True
 )
+MODEL_NAME = "Qwen2.5-0.5B-Instruct"
+N_NODES = 4
+
+# Ray configuration
+RAY_PORT = 6379
+RAY_DASHBOARD_PORT = 8265
+
+MASTER_ADDR = "127.0.0.1"
+
+
+
+def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
+    """Initialize Ray cluster across Modal containers.
+
+    Rank 0 starts the head node, opens a tunnel to the Ray dashboard, and waits
+    for all worker nodes to connect. Other ranks start as workers and connect
+    to the head node address.
+    """
+    if rank == 0:
+        subprocess.Popen(
+            [
+                "ray",
+                "start",
+                "--head",
+                f"--node-ip-address={node_ip_addr}",
+                "--dashboard-host=0.0.0.0",
+            ]
+        )
+
+        for _ in range(10):
+            try:
+                ray.init(address="auto")
+            except ConnectionError:
+                time.sleep(1)
+                continue
+            break
+        else:
+            raise Exception("Failed to connect to Ray")
+
+        for _ in range(60):
+            print("Waiting for worker nodes to connect...")
+            alive_nodes = [n for n in ray.nodes() if n["Alive"]]
+            print(f"Alive nodes: {alive_nodes}")
+
+            if len(alive_nodes) == n_nodes:
+                print("All worker nodes connected")
+                break
+            time.sleep(1)
+        else:
+            raise Exception("Failed to connect to all worker nodes")
+    else:
+        subprocess.Popen(
+            [
+                "ray",
+                "start",
+                f"--node-ip-address={node_ip_addr}",
+                "--address",
+                f"{main_node_addr}:{RAY_PORT}",
+            ]
+        )
 
 
 @app.function(
     image=image,
-    volumes={
-        DATA_PATH.as_posix(): data_volume,
-        MODELS_PATH.as_posix(): checkpoints_volume,
-    },
+    volumes={MODELS_PATH.as_posix(): checkpoints_volume},
+    timeout=24 * 60 * 60,
 )
-def prepare():
+def download_model():
     checkpoints_volume.reload()
     import slime.utils.external_utils.command_utils as U
 
-    MODEL_NAME = "Qwen2.5-0.5B-Instruct"
-
     U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir {MODELS_PATH}/{MODEL_NAME}")
-    # U.hf_download_dataset("zhuzilin/gsm8k")
-    U.exec_command(f"hf download --repo-type dataset zhuzilin/gsm8k --local-dir {DATA_PATH}/gsm8k")
-    data_volume.commit()
     checkpoints_volume.commit()
 
 @app.function(
     image=image,
-    gpu="H100:2",
-    volumes={
-        MODELS_PATH.as_posix(): checkpoints_volume,
-        DATA_PATH.as_posix(): data_volume,
-    },
-    secrets=[
-        modal.Secret.from_name("wandb-secret-clairez"),
-    ],
+    volumes={DATA_PATH.as_posix(): data_volume},
     timeout=24 * 60 * 60,
-    experimental_options={
-        "efa_enabled": True,
-    },
 )
-def execute():
+def prepare_dataset():
+    data_volume.reload()
     import slime.utils.external_utils.command_utils as U
+    U.exec_command(f"hf download --repo-type dataset zhuzilin/gsm8k --local-dir {DATA_PATH}/gsm8k")
+    data_volume.commit()
 
-    FEW_GPU = U.get_bool_env_var("SLIME_TEST_FEW_GPU", "1")
-    TIGHT_DEVICE_MEMORY = U.get_bool_env_var("SLIME_TEST_TIGHT_DEVICE_MEMORY", "1")
 
-    MODEL_NAME = "Qwen2.5-0.5B-Instruct"
-    MODEL_TYPE = "qwen2.5-0.5B"
-    NUM_GPUS = 2 if FEW_GPU else 4
+def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
+    import slime.utils.external_utils.command_utils as U
 
 
     ckpt_args = f"--hf-checkpoint {MODELS_PATH}/{MODEL_NAME}/ " f"--ref-load {MODELS_PATH}/{MODEL_NAME}/ "
@@ -100,6 +150,24 @@ def execute():
         "--n-samples-per-eval-prompt 1 "
         "--eval-max-response-len 1024 "
         "--eval-top-k 1 "
+    )
+
+    # Model architecture args for Qwen2.5-0.5B-Instruct (from HF config)
+    model_args = (
+        "--swiglu "
+        "--num-layers 24 "
+        "--hidden-size 896 "
+        "--ffn-hidden-size 4864 "
+        "--num-attention-heads 14 "
+        "--use-rotary-position-embeddings "
+        "--disable-bias-linear "
+        "--add-qkv-bias "
+        "--normalization RMSNorm "
+        "--norm-epsilon 1e-6 "
+        "--rotary-base 1000000 "
+        "--group-query-attention "
+        "--num-query-groups 2 "
+        "--vocab-size 151936 "
     )
 
     perf_args = (
@@ -135,7 +203,7 @@ def execute():
 
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "
-        f"--sglang-mem-fraction-static {0.6 if TIGHT_DEVICE_MEMORY else 0.7} "
+        "--sglang-mem-fraction-static .7 " # or .6, or .5 as the verl default
         "--sglang-enable-metrics "
     )
 
@@ -156,13 +224,14 @@ def execute():
         # need to comment this when using model with MLA
         "--attention-backend flash "
         "--actor-num-nodes 1 "
-        f"--actor-num-gpus-per-node {2 if FEW_GPU else 4} "
+        "--actor-num-gpus-per-node 2 " # number of gpus per node
         "--colocate "
         "--megatron-to-hf-mode bridge "
     )
 
     train_args = (
         f"{ckpt_args} "
+        f"{model_args} "
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
@@ -174,17 +243,117 @@ def execute():
         f"{misc_args} "
     )
 
-    U.execute_train(
-        train_args=train_args,
-        num_gpus_per_node=NUM_GPUS,
-        megatron_model_type=MODEL_TYPE,
-        train_script="slime/train.py",
+    if arglist:
+        train_args.extend(arglist)
+
+    # must have nvlink, eg. pass check_has_nvlink() in slime/utils/external_utils/command_utils.py
+
+    runtime_env = {
+        "env_vars": {
+            "PYTHONPATH": "/root/Megatron-LM/",
+            # If setting this in FSDP, the computation communication overlapping may have issues
+            **({"CUDA_DEVICE_MAX_CONNECTIONS": "1"}),
+            "NCCL_NVLS_ENABLE": "1",
+            "no_proxy": master_addr,
+            # This is needed by megatron / torch distributed in multi-node setup
+            "MASTER_ADDR": master_addr,
+        }
+    }
+
+    return f"python3 slime/train.py {train_args}", runtime_env
+
+
+
+async def run_training(n_nodes: int, arglist: list[str], master_addr: str):
+    """Submit verl training job to Ray cluster and stream logs.
+
+    Uses Ray's JobSubmissionClient to submit the training command and
+    asynchronously tails logs until the job completes.
+    """
+    client = JobSubmissionClient()
+
+    slime_cmd, runtime_env = generate_slime_cmd(n_nodes, arglist, master_addr)
+    job_id = client.submit_job(
+        entrypoint=slime_cmd,
+        runtime_env=runtime_env
     )
+    print(f"Job submitted with ID: {job_id}")
+
+    async for line in client.tail_job_logs(job_id):
+        print(line, end="", flush=True)
 
 
-@app.local_entrypoint()
-def main():
-    for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
-        os.environ.pop(proxy_var, None)
-    prepare.remote()
-    execute.remote()
+@app.function(
+    image=image,
+    gpu="H100:2",
+    volumes={
+        MODELS_PATH.as_posix(): checkpoints_volume,
+        DATA_PATH.as_posix(): data_volume,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret-clairez"),
+    ],
+    timeout=24 * 60 * 60,
+    experimental_options={
+        "efa_enabled": True,
+    },
+)
+@modal.experimental.clustered(N_NODES, rdma=True)
+async def train_multi_node(*arglist):
+    """Main entry point for multi-node GRPO training on Modal.
+
+    Spins up N_NODES containers with 8xH100 GPUs each, connected via RDMA.
+    Rank 0 initializes Ray and submits the training job; other ranks join
+    as workers and block until training completes.
+    """
+    checkpoints_volume.reload()
+    data_volume.reload()
+
+    cluster_info = modal.experimental.get_cluster_info()
+    print(f"Rank: {cluster_info.rank}, task id: {os.environ['MODAL_TASK_ID']}")
+    print(f"Container IPs: {cluster_info.container_ips}")
+    print(f"Container IPv4 IPs: {cluster_info.container_ipv4_ips}")
+
+    ray_main_node_addr = cluster_info.container_ipv4_ips[0]
+    my_ip_addr = cluster_info.container_ipv4_ips[cluster_info.rank]
+
+    _init_ray(cluster_info.rank, ray_main_node_addr, my_ip_addr, N_NODES)
+
+    if cluster_info.rank == 0:
+        with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
+            dashboard_url = tunnel.url
+            print(f"Dashboard URL: {dashboard_url}")
+
+            await run_training(N_NODES, list(arglist), ray_main_node_addr)
+    else:
+        # We have to keep the worker node alive until the training is complete. Once rank 0
+        # finishes, all workers will be terminated.
+        while True:
+            time.sleep(10)
+
+
+
+@app.function(
+    image=image,
+    gpu="H100:2",
+    volumes={
+        MODELS_PATH.as_posix(): checkpoints_volume,
+        DATA_PATH.as_posix(): data_volume,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret-clairez"),
+    ],
+    timeout=24 * 60 * 60,
+    experimental_options={
+        "efa_enabled": True,
+    },
+)
+async def train_single_node(*arglist):
+    checkpoints_volume.reload()
+    data_volume.reload()
+
+    _init_ray(0, "127.0.0.1", "127.0.0.1", 1)
+
+    with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
+        print(f"Dashboard URL: {tunnel.url}")
+        await run_training(1, list(arglist), "127.0.0.1")
