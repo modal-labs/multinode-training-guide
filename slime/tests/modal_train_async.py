@@ -42,7 +42,7 @@ MODEL_ID: str = f"Qwen/{MODEL_NAME}"
 TRAINING_CHECKPOINT_DIR: Path = MODELS_PATH / "training_checkpoints" / MODEL_ID
 
 
-N_NODES = 2
+N_NODES = 1
 
 # Ray configuration
 RAY_PORT = 6379
@@ -238,7 +238,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         "--attention-backend flash "
         "--actor-num-nodes 1 "
         "--actor-num-gpus-per-node 2 " # number of gpus per node
-        "--colocate "
+        "--rollout-num-gpus 2 "
         "--megatron-to-hf-mode bridge "
     )
 
@@ -273,7 +273,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         }
     }
 
-    return f"python3 slime/train.py {train_args}", runtime_env
+    return f"python3 slime/train_async.py {train_args}", runtime_env
 
 
 
