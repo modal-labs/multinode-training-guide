@@ -107,24 +107,49 @@ def prep_dataset_fn():
     print(f"Dataset loaded: {len(dataset)} examples")
 
     # Save as JSONL for FinetuningDatasetConfig
-    # Use standard naming convention
-    train_jsonl = f"{PREPROCESSED_DIR}/train.jsonl"
+    # FinetuningDatasetConfig expects "training.jsonl" by default
+    train_jsonl = f"{PREPROCESSED_DIR}/training.jsonl"
     print(f"Saving to: {train_jsonl}")
 
     with open(train_jsonl, "w") as f:
         for example in dataset:
-            # Format as instruction-following conversation
-            question = example.get("question", "")
-            answer = example.get("answer", "")
-            # Combine into single text with clear delimiters
-            text = f"### Question:\n{question}\n\n### Answer:\n{answer}"
-            json.dump({"text": text}, f)
+            # Megatron SFT expects "input" and "output" fields
+            json.dump({"input": example["question"], "output": example["answer"]}, f)
             f.write("\n")
 
     # Report file size
     size = os.path.getsize(train_jsonl)
     print(f"Created {train_jsonl} ({size:,} bytes)")
     print(f"Total examples: {len(dataset)}")
+
+    # Remove any existing index files before rebuilding
+    import glob
+    for idx_file in glob.glob(f"{train_jsonl}.idx*"):
+        print(f"Removing old index file: {idx_file}")
+        os.remove(idx_file)
+
+    # Build index files using Megatron's official API
+    print("Building index files...")
+    from megatron.bridge.data.datasets.utils import build_index_files
+
+    build_index_files(
+        dataset_paths=[train_jsonl],
+        newline_int=10,  # ASCII newline character
+        workers=os.cpu_count(),
+        index_mapping_dir=None,  # Write next to the jsonl
+    )
+
+    # Verify index files were created
+    assert os.path.exists(f"{train_jsonl}.idx.npy"), f"{train_jsonl}.idx.npy missing"
+    assert os.path.exists(f"{train_jsonl}.idx.info"), f"{train_jsonl}.idx.info missing"
+    print("Index files created successfully")
+
+    # List all files created
+    for item in os.listdir(PREPROCESSED_DIR):
+        item_path = os.path.join(PREPROCESSED_DIR, item)
+        if os.path.isfile(item_path):
+            fsize = os.path.getsize(item_path)
+            print(f"  📄 {item} ({fsize:,} bytes)")
 
     data_volume.commit()
     return {"preprocessed_dir": PREPROCESSED_DIR, "examples": len(dataset)}
@@ -242,18 +267,8 @@ def train_lora(run_id: str):
     import subprocess
     import os
 
-    os.environ["TORCHDYNAMO_DISABLE"] = "1"
-    os.environ["NCCL_TIMEOUT"] = "7200"
-    os.environ["NCCL_DEBUG"] = "WARN"
-    os.environ["NCCL_IB_TIMEOUT"] = "23"
-    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
-    os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
-    os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "7200"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    os.environ["TORCH_DIST_INIT_BARRIER_TIMEOUT"] = "7200"
-    # os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"  # Experimental for P2P, causes warnings
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    # Disable fused attn to avoid cudnn bugs:
+    os.environ["NVTE_FUSED_ATTN"] = "0"
 
     cluster_info = modal.experimental.get_cluster_info()
     node_rank = cluster_info.rank
@@ -262,10 +277,6 @@ def train_lora(run_id: str):
     master_port = 29500
 
     print(f"Node {node_rank}/{num_nodes}, Master: {master_addr}:{master_port}")
-
-    models_volume.reload()
-    data_volume.reload()
-    checkpoints_volume.reload()
 
     # Verify preprocessed data exists
     if not os.path.exists(PREPROCESSED_DIR):

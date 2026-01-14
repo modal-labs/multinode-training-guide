@@ -145,7 +145,7 @@ def main():
         ),
         checkpoint=CheckpointConfig(
             save_interval=130,
-            save=f"{args.checkpoints_dir}/glm47_lora_{args.run_id}",
+            save=f"{args.checkpoints_dir}/glm47_lora",
             pretrained_checkpoint=args.megatron_checkpoint,
             ckpt_format="torch_dist",
             fully_parallel_save=False,
@@ -163,7 +163,7 @@ def main():
     config.model.pipeline_model_parallel_size = 1
     config.model.expert_model_parallel_size = 8
     config.model.context_parallel_size = 1  # No CP needed for 8k sequences
-    # config.model.cp_comm_type = "a2a+p2p"
+
     config.model.calculate_per_token_loss = False  # CP=1, no need for per-token loss
     config.model.sequence_parallel = True
     config.model.attention_backend = "flash"
