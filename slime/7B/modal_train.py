@@ -37,12 +37,16 @@ checkpoints_volume: modal.Volume = modal.Volume.from_name(
     "grpo-slime-example-checkpoints", create_if_missing=True
 )
 
-MODEL_NAME = "Qwen2.5-0.5B-Instruct"
+MODEL_NAME = "Qwen3-4B"
 MODEL_ID: str = f"Qwen/{MODEL_NAME}"
 TRAINING_CHECKPOINT_DIR: Path = MODELS_PATH / "training_checkpoints" / MODEL_ID
 
 
-N_NODES = 1
+N_NODES = 4
+
+# Wandb configuration
+WANDB_PROJECT = "slime-grpo"
+WANDB_RUN_NAME_PREFIX = "sync-qwen-3-4b-gsm8k"
 
 # Ray configuration
 RAY_PORT = 6379
@@ -238,8 +242,13 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         "--attention-backend flash "
         "--actor-num-nodes 1 "
         "--actor-num-gpus-per-node 2 " # number of gpus per node
-        "--rollout-num-gpus 2 "
+        "--colocate "
         "--megatron-to-hf-mode bridge "
+    )
+
+    wandb_args = (
+        f"{U.get_default_wandb_args(__file__, WANDB_RUN_NAME_PREFIX)} "
+        f"--wandb-project {WANDB_PROJECT} "
     )
 
     train_args = (
@@ -248,7 +257,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{wandb_args} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
@@ -273,7 +282,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         }
     }
 
-    return f"python3 slime/train_async.py {train_args}", runtime_env
+    return f"python3 slime/train.py {train_args}", runtime_env
 
 
 
@@ -283,7 +292,7 @@ async def run_training(n_nodes: int, arglist: list[str], master_addr: str):
     Uses Ray's JobSubmissionClient to submit the training command and
     asynchronously tails logs until the job completes.
     """
-    client = JobSubmissionClient()
+    client = JobSubmissionClient("http://127.0.0.1:8265")
 
     slime_cmd, runtime_env = generate_slime_cmd(n_nodes, arglist, master_addr)
     job_id = client.submit_job(
