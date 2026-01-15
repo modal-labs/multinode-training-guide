@@ -34,7 +34,7 @@ checkpoints_volume: modal.Volume = modal.Volume.from_name(
     "grpo-slime-example-checkpoints", create_if_missing=True
 )
 
-MODEL_NAME = "Qwen3-4B"
+MODEL_NAME = "Qwen3-4B-Instruct-2507"
 MODEL_ID: str = f"Qwen/{MODEL_NAME}"
 TRAINING_CHECKPOINT_DIR: Path = MODELS_PATH / "training_checkpoints" / MODEL_ID
 
@@ -42,7 +42,7 @@ N_NODES = 4
 
 # Wandb configuration
 WANDB_PROJECT = "slime-grpo"
-WANDB_RUN_NAME_PREFIX = "async-qwen-3-4b-gsm8k"
+WANDB_RUN_NAME_PREFIX = "async-qwen-3-4b-instruct-2507-gsm8k"
 
 # Ray configuration
 RAY_PORT = 6379
@@ -59,12 +59,7 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
     for all worker nodes to connect. Other ranks start as workers and connect
     to the head node address.
     """
-
-    # Set all IP-related env vars to force Ray/slime to use the correct Modal cluster IP
-    os.environ["SLIME_HOST_IP"] = node_ip_addr  # For slime SGLang engines
-    # os.environ["RAY_ADDRESS"] = f"{main_node_addr}:{RAY_PORT}"
-    # os.environ["RAY_NODE_IP_ADDRESS"] = node_ip_addr
-    # os.environ["HOST_IP"] = node_ip_addr
+    os.environ["SLIME_HOST_IP"] = node_ip_addr 
 
     if rank == 0:
         print("rank 0")
@@ -174,26 +169,39 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         "--eval-top-k 1 "
     )
 
-    # Model architecture args for Qwen2.5-0.5B-Instruct (from HF config)
+    # Model architecture args for Qwen3-4B-Instruct (from HF config)
     model_args = (
         "--swiglu "
-        "--num-layers 24 "
-        "--hidden-size 896 "
-        "--ffn-hidden-size 4864 "
-        "--num-attention-heads 14 "
+        "--num-layers 36 "
+        "--hidden-size 2560 "
+        "--ffn-hidden-size 9728 "
+        "--num-attention-heads 32 "
+        "--group-query-attention "
+        "--num-query-groups 8 "
         "--use-rotary-position-embeddings "
         "--disable-bias-linear "
-        "--add-qkv-bias "
         "--normalization RMSNorm "
         "--norm-epsilon 1e-6 "
-        "--rotary-base 1000000 "
-        "--group-query-attention "
-        "--num-query-groups 2 "
+        "--rotary-base 5000000 "
         "--vocab-size 151936 "
+        "--kv-channels 128 "
+        "--qk-layernorm "
     )
 
+    # perf_args = (
+    #     "--tensor-model-parallel-size 1 "
+    #     "--sequence-parallel "
+    #     "--pipeline-model-parallel-size 1 "
+    #     "--context-parallel-size 1 "
+    #     "--expert-model-parallel-size 1 "
+    #     "--expert-tensor-parallel-size 1 "
+    #     # "--micro-batch-size 1 "
+    #     "--use-dynamic-batch-size "
+    #     "--max-tokens-per-gpu 9216 "
+    # )
+
     perf_args = (
-        "--tensor-model-parallel-size 1 "
+        "--tensor-model-parallel-size 2 "
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
         "--context-parallel-size 1 "
@@ -201,7 +209,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         "--expert-tensor-parallel-size 1 "
         # "--micro-batch-size 1 "
         "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 9216 "
+        "--max-tokens-per-gpu 4096 "
     )
 
     grpo_args = (

@@ -63,6 +63,8 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
     for all worker nodes to connect. Other ranks start as workers and connect
     to the head node address.
     """
+    os.environ["SLIME_HOST_IP"] = node_ip_addr 
+
     if rank == 0:
         subprocess.Popen(
             [
