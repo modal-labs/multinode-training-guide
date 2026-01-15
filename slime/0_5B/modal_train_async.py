@@ -1,17 +1,14 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 import time
 import modal
 import modal.experimental
-
-app = modal.App("example-grpo-slime")
-
-
-# copied from verl modal_train
 from pathlib import Path
 
+app = modal.App("example-grpo-slime-async")
+    
 CONTAINER_HOME: Path = Path("/home/ec2-user")
 SLIME_REPO_PATH: Path = CONTAINER_HOME / "slime"
 
@@ -41,8 +38,11 @@ MODEL_NAME = "Qwen2.5-0.5B-Instruct"
 MODEL_ID: str = f"Qwen/{MODEL_NAME}"
 TRAINING_CHECKPOINT_DIR: Path = MODELS_PATH / "training_checkpoints" / MODEL_ID
 
+N_NODES = 4
 
-N_NODES = 2
+# Wandb configuration
+WANDB_PROJECT = "slime-grpo"
+WANDB_RUN_NAME_PREFIX = "async-qwen-0.5b-gsm8k"
 
 # Ray configuration
 RAY_PORT = 6379
@@ -59,7 +59,15 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
     for all worker nodes to connect. Other ranks start as workers and connect
     to the head node address.
     """
+
+    # Set all IP-related env vars to force Ray/slime to use the correct Modal cluster IP
+    os.environ["SLIME_HOST_IP"] = node_ip_addr  # For slime SGLang engines
+    # os.environ["RAY_ADDRESS"] = f"{main_node_addr}:{RAY_PORT}"
+    # os.environ["RAY_NODE_IP_ADDRESS"] = node_ip_addr
+    # os.environ["HOST_IP"] = node_ip_addr
+
     if rank == 0:
+        print("rank 0")
         subprocess.Popen(
             [
                 "ray",
@@ -76,6 +84,7 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
             except ConnectionError:
                 time.sleep(1)
                 continue
+            print("Connected to ray. I think.")
             break
         else:
             raise Exception("Failed to connect to Ray")
@@ -218,6 +227,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-mem-fraction-static .7 " # or .6, or .5 as the verl default
         "--sglang-enable-metrics "
+        # "--sglang-router-ip 10.100.0.1 "
     )
 
     ci_args = (
@@ -238,8 +248,13 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         "--attention-backend flash "
         "--actor-num-nodes 1 "
         "--actor-num-gpus-per-node 2 " # number of gpus per node
-        "--colocate "
+        "--rollout-num-gpus 2 "
         "--megatron-to-hf-mode bridge "
+    )
+
+    wandb_args = (
+        f"{U.get_default_wandb_args(__file__, WANDB_RUN_NAME_PREFIX)} "
+        f"--wandb-project {WANDB_PROJECT} "
     )
 
     train_args = (
@@ -248,7 +263,7 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{wandb_args} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
@@ -270,10 +285,15 @@ def generate_slime_cmd(n_nodes: int, arglist: list[str], master_addr: str):
             "no_proxy": master_addr,
             # This is needed by megatron / torch distributed in multi-node setup
             "MASTER_ADDR": master_addr,
+            # Force Ray/slime to use the correct Modal cluster IP instead of internal Docker IP
+            # "RAY_ADDRESS": f"{master_addr}:{RAY_PORT}",
+            # "RAY_NODE_IP_ADDRESS": master_addr,
+            # "HOST_IP": master_addr,
+            # "SLIME_HOST_IP": master_addr,
         }
     }
 
-    return f"python3 slime/train.py {train_args}", runtime_env
+    return f"python3 slime/train_async.py {train_args}", runtime_env
 
 
 
@@ -283,6 +303,8 @@ async def run_training(n_nodes: int, arglist: list[str], master_addr: str):
     Uses Ray's JobSubmissionClient to submit the training command and
     asynchronously tails logs until the job completes.
     """
+    # Explicitly pass the dashboard address to avoid auto-detection picking wrong IP
+    # client = JobSubmissionClient(address=f"http://{master_addr}:{RAY_DASHBOARD_PORT}")
     client = JobSubmissionClient()
 
     slime_cmd, runtime_env = generate_slime_cmd(n_nodes, arglist, master_addr)
@@ -319,6 +341,7 @@ async def train_multi_node(*arglist):
     Rank 0 initializes Ray and submits the training job; other ranks join
     as workers and block until training completes.
     """
+    assert N_NODES > 1
     checkpoints_volume.reload()
     data_volume.reload()
 
@@ -362,6 +385,8 @@ async def train_multi_node(*arglist):
     },
 )
 async def train_single_node(*arglist):
+    assert N_NODES == 1
+
     checkpoints_volume.reload()
     data_volume.reload()
 
