@@ -4,7 +4,7 @@ from .base import (
     TrainingConfig,
     ModelArchitectureConfig,
     PerformanceConfig,
-    SGLangConfig,
+    ClusterConfig,
 )
 
 _ARCHITECTURE = ModelArchitectureConfig(
@@ -29,7 +29,6 @@ def get_config_sync() -> TrainingConfig:
         model_name="Qwen3-4B-Instruct-2507",
         architecture=_ARCHITECTURE,
         performance=_PERFORMANCE,
-        sglang=SGLangConfig(rollout_num_gpus=8),
         app_name="slime-grpo-qwen-4b-sync",
         wandb_run_name_prefix="sync-qwen-3-4b-instruct-gsm8k",
     )
@@ -40,7 +39,6 @@ def get_config_async() -> TrainingConfig:
         model_name="Qwen3-4B-Instruct-2507",
         architecture=_ARCHITECTURE,
         performance=_PERFORMANCE,
-        sglang=SGLangConfig(rollout_num_gpus=8),
         app_name="slime-grpo-qwen-4b-async",
         wandb_run_name_prefix="async-qwen-3-4b-instruct-gsm8k",
         use_async=True,

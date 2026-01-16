@@ -84,9 +84,30 @@ class RolloutConfig:
 
 
 @dataclass
+class ClusterConfig:
+    """Cluster and GPU allocation for training/rollout."""
+    # Actor (training)
+    actor_num_nodes: int = 2
+    actor_num_gpus_per_node: int = 8
+    # Critic (for PPO, usually None for GRPO)
+    critic_num_nodes: Optional[int] = None
+    critic_num_gpus_per_node: Optional[int] = None
+    # Rollout (inference)
+    rollout_num_gpus: Optional[int] = None # defaults to actor_num_gpus_per_node * actor_num_nodes
+    num_gpus_per_node: int = 8
+    # Colocation
+    colocate: bool = False
+    offload: bool = False
+    offload_train: Optional[bool] = None
+    offload_rollout: Optional[bool] = None
+
+    def to_args(self) -> str:
+        return " ".join(_to_cli_args(self))
+
+
+@dataclass
 class SGLangConfig:
-    rollout_num_gpus: Optional[int] = None
-    rollout_num_gpus_per_engine: int = 1
+    """SGLang inference engine configuration."""
     sglang_mem_fraction_static: float = 0.7
 
     def to_args(self) -> str:
@@ -144,13 +165,11 @@ class CIConfig:
 
 @dataclass
 class MiscConfig:
+    """Miscellaneous training settings."""
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
     attention_backend: str = "flash"
     megatron_to_hf_mode: str = "bridge"
-    colocate: bool = False
-    actor_num_nodes: int = 1
-    actor_num_gpus_per_node: int = 2
 
     def to_args(self) -> str:
         return " ".join([*_to_cli_args(self), "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32"])
@@ -166,6 +185,7 @@ class TrainingConfig:
     
     # Nested configs
     architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
+    cluster: ClusterConfig = field(default_factory=ClusterConfig)
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
@@ -187,6 +207,9 @@ class TrainingConfig:
     # Training mode
     use_async: bool = False
     
+    # Extra args passthrough (for any slime arg not in configs)
+    extra_args: list[str] = field(default_factory=list)
+    
     @property
     def model_id(self) -> str:
         return f"{self.model_org}/{self.model_name}"
@@ -196,9 +219,10 @@ class TrainingConfig:
         return "slime/train_async.py" if self.use_async else "slime/train.py"
     
     def generate_train_args(self, models_path, data_path, is_infinite_run: bool) -> str:
-        return " ".join([
+        args = [
             f"--hf-checkpoint {models_path}/{self.model_name}/ --ref-load {models_path}/{self.model_name}/",
             self.architecture.to_args(),
+            self.cluster.to_args(),
             self.rollout.to_args(data_path, is_infinite_run),
             self.optimizer.to_args(),
             self.grpo.to_args(),
@@ -207,4 +231,7 @@ class TrainingConfig:
             self.sglang.to_args(),
             self.ci.to_args(),
             self.misc.to_args(),
-        ])
+        ]
+        if self.extra_args:
+            args.extend(self.extra_args)
+        return " ".join(args)

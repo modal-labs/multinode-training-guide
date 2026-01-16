@@ -148,7 +148,6 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
 def generate_slime_cmd(
     config: TrainingConfig,
     master_addr: str,
-    extra_args: list[str],
 ) -> tuple[str, dict]:
     """Generate the slime training command and runtime environment."""
     import slime.utils.external_utils.command_utils as U
@@ -160,10 +159,6 @@ def generate_slime_cmd(
     
     # Add wandb args
     train_args += f" {U.get_default_wandb_args(__file__, config.wandb_run_name_prefix)} --wandb-project {config.wandb_project}"
-
-    # Add any extra CLI args
-    if extra_args:
-        train_args += " " + " ".join(extra_args)
 
     runtime_env = {
         "env_vars": {
@@ -181,13 +176,12 @@ def generate_slime_cmd(
 async def run_training(
     config: TrainingConfig,
     n_nodes: int,
-    extra_args: list[str],
     master_addr: str,
 ):
     """Submit SLIME training job to Ray cluster and stream logs."""
     client = JobSubmissionClient("http://127.0.0.1:8265")
 
-    slime_cmd, runtime_env = generate_slime_cmd(config, master_addr, extra_args)
+    slime_cmd, runtime_env = generate_slime_cmd(config, master_addr)
     
     print("Submitting training job...")
     print(f"  Config: {config.model_name}")
@@ -282,12 +276,12 @@ def list_available_configs():
     },
 )
 @modal.experimental.clustered(4, rdma=True)
-async def train_multi_node(config: str = "qwen-0.5b-sync", *extra_args):
+async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
     
     Args:
         config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
-        extra_args: Additional args to pass to slime training
+        config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
     """
     cfg = get_config(config)
     
@@ -308,7 +302,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync", *extra_args):
     if cluster_info.rank == 0:
         with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
             print(f"Dashboard URL: {tunnel.url}")
-            await run_training(cfg, n_nodes, list(extra_args), ray_main_node_addr)
+            await run_training(cfg, n_nodes, ray_main_node_addr)
     else:
         while True:
             time.sleep(10)
@@ -329,12 +323,12 @@ async def train_multi_node(config: str = "qwen-0.5b-sync", *extra_args):
         "efa_enabled": True,
     },
 )
-async def train_single_node(config: str = "qwen-0.5b-sync", *extra_args):
+async def train_single_node(config: str = "qwen-0.5b-sync"):
     """Single-node GRPO training on Modal.
     
     Args:
         config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
-        extra_args: Additional args to pass to slime training
+        config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
     """
     cfg = get_config(config)
     
@@ -346,4 +340,4 @@ async def train_single_node(config: str = "qwen-0.5b-sync", *extra_args):
     with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
         print(f"Dashboard URL: {tunnel.url}")
         print(f"Config: {config}")
-        await run_training(cfg, 1, list(extra_args), SINGLE_NODE_MASTER_ADDR)
+        await run_training(cfg, 1, SINGLE_NODE_MASTER_ADDR)
