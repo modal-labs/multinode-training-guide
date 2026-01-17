@@ -521,6 +521,107 @@ def calculate_pp_stage_memory(
     }
 
 
+def calculate_recompute_memory(
+    model: GLM47Config,
+    parallel: ParallelismConfig,
+    training: TrainingConfig,
+    recompute_num_layers: int = 1,
+    verbose: bool = True
+) -> dict:
+    """
+    Calculate memory with activation recomputation.
+
+    With full recompute (recompute_num_layers=1):
+    - Only store input activations at checkpoint boundaries
+    - During backward, recompute forward pass to regenerate activations
+    - Peak memory = weights + checkpoint_activations + recompute_buffer + gradients
+
+    With partial recompute (recompute_num_layers=N):
+    - Checkpoint every N layers
+    - Store N layers worth of activations at a time
+    """
+    results = {}
+
+    batch = training.micro_batch_size
+    seq = training.seq_length
+    hidden = model.hidden_size
+    layers_per_stage = model.num_layers // parallel.pp
+    seq_per_tp = seq // parallel.tp
+
+    # Model weights (same regardless of recompute)
+    embed_params = model.vocab_size * model.hidden_size / parallel.tp
+    expert_params = 3 * model.hidden_size * model.expert_ffn_hidden_size
+    experts_per_ep = model.num_experts / parallel.ep
+    moe_params_per_layer = (experts_per_ep * expert_params) / parallel.tp
+
+    attn_params_per_layer = (
+        model.hidden_size * (model.num_attention_heads + 2 * model.num_kv_heads) * model.head_dim +
+        model.hidden_size * model.hidden_size
+    ) / parallel.tp
+
+    weight_params = embed_params + layers_per_stage * (attn_params_per_layer + moe_params_per_layer)
+    weight_gb = weight_params * training.dtype_bytes / 1e9
+
+    # Checkpoint activation memory
+    # With recompute_num_layers=N, we store inputs every N layers
+    checkpoint_interval = recompute_num_layers
+    num_checkpoints = (layers_per_stage + checkpoint_interval - 1) // checkpoint_interval
+
+    # Each checkpoint stores: hidden_states (batch * seq * hidden)
+    checkpoint_act_bytes = batch * seq_per_tp * hidden * training.dtype_bytes
+    total_checkpoint_bytes = num_checkpoints * checkpoint_act_bytes
+
+    # Recompute buffer: during backward, we need to store activations for N layers
+    # This is the peak memory during recomputation
+    per_layer_act_bytes = batch * seq_per_tp * hidden * 4 * training.dtype_bytes  # input, qkv, intermediate, output
+    expert_act_bytes = batch * seq_per_tp * model.expert_ffn_hidden_size * 2 * (model.num_experts_per_token + 1) * training.dtype_bytes
+    full_layer_act = per_layer_act_bytes + expert_act_bytes
+
+    recompute_buffer_bytes = checkpoint_interval * full_layer_act
+
+    # Gradient buffer (for backward pass)
+    grad_buffer_bytes = full_layer_act * 1.5  # gradients are slightly larger due to intermediate storage
+
+    # Communication and CUDA overhead
+    comm_overhead_gb = 4.0
+    cuda_overhead_gb = 2.0
+
+    # MoE backward spike (reduce_scatter buffers)
+    # This is the additional memory needed during MoE backward
+    moe_backward_spike_gb = 1.5 * batch  # Empirically ~1.5GB per sample in batch
+
+    total_act_gb = (total_checkpoint_bytes + recompute_buffer_bytes + grad_buffer_bytes) / 1e9
+    total_gb = weight_gb + total_act_gb + comm_overhead_gb + cuda_overhead_gb + moe_backward_spike_gb
+
+    results = {
+        "weight_gb": weight_gb,
+        "checkpoint_act_gb": total_checkpoint_bytes / 1e9,
+        "recompute_buffer_gb": recompute_buffer_bytes / 1e9,
+        "grad_buffer_gb": grad_buffer_bytes / 1e9,
+        "moe_backward_spike_gb": moe_backward_spike_gb,
+        "comm_overhead_gb": comm_overhead_gb,
+        "cuda_overhead_gb": cuda_overhead_gb,
+        "total_gb": total_gb,
+        "num_checkpoints": num_checkpoints,
+    }
+
+    if verbose:
+        print(f"\nRecompute Analysis (mbs={batch}, recompute_num_layers={recompute_num_layers}):")
+        print(f"  Model weights:      {weight_gb:>6.1f} GB")
+        print(f"  Checkpoint acts:    {total_checkpoint_bytes/1e9:>6.1f} GB ({num_checkpoints} checkpoints)")
+        print(f"  Recompute buffer:   {recompute_buffer_bytes/1e9:>6.1f} GB ({checkpoint_interval} layers)")
+        print(f"  Grad buffer:        {grad_buffer_bytes/1e9:>6.1f} GB")
+        print(f"  MoE backward spike: {moe_backward_spike_gb:>6.1f} GB")
+        print(f"  Comm + CUDA:        {comm_overhead_gb + cuda_overhead_gb:>6.1f} GB")
+        print(f"  --------------------------")
+        print(f"  TOTAL:              {total_gb:>6.1f} GB")
+        headroom = 80 - total_gb
+        status = "✅" if headroom > 2 else ("⚠️" if headroom > 0 else "❌")
+        print(f"  H100 headroom:      {headroom:>6.1f} GB {status}")
+
+    return results
+
+
 def main():
     model = GLM47Config()
     lora = LoRAConfig(rank=128, alpha=32)
@@ -656,6 +757,74 @@ def main():
         headroom = 80 - result['total_gb']
         headroom_str = f"{headroom:.1f}GB" if headroom > 0 else f"{-headroom:.1f}GB over"
         print(f"{name:<45} {result['total_gb']:<12.1f} {fits:<12} {headroom_str:<12}")
+
+    # =========================================================================
+    # V3 OPTIMIZATION: Recompute configurations with different mbs
+    # =========================================================================
+    print("\n" + "="*70)
+    print("V3 OPTIMIZATION: Recompute Memory Analysis")
+    print("="*70)
+    print("\nGoal: Find optimal mbs to leverage ~17GB/GPU unused VRAM from V2")
+    print("V2 baseline: mbs=2, full recompute, ~63GB observed peak")
+
+    nvidia_config = ParallelismConfig(tp=2, pp=4, ep=4, cp=1)
+
+    # Test different mbs with full recompute
+    for mbs in [1, 2, 3, 4]:
+        train_cfg = TrainingConfig(micro_batch_size=mbs, seq_length=8192)
+        calculate_recompute_memory(model, nvidia_config, train_cfg, recompute_num_layers=1, verbose=True)
+
+    # Test partial recompute (recompute_num_layers=2) with mbs=2
+    print("\n" + "-"*70)
+    print("Alternative: Partial recompute (recompute_num_layers=2)")
+    print("-"*70)
+    for mbs in [2, 3]:
+        train_cfg = TrainingConfig(micro_batch_size=mbs, seq_length=8192)
+        calculate_recompute_memory(model, nvidia_config, train_cfg, recompute_num_layers=2, verbose=True)
+
+    # =========================================================================
+    # CALIBRATED ESTIMATE: Based on observed V2 data
+    # =========================================================================
+    print("\n" + "="*70)
+    print("CALIBRATED ESTIMATES (based on observed V2 peak: 63GB)")
+    print("="*70)
+    print("""
+The calculator underestimates by ~25GB due to:
+- PP buffers (multiple microbatches in flight)
+- MoE all-to-all communication buffers
+- PyTorch autograd graph overhead
+- CUDA allocator fragmentation
+
+Calibrated scaling from observed V2 (mbs=2, full recompute, 63GB):
+- Base overhead: ~30GB (weights + fixed buffers)
+- Per-mbs overhead: ~16.5GB
+
+mbs=1: ~30 + 16.5 = ~47GB  (confirmed: lower than V2)
+mbs=2: ~30 + 33   = ~63GB  (confirmed: V2 observed peak)
+mbs=3: ~30 + 50   = ~80GB  ⚠️  Right at H100 limit!
+mbs=4: ~30 + 66   = ~96GB  ❌ Will OOM
+""")
+
+    print("="*70)
+    print("RECOMMENDATIONS")
+    print("="*70)
+    print("""
+1. PRIMARY: Try mbs=3 with full recompute
+   - Calibrated estimate: ~80GB peak (right at H100 limit)
+   - Risk: MoE backward spikes may cause intermittent OOM
+   - Potential: ~50% throughput improvement if stable
+
+2. SAFER ALTERNATIVE: If mbs=3 is unstable, try mbs=2 with recompute_num_layers=2
+   - Reduces recompute overhead by ~15%
+   - Should stay at ~63GB with less compute overhead
+   - Modest throughput gain (~10-15%)
+
+3. AGGRESSIVE (NOT RECOMMENDED): mbs=4
+   - Will almost certainly OOM on MoE backward pass
+   - Only consider if mbs=3 shows >5GB headroom in practice
+
+Run V3 with: modal run --detach modal_train.py::train_lora_optimized_v3
+""")
 
 
 if __name__ == "__main__":

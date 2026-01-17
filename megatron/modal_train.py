@@ -67,7 +67,6 @@ nemo_image = (
     .uv_pip_install(
         "wandb==0.23.1",
         "datasets==3.1.0",
-        "nvidia-modelopt[hf]",
     )
     .run_commands(f"rm -Rf {HF_CACHE}")
     .add_local_dir(LOCAL_CODE_DIR, remote_path=REMOTE_CODE_DIR)
@@ -560,3 +559,110 @@ def train_lora_optimized_v2():
 
     checkpoints_volume.commit()
     return {"status": "optimized_v2_training_complete"}
+
+
+REMOTE_OPTIMIZED_V3_SCRIPT = "/root/train_optimized_v3.py"
+
+
+@app.function(
+    image=nemo_image,
+    gpu="H100:8",
+    volumes={
+        MODELS_DIR: models_volume,
+        DATA_DIR: data_volume,
+        CHECKPOINTS_DIR: checkpoints_volume,
+    },
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    timeout=86400,
+    experimental_options={"efa_enabled": True},
+)
+@modal.experimental.clustered(size=N_NODES, rdma=True)
+def train_lora_optimized_v3():
+    """
+    Train GLM-4.7 with LoRA - OPTIMIZED V3 (Leverage unused VRAM).
+
+    V2 status: mbs=2, full recompute, ~63GB peak, ~17GB headroom, ~375 TFLOP/s/GPU
+
+    V3 experiment: Try mbs=3 with full recompute to use the ~17GB/GPU headroom
+    - Expected: ~80% of H100 memory utilized
+    - Target: ~50% throughput improvement over V2
+
+    Memory math (per GPU):
+    - V2 (mbs=2): ~63GB peak → 17GB headroom
+    - V3 (mbs=3): ~79GB estimated → 1GB headroom (risky but worth trying)
+
+    If mbs=3 OOMs, fallback options:
+    1. Use recompute_num_layers=2 with mbs=2 (less overhead)
+    2. Stay with V2 config (stable, decent throughput)
+    """
+
+    # Environment optimizations
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["NVTE_FWD_LAYERNORM_SM_MARGIN"] = "16"
+    os.environ["NVTE_BWD_LAYERNORM_SM_MARGIN"] = "16"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+
+    cluster_info = modal.experimental.get_cluster_info()
+    node_rank = cluster_info.rank
+    num_nodes = N_NODES
+    master_addr = (
+        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
+    )
+    master_port = 29500
+
+    print(
+        f"[OPTIMIZED V3] Node {node_rank}/{num_nodes}, Master: {master_addr}:{master_port}"
+    )
+    print("Config: TP=2, PP=4, EP=4, mbs=3, FULL recompute")
+    print("Goal: Leverage ~17GB/GPU unused VRAM for ~50% throughput gain")
+
+    # Verify preprocessed data exists
+    if not os.path.exists(PREPROCESSED_DIR):
+        raise RuntimeError(
+            f"Preprocessed data not found at {PREPROCESSED_DIR}. "
+            "Run: modal run modal_train.py::prep_dataset first!"
+        )
+
+    print(f"Using pre-built dataset from: {PREPROCESSED_DIR}")
+
+    # Verify checkpoint exists
+    if not os.path.exists(MEGATRON_CHECKPOINT):
+        raise RuntimeError(f"Checkpoint not found at {MEGATRON_CHECKPOINT}")
+
+    script_args = [
+        "--preprocessed_dir",
+        PREPROCESSED_DIR,
+        "--megatron_checkpoint",
+        MEGATRON_CHECKPOINT,
+        "--checkpoints_dir",
+        CHECKPOINTS_DIR,
+        "--hf_model",
+        HF_MODEL,
+        "--micro_batch_size",
+        "3",  # V3: Push mbs to 3 to use headroom
+        "--global_batch_size",
+        "36",  # Must be divisible by mbs × DP = 3 × 4 = 12
+        # Full recompute enabled by default
+    ]
+
+    cmd = [
+        "torchrun",
+        f"--nnodes={num_nodes}",
+        f"--node_rank={node_rank}",
+        f"--master_addr={master_addr}",
+        f"--master_port={master_port}",
+        "--nproc_per_node=8",
+        REMOTE_OPTIMIZED_V3_SCRIPT,
+        *script_args,
+    ]
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=False, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Training failed with code {result.returncode}")
+
+    checkpoints_volume.commit()
+    return {"status": "optimized_v3_training_complete"}
