@@ -174,6 +174,8 @@ def main():
     # TRAINING CONFIG
     # ==========================================================================
 
+    SEQ_LENGTH = 128_000
+
     config = ConfigContainer(
         model=model_cfg,
         train=TrainingConfig(
@@ -196,7 +198,7 @@ def main():
         ),
         dataset=FinetuningDatasetConfig(
             dataset_root=args.preprocessed_dir,
-            seq_length=8192,
+            seq_length=SEQ_LENGTH,
             seed=5678,
             dataloader_type="batch",
             num_workers=4,
@@ -259,7 +261,7 @@ def main():
     else:
         print("Recompute: DISABLED - WARNING: Will likely OOM with mbs >= 2")
 
-    config.model.seq_length = 8192
+    config.model.seq_length = SEQ_LENGTH
 
     # ==========================================================================
     # OPERATOR FUSION - ENABLED
