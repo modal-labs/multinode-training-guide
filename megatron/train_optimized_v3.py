@@ -218,7 +218,8 @@ def main():
             pretrained_checkpoint=args.megatron_checkpoint,
             ckpt_format="torch_dist",
             fully_parallel_save=True,
-            async_save=True,
+            # Modal blocks pidfd_getfd needed for async CUDA IPC.
+            async_save=False,
         ),
         rng=RNGConfig(seed=5678),
         peft=lora_config,
