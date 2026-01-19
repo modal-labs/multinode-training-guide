@@ -6,7 +6,7 @@ This example demonstrates how to fine-tune the GLM-4.7 358B Mixture-of-Experts m
 
 GLM-4.7 is a 358B parameter MoE model with 92 layers and 160 experts. Fine-tuning a model this large requires:
 - Multi-node distributed training across 32 GPUs
-- Advanced parallelism strategies (Tensor, Expert, Data parallelism)
+- Advanced parallelism strategies (Tensor, Pipeline, Expert, Data parallelism)
 - Memory-efficient techniques like LoRA and activation recomputation
 
 The training pipeline consists of three main stages:
@@ -37,8 +37,8 @@ modal run --detach modal_train.py::download_and_convert
 ```
 
 This command:
-- Downloads the 358B model weights (~700GB)
-- Converts to Megatron's `torch_dist` checkpoint format
+- Downloads the 358B model weights (~700GB) on CPU
+- Converts to Megatron's `torch_dist` checkpoint format on a B200 GPU (requires ~1TB memory)
 - Stores in a Modal volume for training
 
 **Note:** This step takes several hours due to model size. Run with `--detach` to avoid timeouts.
@@ -71,6 +71,8 @@ This command:
 - Saves checkpoints periodically to a Modal volume
 - Logs metrics to Weights & Biases (run ID generated automatically)
 
+**Memory Note:** The default configuration (mbs=3, full recompute) uses ~79GB per GPU, leaving ~1GB headroom on H100. For datasets with longer sequences, reduce micro batch size or increase tensor/pipeline parallelism.
+
 ## Training Configuration
 
 ### Parallelism Strategy
@@ -80,11 +82,11 @@ The 358B MoE model uses a combination of parallelism strategies across 32 GPUs:
 | Parallelism | Value | Description |
 |-------------|-------|-------------|
 | Tensor (TP) | 2 | Splits attention/FFN across GPUs |
-| Pipeline (PP) | 1 | No pipeline parallelism |
-| Expert (EP) | 8 | Distributes MoE experts |
-| Data (DP) | 2 | Replicates for data parallelism |
+| Pipeline (PP) | 4 | Distributes layers across pipeline stages |
+| Expert (EP) | 4 | Distributes MoE experts |
+| Data (DP) | 4 | Replicates for data parallelism |
 
-**Total:** TP × PP × EP × DP = 2 × 1 × 8 × 2 = 32 GPUs
+**Total:** N_NODES × GPUs_per_node / (TP × PP) = 4 × 8 / (2 × 4) = 4 (DP)
 
 ### LoRA Configuration
 
@@ -100,9 +102,9 @@ LoRA(
 
 | Parameter | Value |
 |-----------|-------|
-| Global batch size | 16 |
-| Micro batch size | 1 |
-| Sequence length | 8192 |
+| Global batch size | 36 |
+| Micro batch size | 3 |
+| Sequence length | 128,000 |
 | Learning rate | 1e-4 (cosine decay) |
 | Warmup iterations | 50 |
 | Training iterations | 650 |
@@ -110,10 +112,12 @@ LoRA(
 
 ### Memory Optimizations
 
-- **Activation recomputation:** Full recomputation with uniform method
+- **Activation recomputation:** Full recomputation with uniform method (configurable via `--recompute_num_layers`)
 - **Mixed precision:** BF16 mixed precision training
 - **Grouped GEMM:** Optimized MoE computation
 - **Sequence parallel:** Enabled for memory efficiency
+- **Operator fusion:** Masked softmax, bias activation, bias dropout, and RoPE fusion enabled
+- **TransformerBlock patch:** Custom gradient flow fix for LoRA + recompute compatibility
 
 ## Monitoring
 
@@ -138,6 +142,8 @@ nvidia-smi
 - Modify LoRA hyperparameters (dim, alpha, dropout)
 - Change training parameters (batch size, learning rate, iterations)
 - Use a different dataset by modifying `prep_dataset()`
+- Tune memory usage with `--recompute_num_layers` (1=full recompute, higher=less recompute overhead)
+- Run `memory_calc.py` to explore different parallelism configurations before training
 
 ## Files
 
@@ -145,4 +151,5 @@ nvidia-smi
 |------|-------------|
 | `modal_train.py` | Modal app with download, convert, prep, and train functions |
 | `train.py` | Training script executed via torchrun on each node |
+| `memory_calc.py` | GPU memory calculator for exploring parallelism configurations |
 

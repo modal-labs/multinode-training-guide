@@ -5,13 +5,12 @@ GLM-4.7 (358B MoE) Memory Calculator for LoRA Training
 This script calculates GPU memory requirements for different parallelism configurations.
 """
 
-import math
 from dataclasses import dataclass
-from typing import Optional
 
 # =============================================================================
 # GLM-4.7 Architecture (based on GLM-4.5 355B architecture)
 # =============================================================================
+
 
 @dataclass
 class GLM47Config:
@@ -30,6 +29,7 @@ class GLM47Config:
     With top-8 routing: 8 * 2343 ≈ 18,744 effective FFN width per token
     The "12,288" may be a different architectural specification.
     """
+
     # Core dimensions
     hidden_size: int = 5120
     num_attention_heads: int = 64
@@ -62,7 +62,9 @@ class GLM47Config:
     max_seq_length: int = 131072  # 128K context
 
     # Layernorm and other small params per layer
-    layernorm_params_per_layer: int = 2 * 5120 * 2  # 2 layernorms * hidden * 2 (weight + bias)
+    layernorm_params_per_layer: int = (
+        2 * 5120 * 2
+    )  # 2 layernorms * hidden * 2 (weight + bias)
 
     def total_params(self) -> int:
         """Calculate total parameter count"""
@@ -72,10 +74,18 @@ class GLM47Config:
         # Attention per layer (same for dense and MoE)
         # QKV projection: hidden -> (Q_heads * head_dim) + 2 * (KV_heads * head_dim)
         # With GQA: Q has 64 heads, KV has 8 heads
-        q_params = self.hidden_size * self.num_attention_heads * self.head_dim  # 5120 * 64 * 128
-        kv_params = self.hidden_size * 2 * self.num_kv_heads * self.head_dim    # 5120 * 2 * 8 * 128
-        proj_params = self.num_attention_heads * self.head_dim * self.hidden_size  # 64 * 128 * 5120
-        attn_params_per_layer = q_params + kv_params + proj_params + self.layernorm_params_per_layer
+        q_params = (
+            self.hidden_size * self.num_attention_heads * self.head_dim
+        )  # 5120 * 64 * 128
+        kv_params = (
+            self.hidden_size * 2 * self.num_kv_heads * self.head_dim
+        )  # 5120 * 2 * 8 * 128
+        proj_params = (
+            self.num_attention_heads * self.head_dim * self.hidden_size
+        )  # 64 * 128 * 5120
+        attn_params_per_layer = (
+            q_params + kv_params + proj_params + self.layernorm_params_per_layer
+        )
 
         # Dense FFN params (for first 3 layers) - SwiGLU style: 3 projections
         # up_proj: hidden -> ffn_hidden
@@ -92,17 +102,17 @@ class GLM47Config:
         shared_expert_params = self.num_shared_experts * expert_params
         # Total MoE layer params
         moe_layer_params = (
-            attn_params_per_layer +
-            (self.num_experts * expert_params) +
-            shared_expert_params +
-            router_params
+            attn_params_per_layer
+            + (self.num_experts * expert_params)
+            + shared_expert_params
+            + router_params
         )
 
         # Total
         total = (
-            embed_params +
-            self.num_dense_layers * dense_layer_params +
-            self.num_moe_layers * moe_layer_params
+            embed_params
+            + self.num_dense_layers * dense_layer_params
+            + self.num_moe_layers * moe_layer_params
         )
 
         return total
@@ -114,7 +124,9 @@ class GLM47Config:
         q_params = self.hidden_size * self.num_attention_heads * self.head_dim
         kv_params = self.hidden_size * 2 * self.num_kv_heads * self.head_dim
         proj_params = self.num_attention_heads * self.head_dim * self.hidden_size
-        attn_params_per_layer = q_params + kv_params + proj_params + self.layernorm_params_per_layer
+        attn_params_per_layer = (
+            q_params + kv_params + proj_params + self.layernorm_params_per_layer
+        )
 
         dense_ffn_params = 3 * self.hidden_size * self.dense_ffn_hidden_size
         dense_layer_params = attn_params_per_layer + dense_ffn_params
@@ -123,12 +135,14 @@ class GLM47Config:
         expert_params = 3 * self.hidden_size * self.expert_ffn_hidden_size
         active_experts = self.num_experts_per_token + self.num_shared_experts
         router_params = self.hidden_size * self.num_experts  # Router always runs
-        active_moe_layer_params = attn_params_per_layer + (active_experts * expert_params) + router_params
+        active_moe_layer_params = (
+            attn_params_per_layer + (active_experts * expert_params) + router_params
+        )
 
         total = (
-            embed_params +
-            self.num_dense_layers * dense_layer_params +
-            self.num_moe_layers * active_moe_layer_params
+            embed_params
+            + self.num_dense_layers * dense_layer_params
+            + self.num_moe_layers * active_moe_layer_params
         )
 
         return total
@@ -146,20 +160,27 @@ class GLM47Config:
         expert_params = 3 * self.hidden_size * self.expert_ffn_hidden_size
         all_experts = self.num_experts * expert_params
 
-        print(f"\nParameter Breakdown:")
-        print(f"  Embeddings (in+out): {embed/1e9:.2f}B")
-        print(f"  Attention per layer: {attn_per_layer/1e6:.1f}M")
-        print(f"  Total attention ({self.num_layers} layers): {self.num_layers * attn_per_layer/1e9:.2f}B")
-        print(f"  Dense FFN per layer: {dense_ffn/1e6:.1f}M")
-        print(f"  Total dense FFN ({self.num_dense_layers} layers): {self.num_dense_layers * dense_ffn/1e9:.2f}B")
-        print(f"  Expert params each: {expert_params/1e6:.2f}M")
-        print(f"  All experts per MoE layer: {all_experts/1e9:.2f}B")
-        print(f"  Total MoE experts ({self.num_moe_layers} layers): {self.num_moe_layers * all_experts/1e9:.1f}B")
+        print("\nParameter Breakdown:")
+        print(f"  Embeddings (in+out): {embed / 1e9:.2f}B")
+        print(f"  Attention per layer: {attn_per_layer / 1e6:.1f}M")
+        print(
+            f"  Total attention ({self.num_layers} layers): {self.num_layers * attn_per_layer / 1e9:.2f}B"
+        )
+        print(f"  Dense FFN per layer: {dense_ffn / 1e6:.1f}M")
+        print(
+            f"  Total dense FFN ({self.num_dense_layers} layers): {self.num_dense_layers * dense_ffn / 1e9:.2f}B"
+        )
+        print(f"  Expert params each: {expert_params / 1e6:.2f}M")
+        print(f"  All experts per MoE layer: {all_experts / 1e9:.2f}B")
+        print(
+            f"  Total MoE experts ({self.num_moe_layers} layers): {self.num_moe_layers * all_experts / 1e9:.1f}B"
+        )
 
 
 @dataclass
 class ParallelismConfig:
     """Parallelism configuration"""
+
     tp: int = 1  # Tensor parallel
     pp: int = 1  # Pipeline parallel
     ep: int = 1  # Expert parallel
@@ -178,6 +199,7 @@ class ParallelismConfig:
 @dataclass
 class LoRAConfig:
     """LoRA adapter configuration"""
+
     rank: int = 128
     alpha: int = 32
     target_modules: tuple = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
@@ -187,6 +209,7 @@ class LoRAConfig:
 @dataclass
 class TrainingConfig:
     """Training configuration"""
+
     micro_batch_size: int = 1
     seq_length: int = 8192
     dtype_bytes: int = 2  # bf16
@@ -199,7 +222,7 @@ def calculate_memory(
     training: TrainingConfig,
     total_gpus: int,
     use_recompute: bool = False,
-    verbose: bool = True
+    verbose: bool = True,
 ) -> dict:
     """
     Calculate per-GPU memory requirements for LoRA training.
@@ -227,13 +250,19 @@ def calculate_memory(
 
     # Attention weights per layer - sharded by TP
     # QKV: hidden -> (heads + 2*kv_heads) * head_dim
-    qkv_params = model.hidden_size * (model.num_attention_heads + 2 * model.num_kv_heads) * model.head_dim
+    qkv_params = (
+        model.hidden_size
+        * (model.num_attention_heads + 2 * model.num_kv_heads)
+        * model.head_dim
+    )
     proj_params = model.hidden_size * model.hidden_size
     attn_params_per_layer = (qkv_params + proj_params) / parallel.tp
 
     # Dense FFN layers (first 3 layers) - sharded by TP
     # SwiGLU has 3 projections: gate, up, down
-    dense_ffn_params_per_layer = (3 * model.hidden_size * model.dense_ffn_hidden_size) / parallel.tp
+    dense_ffn_params_per_layer = (
+        3 * model.hidden_size * model.dense_ffn_hidden_size
+    ) / parallel.tp
 
     # MoE expert weights - sharded by EP (and TP within EP group)
     # SwiGLU has 3 projections: gate, up, down
@@ -243,7 +272,9 @@ def calculate_memory(
     router_params = model.hidden_size * model.num_experts
     # Shared expert
     shared_expert_params = model.num_shared_experts * expert_params
-    moe_params_per_layer = ((experts_per_ep_rank * expert_params) + router_params + shared_expert_params) / parallel.tp
+    moe_params_per_layer = (
+        (experts_per_ep_rank * expert_params) + router_params + shared_expert_params
+    ) / parallel.tp
 
     # Layers per PP stage
     layers_per_stage = model.num_layers / parallel.pp
@@ -252,10 +283,10 @@ def calculate_memory(
 
     # Total model weight bytes per GPU
     model_weight_params = (
-        embed_per_gpu +  # embedding (assume first PP stage)
-        dense_layers_per_stage * (attn_params_per_layer + dense_ffn_params_per_layer) +
-        moe_layers_per_stage * (attn_params_per_layer + moe_params_per_layer) +
-        (embed_per_gpu if parallel.pp == 1 else 0)  # output proj on last stage
+        embed_per_gpu  # embedding (assume first PP stage)
+        + dense_layers_per_stage * (attn_params_per_layer + dense_ffn_params_per_layer)
+        + moe_layers_per_stage * (attn_params_per_layer + moe_params_per_layer)
+        + (embed_per_gpu if parallel.pp == 1 else 0)  # output proj on last stage
     )
     model_weight_bytes = model_weight_params * training.dtype_bytes
 
@@ -288,8 +319,8 @@ def calculate_memory(
 
     # Total LoRA params per PP stage
     lora_params_per_stage = (
-        dense_layers_per_stage * (lora_attn_params + lora_dense_ffn_params) +
-        moe_layers_per_stage * lora_moe_layer_params
+        dense_layers_per_stage * (lora_attn_params + lora_dense_ffn_params)
+        + moe_layers_per_stage * lora_moe_layer_params
     )
 
     # LoRA is sharded by TP
@@ -344,7 +375,9 @@ def calculate_memory(
     attn_scores_flash = batch * heads / parallel.tp * seq_per_tp * 256  # tile size
     attn_output = batch * seq_per_tp * hidden
 
-    attn_act_per_layer = (attn_input + qkv_act + attn_scores_flash + attn_output) * training.dtype_bytes
+    attn_act_per_layer = (
+        attn_input + qkv_act + attn_scores_flash + attn_output
+    ) * training.dtype_bytes
 
     # FFN activations per layer
     # For MoE: only top-k experts process tokens, but tokens are redistributed
@@ -352,7 +385,13 @@ def calculate_memory(
     expert_ffn = model.expert_ffn_hidden_size
     ffn_input = batch * seq_per_tp * hidden
     # SwiGLU: gate and up activations, then down
-    ffn_hidden_act = batch * seq_per_tp * expert_ffn * 2 * (model.num_experts_per_token + model.num_shared_experts)
+    ffn_hidden_act = (
+        batch
+        * seq_per_tp
+        * expert_ffn
+        * 2
+        * (model.num_experts_per_token + model.num_shared_experts)
+    )
     ffn_output = batch * seq_per_tp * hidden
 
     ffn_act_per_layer = (ffn_input + ffn_hidden_act + ffn_output) * training.dtype_bytes
@@ -398,47 +437,63 @@ def calculate_memory(
     # =========================================================================
 
     total_gb = (
-        results["model_weights_gb"] +
-        results["lora_total_gb"] +
-        results["activation_gb"] +
-        results["comm_buffers_gb"] +
-        results["cuda_overhead_gb"]
+        results["model_weights_gb"]
+        + results["lora_total_gb"]
+        + results["activation_gb"]
+        + results["comm_buffers_gb"]
+        + results["cuda_overhead_gb"]
     )
 
     results["total_gb"] = total_gb
     results["use_recompute"] = use_recompute
 
     if verbose:
-        print(f"\n{'='*70}")
-        print(f"GLM-4.7 LoRA Memory Analysis")
-        print(f"{'='*70}")
-        print(f"\nParallelism: TP={parallel.tp}, PP={parallel.pp}, EP={parallel.ep}, CP={parallel.cp}")
+        print(f"\n{'=' * 70}")
+        print("GLM-4.7 LoRA Memory Analysis")
+        print(f"{'=' * 70}")
+        print(
+            f"\nParallelism: TP={parallel.tp}, PP={parallel.pp}, EP={parallel.ep}, CP={parallel.cp}"
+        )
         print(f"Data Parallel: DP={dp} (with {total_gpus} total GPUs)")
         print(f"Recompute: {'ENABLED' if use_recompute else 'DISABLED'}")
         print(f"\nLoRA: rank={lora.rank}, alpha={lora.alpha}")
-        print(f"Training: micro_batch={training.micro_batch_size}, seq_len={training.seq_length}")
-        print(f"\n{'-'*70}")
-        print(f"Memory Breakdown (per GPU):")
-        print(f"{'-'*70}")
-        print(f"  Model weights (frozen bf16):  {results['model_weights_gb']:>8.2f} GB  ({results['model_weight_params_billions']:.2f}B params)")
-        print(f"  LoRA adapters + optim:        {results['lora_total_gb']:>8.2f} GB  ({results['lora_params_millions']:.1f}M params)")
-        print(f"  Activations:                  {results['activation_gb']:>8.2f} GB  ({results['activation_per_layer_mb']:.1f} MB/layer)")
+        print(
+            f"Training: micro_batch={training.micro_batch_size}, seq_len={training.seq_length}"
+        )
+        print(f"\n{'-' * 70}")
+        print("Memory Breakdown (per GPU):")
+        print(f"{'-' * 70}")
+        print(
+            f"  Model weights (frozen bf16):  {results['model_weights_gb']:>8.2f} GB  ({results['model_weight_params_billions']:.2f}B params)"
+        )
+        print(
+            f"  LoRA adapters + optim:        {results['lora_total_gb']:>8.2f} GB  ({results['lora_params_millions']:.1f}M params)"
+        )
+        print(
+            f"  Activations:                  {results['activation_gb']:>8.2f} GB  ({results['activation_per_layer_mb']:.1f} MB/layer)"
+        )
         print(f"  Communication buffers:        {results['comm_buffers_gb']:>8.2f} GB")
         print(f"  CUDA overhead:                {results['cuda_overhead_gb']:>8.2f} GB")
-        print(f"{'-'*70}")
+        print(f"{'-' * 70}")
         print(f"  TOTAL:                        {results['total_gb']:>8.2f} GB")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
 
         h100_memory = 80
         h200_memory = 141
 
         if total_gb <= h100_memory:
-            print(f"  ✅ FITS in H100 (80GB) with {h100_memory - total_gb:.1f}GB headroom")
+            print(
+                f"  ✅ FITS in H100 (80GB) with {h100_memory - total_gb:.1f}GB headroom"
+            )
         else:
-            print(f"  ❌ DOES NOT FIT in H100 (80GB) - needs {total_gb - h100_memory:.1f}GB more")
+            print(
+                f"  ❌ DOES NOT FIT in H100 (80GB) - needs {total_gb - h100_memory:.1f}GB more"
+            )
 
         if total_gb <= h200_memory:
-            print(f"  ✅ FITS in H200 (141GB) with {h200_memory - total_gb:.1f}GB headroom")
+            print(
+                f"  ✅ FITS in H200 (141GB) with {h200_memory - total_gb:.1f}GB headroom"
+            )
 
     return results
 
@@ -464,8 +519,8 @@ def calculate_pp_stage_memory(
         layers_per_stage += 1
 
     # Embedding on first stage, output proj on last stage
-    has_embedding = (pp_stage == 0)
-    has_output_proj = (pp_stage == parallel.pp - 1)
+    has_embedding = pp_stage == 0
+    has_output_proj = pp_stage == parallel.pp - 1
 
     # Model weights
     embed_params = model.vocab_size * model.hidden_size if has_embedding else 0
@@ -482,13 +537,15 @@ def calculate_pp_stage_memory(
     experts_per_ep = model.num_experts / parallel.ep
     router_params = model.hidden_size * model.num_experts
     shared_expert = model.num_shared_experts * expert_params
-    moe_per_layer = ((experts_per_ep * expert_params) + router_params + shared_expert) / parallel.tp
+    moe_per_layer = (
+        (experts_per_ep * expert_params) + router_params + shared_expert
+    ) / parallel.tp
 
     # Total weights for this PP stage
     weight_params = (
-        embed_params / parallel.tp +
-        output_params / parallel.tp +
-        layers_per_stage * (attn_per_layer + moe_per_layer)
+        embed_params / parallel.tp
+        + output_params / parallel.tp
+        + layers_per_stage * (attn_per_layer + moe_per_layer)
     )
     weight_bytes = weight_params * training.dtype_bytes
 
@@ -501,7 +558,9 @@ def calculate_pp_stage_memory(
     # Forward pass activations
     attn_act = batch * seq_per_tp * hidden * 4  # input, qkv, scores approx, output
     expert_ffn = model.expert_ffn_hidden_size
-    ffn_act = batch * seq_per_tp * hidden * 2 + batch * seq_per_tp * expert_ffn * 2 * (model.num_experts_per_token + 1)
+    ffn_act = batch * seq_per_tp * hidden * 2 + batch * seq_per_tp * expert_ffn * 2 * (
+        model.num_experts_per_token + 1
+    )
 
     act_per_layer = (attn_act + ffn_act) * training.dtype_bytes
 
@@ -526,7 +585,7 @@ def calculate_recompute_memory(
     parallel: ParallelismConfig,
     training: TrainingConfig,
     recompute_num_layers: int = 1,
-    verbose: bool = True
+    verbose: bool = True,
 ) -> dict:
     """
     Calculate memory with activation recomputation.
@@ -555,17 +614,23 @@ def calculate_recompute_memory(
     moe_params_per_layer = (experts_per_ep * expert_params) / parallel.tp
 
     attn_params_per_layer = (
-        model.hidden_size * (model.num_attention_heads + 2 * model.num_kv_heads) * model.head_dim +
-        model.hidden_size * model.hidden_size
+        model.hidden_size
+        * (model.num_attention_heads + 2 * model.num_kv_heads)
+        * model.head_dim
+        + model.hidden_size * model.hidden_size
     ) / parallel.tp
 
-    weight_params = embed_params + layers_per_stage * (attn_params_per_layer + moe_params_per_layer)
+    weight_params = embed_params + layers_per_stage * (
+        attn_params_per_layer + moe_params_per_layer
+    )
     weight_gb = weight_params * training.dtype_bytes / 1e9
 
     # Checkpoint activation memory
     # With recompute_num_layers=N, we store inputs every N layers
     checkpoint_interval = recompute_num_layers
-    num_checkpoints = (layers_per_stage + checkpoint_interval - 1) // checkpoint_interval
+    num_checkpoints = (
+        layers_per_stage + checkpoint_interval - 1
+    ) // checkpoint_interval
 
     # Each checkpoint stores: hidden_states (batch * seq * hidden)
     checkpoint_act_bytes = batch * seq_per_tp * hidden * training.dtype_bytes
@@ -573,14 +638,25 @@ def calculate_recompute_memory(
 
     # Recompute buffer: during backward, we need to store activations for N layers
     # This is the peak memory during recomputation
-    per_layer_act_bytes = batch * seq_per_tp * hidden * 4 * training.dtype_bytes  # input, qkv, intermediate, output
-    expert_act_bytes = batch * seq_per_tp * model.expert_ffn_hidden_size * 2 * (model.num_experts_per_token + 1) * training.dtype_bytes
+    per_layer_act_bytes = (
+        batch * seq_per_tp * hidden * 4 * training.dtype_bytes
+    )  # input, qkv, intermediate, output
+    expert_act_bytes = (
+        batch
+        * seq_per_tp
+        * model.expert_ffn_hidden_size
+        * 2
+        * (model.num_experts_per_token + 1)
+        * training.dtype_bytes
+    )
     full_layer_act = per_layer_act_bytes + expert_act_bytes
 
     recompute_buffer_bytes = checkpoint_interval * full_layer_act
 
     # Gradient buffer (for backward pass)
-    grad_buffer_bytes = full_layer_act * 1.5  # gradients are slightly larger due to intermediate storage
+    grad_buffer_bytes = (
+        full_layer_act * 1.5
+    )  # gradients are slightly larger due to intermediate storage
 
     # Communication and CUDA overhead
     comm_overhead_gb = 4.0
@@ -590,8 +666,16 @@ def calculate_recompute_memory(
     # This is the additional memory needed during MoE backward
     moe_backward_spike_gb = 1.5 * batch  # Empirically ~1.5GB per sample in batch
 
-    total_act_gb = (total_checkpoint_bytes + recompute_buffer_bytes + grad_buffer_bytes) / 1e9
-    total_gb = weight_gb + total_act_gb + comm_overhead_gb + cuda_overhead_gb + moe_backward_spike_gb
+    total_act_gb = (
+        total_checkpoint_bytes + recompute_buffer_bytes + grad_buffer_bytes
+    ) / 1e9
+    total_gb = (
+        weight_gb
+        + total_act_gb
+        + comm_overhead_gb
+        + cuda_overhead_gb
+        + moe_backward_spike_gb
+    )
 
     results = {
         "weight_gb": weight_gb,
@@ -606,14 +690,20 @@ def calculate_recompute_memory(
     }
 
     if verbose:
-        print(f"\nRecompute Analysis (mbs={batch}, recompute_num_layers={recompute_num_layers}):")
+        print(
+            f"\nRecompute Analysis (mbs={batch}, recompute_num_layers={recompute_num_layers}):"
+        )
         print(f"  Model weights:      {weight_gb:>6.1f} GB")
-        print(f"  Checkpoint acts:    {total_checkpoint_bytes/1e9:>6.1f} GB ({num_checkpoints} checkpoints)")
-        print(f"  Recompute buffer:   {recompute_buffer_bytes/1e9:>6.1f} GB ({checkpoint_interval} layers)")
-        print(f"  Grad buffer:        {grad_buffer_bytes/1e9:>6.1f} GB")
+        print(
+            f"  Checkpoint acts:    {total_checkpoint_bytes / 1e9:>6.1f} GB ({num_checkpoints} checkpoints)"
+        )
+        print(
+            f"  Recompute buffer:   {recompute_buffer_bytes / 1e9:>6.1f} GB ({checkpoint_interval} layers)"
+        )
+        print(f"  Grad buffer:        {grad_buffer_bytes / 1e9:>6.1f} GB")
         print(f"  MoE backward spike: {moe_backward_spike_gb:>6.1f} GB")
         print(f"  Comm + CUDA:        {comm_overhead_gb + cuda_overhead_gb:>6.1f} GB")
-        print(f"  --------------------------")
+        print("  --------------------------")
         print(f"  TOTAL:              {total_gb:>6.1f} GB")
         headroom = 80 - total_gb
         status = "✅" if headroom > 2 else ("⚠️" if headroom > 0 else "❌")
@@ -627,116 +717,142 @@ def main():
     lora = LoRAConfig(rank=128, alpha=32)
     training = TrainingConfig(micro_batch_size=1, seq_length=8192)
 
-    print(f"\nGLM-4.7 Model Stats:")
-    print(f"  Total parameters: {model.total_params()/1e9:.1f}B")
-    print(f"  Active parameters: {model.active_params()/1e9:.1f}B")
+    print("\nGLM-4.7 Model Stats:")
+    print(f"  Total parameters: {model.total_params() / 1e9:.1f}B")
+    print(f"  Active parameters: {model.active_params() / 1e9:.1f}B")
     model.print_breakdown()
 
     # =========================================================================
     # PP STAGE ANALYSIS - explains the OOM on PP stage 0
     # =========================================================================
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("PP STAGE MEMORY BREAKDOWN (TP=2, PP=4, EP=4, mbs=2)")
-    print("="*70)
+    print("=" * 70)
     nvidia_config = ParallelismConfig(tp=2, pp=4, ep=4, cp=1)
     training_mb2 = TrainingConfig(micro_batch_size=2, seq_length=8192)
 
-    print(f"\n{'PP Stage':<10} {'Layers':<8} {'Embed?':<8} {'Weights':<12} {'Activations':<14} {'Total':<12} {'H100 Fit?'}")
+    print(
+        f"\n{'PP Stage':<10} {'Layers':<8} {'Embed?':<8} {'Weights':<12} {'Activations':<14} {'Total':<12} {'H100 Fit?'}"
+    )
     print("-" * 80)
     for stage in range(4):
         result = calculate_pp_stage_memory(model, nvidia_config, training_mb2, stage)
-        fits = "✅" if result['total_gb'] < 75 else "❌ OOM risk"
-        embed_str = "Yes" if result['has_embedding'] else "No"
-        print(f"{stage:<10} {result['layers']:<8} {embed_str:<8} {result['weight_gb']:<12.1f} {result['activation_gb']:<14.1f} {result['total_gb']:<12.1f} {fits}")
+        fits = "✅" if result["total_gb"] < 75 else "❌ OOM risk"
+        embed_str = "Yes" if result["has_embedding"] else "No"
+        print(
+            f"{stage:<10} {result['layers']:<8} {embed_str:<8} {result['weight_gb']:<12.1f} {result['activation_gb']:<14.1f} {result['total_gb']:<12.1f} {fits}"
+        )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("PP STAGE MEMORY BREAKDOWN (TP=2, PP=4, EP=4, mbs=1) - SAFER")
-    print("="*70)
+    print("=" * 70)
     training_mb1 = TrainingConfig(micro_batch_size=1, seq_length=8192)
 
-    print(f"\n{'PP Stage':<10} {'Layers':<8} {'Embed?':<8} {'Weights':<12} {'Activations':<14} {'Total':<12} {'H100 Fit?'}")
+    print(
+        f"\n{'PP Stage':<10} {'Layers':<8} {'Embed?':<8} {'Weights':<12} {'Activations':<14} {'Total':<12} {'H100 Fit?'}"
+    )
     print("-" * 80)
     for stage in range(4):
         result = calculate_pp_stage_memory(model, nvidia_config, training_mb1, stage)
-        fits = "✅" if result['total_gb'] < 75 else "❌ OOM risk"
-        embed_str = "Yes" if result['has_embedding'] else "No"
-        print(f"{stage:<10} {result['layers']:<8} {embed_str:<8} {result['weight_gb']:<12.1f} {result['activation_gb']:<14.1f} {result['total_gb']:<12.1f} {fits}")
+        fits = "✅" if result["total_gb"] < 75 else "❌ OOM risk"
+        embed_str = "Yes" if result["has_embedding"] else "No"
+        print(
+            f"{stage:<10} {result['layers']:<8} {embed_str:<8} {result['weight_gb']:<12.1f} {result['activation_gb']:<14.1f} {result['total_gb']:<12.1f} {fits}"
+        )
 
     total_gpus = 32
 
     # Current config: TP=2, PP=1, EP=8
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 1: Current (TP=2, PP=1, EP=8) - WITH recompute")
-    print("="*70)
+    print("=" * 70)
     current_config = ParallelismConfig(tp=2, pp=1, ep=8, cp=1)
-    calculate_memory(model, current_config, lora, training, total_gpus, use_recompute=True)
+    calculate_memory(
+        model, current_config, lora, training, total_gpus, use_recompute=True
+    )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 2: Current (TP=2, PP=1, EP=8) - WITHOUT recompute")
-    print("="*70)
-    calculate_memory(model, current_config, lora, training, total_gpus, use_recompute=False)
+    print("=" * 70)
+    calculate_memory(
+        model, current_config, lora, training, total_gpus, use_recompute=False
+    )
 
     # NVIDIA recommended: TP=2, PP=4, EP=4
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 3: NVIDIA Recipe (TP=2, PP=4, EP=4) - WITHOUT recompute")
-    print("="*70)
+    print("=" * 70)
     nvidia_config = ParallelismConfig(tp=2, pp=4, ep=4, cp=1)
-    calculate_memory(model, nvidia_config, lora, training, total_gpus, use_recompute=False)
+    calculate_memory(
+        model, nvidia_config, lora, training, total_gpus, use_recompute=False
+    )
 
     # Alternative: TP=2, PP=2, EP=8
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 4: Alternative (TP=2, PP=2, EP=8) - WITHOUT recompute")
-    print("="*70)
+    print("=" * 70)
     alt_config = ParallelismConfig(tp=2, pp=2, ep=8, cp=1)
     calculate_memory(model, alt_config, lora, training, total_gpus, use_recompute=False)
 
     # Test with higher micro batch
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 5: NVIDIA Recipe + micro_batch=2 - WITHOUT recompute")
-    print("="*70)
+    print("=" * 70)
     training_mb2 = TrainingConfig(micro_batch_size=2, seq_length=8192)
-    calculate_memory(model, nvidia_config, lora, training_mb2, total_gpus, use_recompute=False)
+    calculate_memory(
+        model, nvidia_config, lora, training_mb2, total_gpus, use_recompute=False
+    )
 
     # What about without any EP sharding optimization?
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 6: Minimal (TP=2, PP=1, EP=1) - see what explodes")
-    print("="*70)
+    print("=" * 70)
     minimal_config = ParallelismConfig(tp=2, pp=1, ep=1, cp=1)
-    calculate_memory(model, minimal_config, lora, training, total_gpus, use_recompute=False)
+    calculate_memory(
+        model, minimal_config, lora, training, total_gpus, use_recompute=False
+    )
 
     # =========================================================================
     # OPTIMIZED CONFIGURATIONS - exploring throughput optimization
     # =========================================================================
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 7: NVIDIA Recipe + micro_batch=4 - max throughput?")
-    print("="*70)
+    print("=" * 70)
     training_mb4 = TrainingConfig(micro_batch_size=4, seq_length=8192)
-    calculate_memory(model, nvidia_config, lora, training_mb4, total_gpus, use_recompute=False)
+    calculate_memory(
+        model, nvidia_config, lora, training_mb4, total_gpus, use_recompute=False
+    )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 8: PP=2, EP=8 + micro_batch=2 - balance")
-    print("="*70)
-    calculate_memory(model, alt_config, lora, training_mb2, total_gpus, use_recompute=False)
+    print("=" * 70)
+    calculate_memory(
+        model, alt_config, lora, training_mb2, total_gpus, use_recompute=False
+    )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 9: PP=2, EP=8 + micro_batch=4 - push throughput")
-    print("="*70)
-    calculate_memory(model, alt_config, lora, training_mb4, total_gpus, use_recompute=False)
+    print("=" * 70)
+    calculate_memory(
+        model, alt_config, lora, training_mb4, total_gpus, use_recompute=False
+    )
 
     # Smaller LoRA rank for comparison
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CONFIGURATION 10: NVIDIA Recipe + LoRA rank=64 + micro_batch=4")
-    print("="*70)
+    print("=" * 70)
     lora_small = LoRAConfig(rank=64, alpha=16)
-    calculate_memory(model, nvidia_config, lora_small, training_mb4, total_gpus, use_recompute=False)
+    calculate_memory(
+        model, nvidia_config, lora_small, training_mb4, total_gpus, use_recompute=False
+    )
 
     # =========================================================================
     # SUMMARY TABLE
     # =========================================================================
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("SUMMARY: Memory vs Throughput Trade-offs")
-    print("="*70)
+    print("=" * 70)
     print(f"\n{'Config':<45} {'Memory':<12} {'Fits H100?':<12} {'Headroom':<12}")
     print("-" * 81)
 
@@ -752,18 +868,28 @@ def main():
     ]
 
     for name, cfg, train_cfg, recompute in configs_to_compare:
-        result = calculate_memory(model, cfg, lora, train_cfg, total_gpus, use_recompute=recompute, verbose=False)
-        fits = "✅ Yes" if result['total_gb'] <= 80 else "❌ No"
-        headroom = 80 - result['total_gb']
-        headroom_str = f"{headroom:.1f}GB" if headroom > 0 else f"{-headroom:.1f}GB over"
+        result = calculate_memory(
+            model,
+            cfg,
+            lora,
+            train_cfg,
+            total_gpus,
+            use_recompute=recompute,
+            verbose=False,
+        )
+        fits = "✅ Yes" if result["total_gb"] <= 80 else "❌ No"
+        headroom = 80 - result["total_gb"]
+        headroom_str = (
+            f"{headroom:.1f}GB" if headroom > 0 else f"{-headroom:.1f}GB over"
+        )
         print(f"{name:<45} {result['total_gb']:<12.1f} {fits:<12} {headroom_str:<12}")
 
     # =========================================================================
     # V3 OPTIMIZATION: Recompute configurations with different mbs
     # =========================================================================
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("V3 OPTIMIZATION: Recompute Memory Analysis")
-    print("="*70)
+    print("=" * 70)
     print("\nGoal: Find optimal mbs to leverage ~17GB/GPU unused VRAM from V2")
     print("V2 baseline: mbs=2, full recompute, ~63GB observed peak")
 
@@ -772,22 +898,26 @@ def main():
     # Test different mbs with full recompute
     for mbs in [1, 2, 3, 4]:
         train_cfg = TrainingConfig(micro_batch_size=mbs, seq_length=8192)
-        calculate_recompute_memory(model, nvidia_config, train_cfg, recompute_num_layers=1, verbose=True)
+        calculate_recompute_memory(
+            model, nvidia_config, train_cfg, recompute_num_layers=1, verbose=True
+        )
 
     # Test partial recompute (recompute_num_layers=2) with mbs=2
-    print("\n" + "-"*70)
+    print("\n" + "-" * 70)
     print("Alternative: Partial recompute (recompute_num_layers=2)")
-    print("-"*70)
+    print("-" * 70)
     for mbs in [2, 3]:
         train_cfg = TrainingConfig(micro_batch_size=mbs, seq_length=8192)
-        calculate_recompute_memory(model, nvidia_config, train_cfg, recompute_num_layers=2, verbose=True)
+        calculate_recompute_memory(
+            model, nvidia_config, train_cfg, recompute_num_layers=2, verbose=True
+        )
 
     # =========================================================================
     # CALIBRATED ESTIMATE: Based on observed V2 data
     # =========================================================================
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("CALIBRATED ESTIMATES (based on observed V2 peak: 63GB)")
-    print("="*70)
+    print("=" * 70)
     print("""
 The calculator underestimates by ~25GB due to:
 - PP buffers (multiple microbatches in flight)
@@ -805,9 +935,9 @@ mbs=3: ~30 + 50   = ~80GB  ⚠️  Right at H100 limit!
 mbs=4: ~30 + 66   = ~96GB  ❌ Will OOM
 """)
 
-    print("="*70)
+    print("=" * 70)
     print("RECOMMENDATIONS")
-    print("="*70)
+    print("=" * 70)
     print("""
 1. PRIMARY: Try mbs=3 with full recompute
    - Calibrated estimate: ~80GB peak (right at H100 limit)

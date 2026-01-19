@@ -1,8 +1,5 @@
 """
 GLM-4.7 LoRA Training Script
-
-This script is mounted into Modal containers and executed via torchrun.
-Configuration is passed via command-line arguments.
 """
 
 import argparse
@@ -33,12 +30,44 @@ from megatron.bridge.training.gpt_step import forward_step
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="GLM-4.7 LoRA Training")
+    p = argparse.ArgumentParser(description="GLM-4.7 LoRA Training (Optimized V3)")
 
-    p.add_argument("--preprocessed_dir", required=True, help="Path to preprocessed dataset")
-    p.add_argument("--megatron_checkpoint", required=True, help="Path to Megatron checkpoint")
-    p.add_argument("--checkpoints_dir", required=True, help="Directory to save checkpoints")
+    p.add_argument(
+        "--preprocessed_dir", required=True, help="Path to preprocessed dataset"
+    )
+    p.add_argument(
+        "--megatron_checkpoint", required=True, help="Path to Megatron checkpoint"
+    )
+    p.add_argument(
+        "--checkpoints_dir", required=True, help="Directory to save checkpoints"
+    )
     p.add_argument("--hf_model", default="zai-org/GLM-4.7", help="HuggingFace model ID")
+
+    p.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=3,
+        help="Micro batch size (default: 3 in V3)",
+    )
+    p.add_argument(
+        "--global_batch_size",
+        type=int,
+        default=36,
+        help="Global batch size (must be divisible by mbs × DP=12)",
+    )
+
+    # Recompute options
+    p.add_argument(
+        "--recompute_num_layers",
+        type=int,
+        default=1,
+        help="Checkpoint every N layers (1=full recompute, 2=half overhead)",
+    )
+    p.add_argument(
+        "--no_recompute",
+        action="store_true",
+        help="Disable recomputation entirely (will likely OOM)",
+    )
 
     return p.parse_args()
 
@@ -53,11 +82,14 @@ def main():
         run = wandb.init(project="glm47-lora")
         print(f"WandB initialized: {run.name} ({run.id})")
 
-    print("=" * 60)
+    print("=" * 70)
     print("GLM-4.7 (358B MoE) LoRA Training")
-    print("=" * 60)
+    print("=" * 70)
 
-    # Monkey-patch for PP=1 + Recompute + Frozen Base gradient fix
+    # ==========================================================================
+    # CRITICAL PATCH: Fix for Recompute + Frozen Base Model (LoRA)
+    # ==========================================================================
+
     _original_transformer_forward = TransformerBlock.forward
 
     @wraps(_original_transformer_forward)
@@ -71,7 +103,7 @@ def main():
         return _original_transformer_forward(self, hidden_states, *args_, **kwargs)
 
     TransformerBlock.forward = _patched_transformer_forward
-    print("[PEFT+Recompute FIX] Patched TransformerBlock.forward")
+    print("[PEFT+Recompute FIX] Patched TransformerBlock.forward for gradient flow")
 
     # LoRA config
     lora_config = LoRA(
@@ -80,21 +112,14 @@ def main():
         dropout=0.05,
     )
 
-    # GLM-4.7 uses same architecture class (Glm4MoeForCausalLM) as GLM-4.5
-    # So we can use from_hf_pretrained directly - it will read the correct architecture
     print(f"Creating config from HF model: {args.hf_model}")
-
-    # Use AutoBridge to get the model provider from HF config
-    # This reads the actual architecture (92 layers, 160 experts) from HF
     bridge = AutoBridge.from_hf_pretrained(args.hf_model, trust_remote_code=True)
     model_cfg = bridge.to_megatron_provider(load_weights=False)
 
     print(
-        f"Model loaded: num_layers={model_cfg.num_layers}, "
+        f"Model: num_layers={model_cfg.num_layers}, "
         f"num_moe_experts={getattr(model_cfg, 'num_moe_experts', 'N/A')}"
     )
-
-    print(f"[Rank {rank}] Loading pre-built dataset from: {args.preprocessed_dir}")
 
     # Optimizer with cosine annealing
     opt_cfg, scheduler_cfg = distributed_fused_adam_with_cosine_annealing(
@@ -108,25 +133,38 @@ def main():
         weight_decay=0.1,
     )
 
-    # Build the full config
+    # ==========================================================================
+    # TRAINING CONFIG
+    # ==========================================================================
+
+    SEQ_LENGTH = 128_000
+
     config = ConfigContainer(
         model=model_cfg,
         train=TrainingConfig(
             train_iters=650,
             eval_interval=9999,
             eval_iters=0,
-            global_batch_size=16,
-            micro_batch_size=1,
+            global_batch_size=args.global_batch_size,
+            micro_batch_size=args.micro_batch_size,
+            # Manual GC to reduce jitter
+            manual_gc_interval=10,
         ),
         optimizer=opt_cfg,
         scheduler=scheduler_cfg,
-        ddp=DistributedDataParallelConfig(check_for_nan_in_grad=True),
+        ddp=DistributedDataParallelConfig(
+            check_for_nan_in_grad=True,
+            # DISABLED for PEFT - overlaps expect all params to have gradients
+            overlap_param_gather=False,
+            overlap_grad_reduce=False,
+            bucket_size=100_000_000,  # 100MB buckets
+        ),
         dataset=FinetuningDatasetConfig(
             dataset_root=args.preprocessed_dir,
-            seq_length=8192,  # 8k context - suitable for code assistant conversations
+            seq_length=SEQ_LENGTH,
             seed=5678,
             dataloader_type="batch",
-            num_workers=1,
+            num_workers=4,
             do_validation=False,
             do_test=False,
         ),
@@ -144,7 +182,8 @@ def main():
             save=f"{args.checkpoints_dir}/glm47_lora",
             pretrained_checkpoint=args.megatron_checkpoint,
             ckpt_format="torch_dist",
-            fully_parallel_save=False,
+            fully_parallel_save=True,
+            # Modal blocks pidfd_getfd needed for async CUDA IPC.
             async_save=False,
         ),
         rng=RNGConfig(seed=5678),
@@ -152,43 +191,96 @@ def main():
         mixed_precision="bf16_mixed",
     )
 
-    print("Config created successfully")
+    # ==========================================================================
+    # PARALLELISM - NVIDIA RECOMMENDED
+    # ==========================================================================
 
-    # Parallelism for GLM-4.7 on 32 GPUs (TP=2 x PP=1 x EP=8 x DP=2 = 32)
     config.model.tensor_model_parallel_size = 2
-    config.model.pipeline_model_parallel_size = 1
-    config.model.expert_model_parallel_size = 8
-    config.model.context_parallel_size = 1  # No CP needed for 8k sequences
+    config.model.pipeline_model_parallel_size = 4
+    config.model.expert_model_parallel_size = 4
+    config.model.context_parallel_size = 1
 
-    config.model.calculate_per_token_loss = False  # CP=1, no need for per-token loss
+    config.model.calculate_per_token_loss = False
     config.model.sequence_parallel = True
     config.model.attention_backend = "flash"
 
     # MoE optimization
     config.model.moe_grouped_gemm = True
 
-    # DDP optimization
-    # config.ddp.overlap_param_gather = True
+    # ==========================================================================
+    # ACTIVATION RECOMPUTATION CONFIGURATION
+    # ==========================================================================
 
-    # Memory optimization - activation recomputation
-    config.model.recompute_granularity = "full"
-    config.model.recompute_method = "uniform"
-    config.model.recompute_num_layers = 1  # Must be 1 for MTP (Multi-Token Prediction)
-    # Sequence length
-    config.model.seq_length = 8192  # 8k context - suitable for code assistant conversations
+    if not args.no_recompute:
+        config.model.recompute_granularity = "full"
+        config.model.recompute_method = "uniform"
+        config.model.recompute_num_layers = args.recompute_num_layers
 
-    print("Config:")
+        if args.recompute_num_layers == 1:
+            print("Recompute: FULL (checkpoint every layer)")
+        else:
+            print(
+                f"Recompute: PARTIAL (checkpoint every {args.recompute_num_layers} layers)"
+            )
+            print("  - This reduces recompute overhead but increases activation memory")
+    else:
+        print("Recompute: DISABLED - WARNING: Will likely OOM with mbs >= 2")
+
+    config.model.seq_length = SEQ_LENGTH
+
+    # ==========================================================================
+    # OPERATOR FUSION - ENABLED
+    # ==========================================================================
+    config.model.masked_softmax_fusion = True
+    config.model.bias_activation_fusion = True
+    config.model.bias_dropout_fusion = True
+    config.model.apply_rope_fusion = True
+
+    # ==========================================================================
+    # V3 SUMMARY
+    # ==========================================================================
+
+    # Calculate gradient accumulation steps
+    accum_steps = args.global_batch_size // args.micro_batch_size
+
+    print("\n" + "=" * 70)
+    print("V3 Configuration Summary")
+    print("=" * 70)
     print("  Model: GLM-4.7 (358B MoE)")
     print(f"  seq_length: {config.model.seq_length}")
-    print(f"  Dataset: {args.preprocessed_dir} (PRE-BUILT)")
+    print(f"  micro_batch_size: {config.train.micro_batch_size}")
+    print(f"  global_batch_size: {config.train.global_batch_size}")
+    print(f"  gradient_accumulation_steps: {accum_steps}")
+    print("\nParallelism:")
+    print(f"  TP={config.model.tensor_model_parallel_size}")
+    print(f"  PP={config.model.pipeline_model_parallel_size}")
+    print(f"  EP={config.model.expert_model_parallel_size}")
+    print(f"  CP={config.model.context_parallel_size}")
+    print("\nMemory Optimizations:")
+    if not args.no_recompute:
+        print("  recompute_granularity: full")
+        print(f"  recompute_num_layers: {args.recompute_num_layers}")
+    else:
+        print("  recompute: DISABLED")
+    print("\nExpected Memory (per GPU):")
+    print("  Model weights (frozen): ~23 GB")
+    print("  LoRA + optimizer: ~0.5 GB")
+    print("  Comm buffers: ~4 GB")
+    print("  CUDA overhead: ~2 GB")
     print(
-        f"  TP={config.model.tensor_model_parallel_size}, "
-        f"PP={config.model.pipeline_model_parallel_size}, "
-        f"EP={config.model.expert_model_parallel_size}, "
-        f"CP={config.model.context_parallel_size}"
+        f"  Activations (mbs={args.micro_batch_size}): ~{16.5 * args.micro_batch_size:.1f} GB (with full recompute)"
     )
-    print(f"  moe_grouped_gemm: {config.model.moe_grouped_gemm}")
-    print(f"  overlap_param_gather: {config.ddp.overlap_param_gather}")
+    estimated_total = (
+        30 + 16.5 * args.micro_batch_size + 5
+    )  # +5GB for MoE backward spikes
+    print(f"  Estimated Total: ~{estimated_total:.0f} GB")
+    print(f"  H100 Headroom: ~{80 - estimated_total:.0f} GB")
+
+    if estimated_total > 78:
+        print("\n  WARNING: Estimated memory is close to H100 limit!")
+        print("           MoE backward spikes may cause OOM.")
+
+    print("=" * 70 + "\n")
 
     finetune(config=config, forward_step_func=forward_step)
     print("Training complete!")
