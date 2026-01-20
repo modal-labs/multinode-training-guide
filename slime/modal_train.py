@@ -36,8 +36,8 @@ import time
 import modal
 import modal.experimental
 
-from configs import get_config, list_configs as _list_configs
-from configs.base import TrainingConfig
+from configs.base import RLConfig
+
 
 # =============================================================================
 # Modal Image & Volumes
@@ -50,6 +50,7 @@ image = (
         "cd /root/slime && git remote set-url origin https://github.com/czhang-modal/slime.git && git fetch origin && git checkout claire/slime && pip install -e ."
     )
     .entrypoint([])
+    .add_local_python_source("configs")
 )
 
 with image.imports():
@@ -77,8 +78,10 @@ SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 # App (created dynamically based on config)
 # =============================================================================
 
-# Default app for utility functions
-app = modal.App("slime-grpo")
+# App name from environment variable (set before running modal)
+# Usage: SLIME_APP_NAME="my-experiment" modal run modal_train.py ...
+APP_NAME = os.environ.get("SLIME_APP_NAME", "slime-grpo")
+app = modal.App(APP_NAME)
 
 
 # =============================================================================
@@ -146,7 +149,7 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
 # =============================================================================
 
 def generate_slime_cmd(
-    config: TrainingConfig,
+    config: RLConfig,
     master_addr: str,
 ) -> tuple[str, dict]:
     """Generate the slime training command and runtime environment."""
@@ -174,7 +177,7 @@ def generate_slime_cmd(
 
 
 async def run_training(
-    config: TrainingConfig,
+    config: RLConfig,
     n_nodes: int,
     master_addr: str,
 ):
@@ -184,8 +187,8 @@ async def run_training(
     slime_cmd, runtime_env = generate_slime_cmd(config, master_addr)
     
     print("Submitting training job...")
-    print(f"  Config: {config.model_name}")
-    print(f"  Mode: {'async' if config.use_async else 'sync'}")
+    print(f"  Model: {config.model_name}")
+    print(f"  Mode: {'sync' if config.sync else 'async'}")
     print(f"  Nodes: {n_nodes}")
     
     job_id = client.submit_job(
@@ -218,13 +221,14 @@ def download_model(
         revision: Optional HF revision to pin
     """
     from huggingface_hub import snapshot_download
+    from configs import get_config
     
     cfg = get_config(config)
     
     snapshot_download(
         repo_id=cfg.model_id,
         local_dir=MODELS_PATH / cfg.model_name,
-        revision=revision
+        revision=revision,
     )
     print(f"Model downloaded to {MODELS_PATH / cfg.model_name}")
     
@@ -251,8 +255,10 @@ def prepare_dataset():
 @app.local_entrypoint()
 def list_available_configs():
     """List all available training configs."""
+    from configs import list_configs
+    
     print("Available configs:")
-    for name in _list_configs():
+    for name in list_configs():
         print(f"  - {name}")
 
 
@@ -262,7 +268,7 @@ def list_available_configs():
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="H100:2",
     volumes={
         MODELS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
@@ -275,14 +281,15 @@ def list_available_configs():
         "efa_enabled": True,
     },
 )
-@modal.experimental.clustered(4, rdma=True)
+@modal.experimental.clustered(2, rdma=True)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
     
     Args:
         config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
-        config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
     """
+    from configs import get_config
+    
     cfg = get_config(config)
     
     checkpoints_volume.reload()
@@ -328,8 +335,9 @@ async def train_single_node(config: str = "qwen-0.5b-sync"):
     
     Args:
         config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
-        config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
     """
+    from configs import get_config
+    
     cfg = get_config(config)
     
     checkpoints_volume.reload()

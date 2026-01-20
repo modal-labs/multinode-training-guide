@@ -175,3 +175,5 @@ cython_debug/
 
 # Ruff cache
 .ruff_cache/
+# Test configs (local experiments)
+slime/test-configs/
