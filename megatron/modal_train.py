@@ -272,7 +272,7 @@ def download_and_convert():
 
 @app.function(
     image=nemo_image,
-    gpu="H200:8",
+    gpu="B200:8",
     volumes={
         MODELS_DIR: models_volume,
         DATA_DIR: data_volume,
