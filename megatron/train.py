@@ -46,14 +46,14 @@ def parse_args():
     p.add_argument(
         "--micro_batch_size",
         type=int,
-        default=3,
-        help="Micro batch size (default: 3 in V3)",
+        default=1,
+        help="Micro batch size (default: 1 for long-context)",
     )
     p.add_argument(
         "--global_batch_size",
         type=int,
-        default=36,
-        help="Global batch size (must be divisible by mbs × DP=12)",
+        default=32,
+        help="Global batch size (must be divisible by mbs × DP)",
     )
 
     # Recompute options
@@ -137,7 +137,7 @@ def main():
     # TRAINING CONFIG
     # ==========================================================================
 
-    SEQ_LENGTH = 128_000
+    SEQ_LENGTH = 131_072
 
     config = ConfigContainer(
         model=model_cfg,

@@ -11,7 +11,7 @@ GLM-4.7 is a 358B parameter MoE model with 92 layers and 160 experts. Fine-tunin
 
 The training pipeline consists of three main stages:
 1. Model download and conversion to Megatron format
-2. Dataset preparation (glaive-code-assistant)
+2. Dataset preparation (LongMIT-128K)
 3. Multi-node distributed LoRA training
 
 ## Prerequisites
@@ -45,7 +45,7 @@ This command:
 
 ### 2. Prepare Dataset
 
-Download and preprocess the glaive-code-assistant dataset:
+Download and preprocess the LongMIT-128K dataset:
 
 ```bash
 modal run modal_train.py::prep_dataset
@@ -53,7 +53,8 @@ modal run modal_train.py::prep_dataset
 
 This command:
 - Downloads the dataset from Hugging Face
-- Converts to JSONL format for Megatron SFT
+- Builds a long-context SFT prompt from passages + question
+- Filters to <= 128K tokens and converts to JSONL for Megatron SFT
 - Builds index files for efficient data loading
 
 ### 3. Training
@@ -71,7 +72,7 @@ This command:
 - Saves checkpoints periodically to a Modal volume
 - Logs metrics to Weights & Biases (run ID generated automatically)
 
-**Memory Note:** The default configuration (mbs=3, full recompute) uses ~79GB per GPU, leaving ~1GB headroom on H100. For datasets with longer sequences, reduce micro batch size or increase tensor/pipeline parallelism.
+**Memory Note:** The default configuration (mbs=1, full recompute) is chosen for long-context examples. Increase micro batch size only if you have headroom, or increase tensor/pipeline parallelism.
 
 ## Training Configuration
 
@@ -102,9 +103,9 @@ LoRA(
 
 | Parameter | Value |
 |-----------|-------|
-| Global batch size | 36 |
-| Micro batch size | 3 |
-| Sequence length | 128,000 |
+| Global batch size | 32 |
+| Micro batch size | 1 |
+| Sequence length | 131,072 |
 | Learning rate | 1e-4 (cosine decay) |
 | Warmup iterations | 50 |
 | Training iterations | 650 |

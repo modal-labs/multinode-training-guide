@@ -34,8 +34,9 @@ HF_CACHE = "/root/.cache/huggingface"
 DATA_DIR = "/data"
 CHECKPOINTS_DIR = "/checkpoints"
 HF_MODEL = "zai-org/GLM-4.7"
-HF_DATASET = "glaiveai/glaive-code-assistant"
-PREPROCESSED_DIR = f"{DATA_DIR}/glaive-code-assistant"
+HF_DATASET = "donmaclean/LongMIT-128K"
+PREPROCESSED_DIR = f"{DATA_DIR}/longmit-128k"
+MAX_SFT_TOKENS = 131_072
 MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"
 
 # Number of nodes in the cluster
@@ -66,6 +67,7 @@ nemo_image = (
     .uv_pip_install(
         "wandb==0.23.1",
         "datasets==3.1.0",
+        "transformers",
     )
     .run_commands(f"rm -Rf {HF_CACHE}")
     .add_local_dir(LOCAL_CODE_DIR, remote_path=REMOTE_CODE_DIR)
@@ -104,9 +106,10 @@ def download_model():
     cpu=4,
 )
 def prep_dataset():
-    """Download and prepare glaive-code-assistant for Megatron training."""
+    """Download and prepare LongMIT-128K for Megatron training."""
 
     from datasets import load_dataset
+    from transformers import AutoTokenizer
     from megatron.bridge.data.datasets.utils import build_index_files
 
     data_volume.reload()
@@ -115,8 +118,39 @@ def prep_dataset():
 
     # Download dataset from HuggingFace
     print(f"Downloading dataset: {HF_DATASET}")
-    dataset = load_dataset(HF_DATASET, split="train")
+    dataset = load_dataset(HF_DATASET, split="train", trust_remote_code=True)
     print(f"Dataset loaded: {len(dataset)} examples")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        HF_MODEL, use_fast=True, trust_remote_code=True
+    )
+
+    def format_longmit(example):
+        passages = "\n".join(
+            [
+                f"Passage {i + 1}:\n{doc['content']}"
+                for i, doc in enumerate(example["all_docs"])
+            ]
+        )
+        prompt = (
+            "Answer the question based on the given passages.\n\n"
+            f"{passages}\n\n"
+            f"Question: {example['question']}\nAnswer:"
+        )
+        answer = example["answer"]
+        text = prompt + answer
+        token_count = len(tokenizer(text).input_ids)
+        return {"input": prompt, "output": answer, "n_tokens": token_count}
+
+    print(f"Formatting for SFT and filtering to <= {MAX_SFT_TOKENS} tokens")
+    original_len = len(dataset)
+    dataset = dataset.map(format_longmit, remove_columns=dataset.column_names)
+    dataset = dataset.filter(lambda ex: ex["n_tokens"] <= MAX_SFT_TOKENS)
+    filtered_len = len(dataset)
+    print(
+        "Filtered dataset size: "
+        f"{filtered_len} (from {original_len} examples)"
+    )
 
     # Save as JSONL for FinetuningDatasetConfig
     # FinetuningDatasetConfig expects "training.jsonl" by default
@@ -126,7 +160,7 @@ def prep_dataset():
     with open(train_jsonl, "w") as f:
         for example in dataset:
             # Megatron SFT expects "input" and "output" fields
-            json.dump({"input": example["question"], "output": example["answer"]}, f)
+            json.dump({"input": example["input"], "output": example["output"]}, f)
             f.write("\n")
 
     size = os.path.getsize(train_jsonl)
@@ -252,22 +286,21 @@ def train_lora():
     - TP=2
     - PP=4
     - EP=4
-    - micro batch size=3
-    - global batch size=36
+    - micro batch size=1
+    - global batch size=32
     - FULL recompute
 
     Note that this means DP = N_NODES * GPUs per node / (TP x PP) = 4 * 8 / (2 x 4) = 4
 
-    Memory math (per GPU):
-    - (mbs=3): ~79GB estimated → 1GB headroom
+    Memory note (per GPU):
+    - Long-context training is memory heavy; start with mbs=1 and scale up carefully.
 
     Tuning:
 
-    This function is confirmed to work with the glaive-code-assistant dataset. This dataset
-    has relatively short examples, so we can push the micro batch size to 3 to use GPU headroom.
+    This function targets LongMIT-128K, which contains long-context examples. Start
+    conservatively with micro batch size 1 and increase only if you have headroom.
 
-    For datasets with longer context lengths, try them with this configuration, and only tune
-    further if you see OOMs. If you do see OOMs, try (in order):
+    If you do see OOMs, try (in order):
     - Reducing the micro batch size in coordination with the global batch size
     - Upgrading to H200 GPUs
     - Increasing tensor parallelism
@@ -295,8 +328,8 @@ def train_lora():
     master_port = 29500
 
     print(f"Node {node_rank}/{num_nodes}, Master: {master_addr}:{master_port}")
-    print("Config: TP=2, PP=4, EP=4, mbs=3, FULL recompute")
-    print("Goal: Leverage ~17GB/GPU unused VRAM for ~50% throughput gain")
+    print("Config: TP=2, PP=4, EP=4, mbs=1, FULL recompute")
+    print("Goal: Start safe for long context and scale up if stable")
 
     # Verify preprocessed data exists
     if not os.path.exists(PREPROCESSED_DIR):
@@ -321,9 +354,9 @@ def train_lora():
         "--hf_model",
         HF_MODEL,
         "--micro_batch_size",
-        "3",  # Use 3 micro batches to use GPU headroom
+        "1",  # Long-context default; increase only if stable
         "--global_batch_size",
-        "36",  # Must be divisible by micro batch size × DP = 3 × 4 = 12
+        "32",  # Must be divisible by micro batch size × DP = 1 × 4 = 4
     ]
 
     cmd = [
