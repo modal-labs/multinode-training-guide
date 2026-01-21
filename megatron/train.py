@@ -198,7 +198,7 @@ def main():
     config.model.tensor_model_parallel_size = 2
     config.model.pipeline_model_parallel_size = 4
     config.model.expert_model_parallel_size = 4
-    config.model.context_parallel_size = 1
+    config.model.context_parallel_size = 4
 
     config.model.calculate_per_token_loss = False
     config.model.sequence_parallel = True
