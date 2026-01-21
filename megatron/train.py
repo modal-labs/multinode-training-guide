@@ -200,7 +200,7 @@ def main():
     config.model.expert_model_parallel_size = 4
     config.model.context_parallel_size = 4
 
-    config.model.calculate_per_token_loss = False
+    config.model.calculate_per_token_loss = True
     config.model.sequence_parallel = True
     config.model.attention_backend = "flash"
 
