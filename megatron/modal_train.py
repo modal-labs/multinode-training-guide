@@ -38,6 +38,7 @@ HF_DATASET = "donmaclean/LongMIT-128K"
 PREPROCESSED_DIR = f"{DATA_DIR}/longmit-128k"
 MAX_SFT_TOKENS = 131_072
 MEGATRON_CHECKPOINT = f"{CHECKPOINTS_DIR}/glm47-megatron"
+PREP_CPU = 32
 
 # Number of nodes in the cluster
 N_NODES = 4  # 4 nodes x 8 GPUs = 32 GPUs
@@ -103,7 +104,7 @@ def download_model():
     volumes={DATA_DIR: data_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=3600,
-    cpu=4,
+    cpu=PREP_CPU,
 )
 def prep_dataset():
     """Download and prepare LongMIT-128K for Megatron training."""
@@ -144,8 +145,15 @@ def prep_dataset():
 
     print(f"Formatting for SFT and filtering to <= {MAX_SFT_TOKENS} tokens")
     original_len = len(dataset)
-    dataset = dataset.map(format_longmit, remove_columns=dataset.column_names)
-    dataset = dataset.filter(lambda ex: ex["n_tokens"] <= MAX_SFT_TOKENS)
+    dataset = dataset.map(
+        format_longmit,
+        remove_columns=dataset.column_names,
+        num_proc=PREP_CPU,
+    )
+    dataset = dataset.filter(
+        lambda ex: ex["n_tokens"] <= MAX_SFT_TOKENS,
+        num_proc=PREP_CPU,
+    )
     filtered_len = len(dataset)
     print(
         "Filtered dataset size: "
@@ -178,7 +186,7 @@ def prep_dataset():
     build_index_files(
         dataset_paths=[train_jsonl],
         newline_int=10,  # ASCII newline character
-        workers=os.cpu_count(),
+        workers=PREP_CPU,
         index_mapping_dir=None,  # Write next to the jsonl
     )
 
