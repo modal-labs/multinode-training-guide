@@ -30,18 +30,48 @@ class ModelArchitectureConfig:
     hidden_size: int
     ffn_hidden_size: int
     num_attention_heads: int
-    num_query_groups: int
+    num_query_groups: Optional[int] = None  # For GQA models
     vocab_size: int = 151936
-    rotary_base: int = 1000000
+    make_vocab_size_divisible_by: Optional[int] = None  # e.g., 64
+    rotary_base: Optional[int] = None
     norm_epsilon: float = 1e-6
     kv_channels: Optional[int] = None
     normalization: str = "RMSNorm"
     swiglu: bool = True
     group_query_attention: bool = True
+    position_embedding_type: Optional[str] = None  # "rope" for rotary
+    no_position_embedding: bool = False  # Use with position_embedding_type=rope
     use_rotary_position_embeddings: bool = True
+    no_rope_fusion: bool = False  # Disable rope fusion kernel
     disable_bias_linear: bool = True
     add_qkv_bias: bool = False
     qk_layernorm: bool = False
+    untie_embeddings_and_output_weights: bool = False  # True when HF tie_word_embeddings=false
+    # MLA (Multi-Latent Attention) - for DeepSeek-V2/V3, GLM-4.7-Flash style models
+    multi_latent_attention: bool = False
+    q_lora_rank: Optional[int] = None
+    kv_lora_rank: Optional[int] = None
+    qk_head_dim: Optional[int] = None  # qk_nope_head_dim
+    v_head_dim: Optional[int] = None
+    qk_pos_emb_head_dim: Optional[int] = None  # qk_rope_head_dim
+    # MoE (Mixture of Experts)
+    moe_layer_freq: Optional[str] = None  # e.g., "[0]*1+[1]*46" for 1 dense + 46 MoE
+    num_experts: Optional[int] = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
+    moe_router_topk: Optional[int] = None  # num_experts_per_tok
+    moe_grouped_gemm: bool = False
+    moe_permute_fusion: bool = False
+    moe_ffn_hidden_size: Optional[int] = None
+    moe_router_score_function: Optional[str] = None  # e.g., "sigmoid"
+    moe_router_pre_softmax: bool = False
+    moe_router_enable_expert_bias: bool = False
+    moe_router_bias_update_rate: Optional[int] = None
+    moe_router_load_balancing_type: Optional[str] = None  # e.g., "seq_aux_loss"
+    moe_router_topk_scaling_factor: Optional[float] = None
+    moe_aux_loss_coeff: Optional[float] = None
+    moe_router_dtype: Optional[str] = None  # e.g., "fp32"
+    moe_token_dispatcher_type: Optional[str] = None  # e.g., "flex"
+    moe_enable_deepep: bool = False
 
     def to_args(self) -> str:
         return " ".join(_to_cli_args(self))
@@ -55,8 +85,9 @@ class MegatronConfig:
     pipeline_model_parallel_size: int = 1  # Split model layers across GPUs (PP)
     context_parallel_size: int = 1  # Parallelism for long sequences
     expert_model_parallel_size: int = 1  # MoE: split experts across GPUs
-    expert_tensor_parallel_size: int = 1  # MoE: TP within each expert
+    expert_tensor_parallel_size: Optional[int] = None  # MoE: TP within each expert
     sequence_parallel: bool = True  # Reduce activation memory
+    decoder_last_pipeline_num_layers: Optional[int] = None  # For uneven PP splits
     # Batching
     max_tokens_per_gpu: int = 9216  # Micro-batch size in tokens
     use_dynamic_batch_size: bool = True  # Variable batch sizes based on sequence lengths
@@ -71,8 +102,16 @@ class MegatronConfig:
     # Misc
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
-    attention_backend: str = "flash"
+    attention_backend: Optional[str] = None  # "flash" - but don't use with MLA models
     megatron_to_hf_mode: str = "bridge"
+    # Recompute (memory optimization)
+    recompute_granularity: Optional[str] = None  # "full" or "selective"
+    recompute_method: Optional[str] = None  # "uniform" or "block"
+    recompute_num_layers: Optional[int] = None
+    # Optimizer offload (CPU offload for large models)
+    optimizer_cpu_offload: bool = False
+    overlap_cpu_optimizer_d2h_h2d: bool = False
+    use_precision_aware_optimizer: bool = False
 
     def to_args(self) -> str:
         return " ".join([
@@ -87,7 +126,8 @@ class SGLangConfig:
     """SGLang inference engine settings - parallelism, memory, generation."""
     # Parallelism
     rollout_num_gpus_per_engine: Optional[int] = None  # TP size - GPUs per engine
-    sglang_data_parallel_size: Optional[int] = None  # DP size - data parallel within engine
+    sglang_dp_size: Optional[int] = None  # DP size - data parallel within engine
+    sglang_data_parallel_size: Optional[int] = None  # Alias for sglang_dp_size (older name)
     sglang_pipeline_parallel_size: Optional[int] = None  # PP size - pipeline parallel
     sglang_expert_parallel_size: Optional[int] = None  # EP size - expert parallel (MoE)
     # Memory
@@ -97,8 +137,21 @@ class SGLangConfig:
     n_samples_per_prompt: int = 8  # Responses to generate per prompt
     rollout_max_response_len: int = 1024  # Max tokens to generate
     rollout_temperature: float = 1.0  # Sampling temperature
-    # Debug/testing
-    sglang_disable_cuda_graph: bool = False  # Disable CUDA graph capture (faster startup)
+    # Advanced features
+    sglang_enable_dp_attention: bool = False
+    sglang_enable_dp_lm_head: bool = False
+    sglang_moe_dense_tp_size: Optional[int] = None
+    sglang_tool_call_parser: Optional[str] = None
+    sglang_reasoning_parser: Optional[str] = None
+    # Speculative decoding
+    sglang_speculative_algorithm: Optional[str] = None  # e.g., "EAGLE"
+    sglang_speculative_num_steps: Optional[int] = None
+    sglang_speculative_eagle_topk: Optional[int] = None
+    sglang_speculative_num_draft_tokens: Optional[int] = None
+    # Performance tuning
+    sglang_cuda_graph_max_bs: Optional[int] = None
+    sglang_max_running_requests: Optional[int] = None
+    sglang_disable_cuda_graph: bool = False
 
     def to_args(self) -> str:
         return " ".join([*_to_cli_args(self), "--sglang-enable-metrics"])
@@ -144,6 +197,7 @@ class GRPOConfig:
     use_kl_loss: bool = True
     kl_loss_coef: float = 0.00
     kl_loss_type: str = "low_var_kl"
+    kl_coef: float = 0.00  # Separate from kl_loss_coef
     entropy_coef: float = 0.00
     eps_clip: float = 0.2
     eps_clip_high: float = 0.28
@@ -158,7 +212,9 @@ class EvalConfig:
     eval_interval: int = 20
     n_samples_per_eval_prompt: int = 1
     eval_max_response_len: int = 1024
-    eval_top_k: int = 1
+    eval_top_k: Optional[int] = None
+    eval_temperature: Optional[float] = None
+    eval_top_p: Optional[float] = None
 
     def to_args(self, data_path) -> str:
         return " ".join([f"--eval-prompt-data gsm8k {data_path}/gsm8k/test.parquet", *_to_cli_args(self)])

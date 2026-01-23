@@ -173,7 +173,6 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# Ruff cache
-.ruff_cache/
-# Test configs (local experiments)
-slime/test-configs/
+
+# claire, experimental
+slime/test_configs
