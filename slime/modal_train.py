@@ -44,10 +44,13 @@ from configs.base import RLConfig
 # =============================================================================
 
 image = (
-    modal.Image.from_registry("slimerl/slime:nightly-dev-20260106a")
+    modal.Image.from_registry("slimerl/slime")
     .run_commands(
         # Update slime from GitHub to get the latest version
-        "cd /root/slime && git remote set-url origin https://github.com/czhang-modal/slime.git && git fetch origin && git checkout claire/slime && pip install -e ."
+        "cd /root/slime && git remote set-url origin https://github.com/czhang-modal/slime.git && git fetch origin && git checkout claire/slime && pip install -e .",
+        "pip install git+https://github.com/huggingface/transformers.git@eebf856",
+        # Patch sglang for transformers compatibility
+        """sed -i 's/AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)/AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)/g' /sgl-workspace/sglang/python/sglang/srt/configs/utils.py""",
     )
     .entrypoint([])
     .add_local_python_source("configs")
@@ -281,7 +284,7 @@ def list_available_configs():
         "efa_enabled": True,
     },
 )
-@modal.experimental.clustered(2, rdma=True)
+@modal.experimental.clustered(4, rdma=True)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
     
