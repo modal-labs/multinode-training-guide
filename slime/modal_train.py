@@ -51,6 +51,8 @@ image = (
         "pip install git+https://github.com/huggingface/transformers.git@eebf856",
         # Patch sglang for transformers compatibility
         """sed -i 's/AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)/AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)/g' /sgl-workspace/sglang/python/sglang/srt/configs/utils.py""",
+        # Patch Megatron-Bridge: GLM-4.7 uses rope_parameters.rope_theta
+        """sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
     )
     .entrypoint([])
     .add_local_python_source("configs")
@@ -170,6 +172,7 @@ def generate_slime_cmd(
         "env_vars": {
             "PYTHONPATH": "/root/Megatron-LM/",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+            "CUDA_LAUNCH_BLOCKING": "1",  # Synchronous CUDA errors for debugging
             "NCCL_NVLS_ENABLE": "1",
             "no_proxy": master_addr,
             "MASTER_ADDR": master_addr,
@@ -271,7 +274,7 @@ def list_available_configs():
 
 @app.function(
     image=image,
-    gpu="H100:2",
+    gpu="B200:8",  # GLM-4.7 needs H200s for memory
     volumes={
         MODELS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
@@ -284,7 +287,7 @@ def list_available_configs():
         "efa_enabled": True,
     },
 )
-@modal.experimental.clustered(4, rdma=True)
+@modal.experimental.clustered(8, rdma=True)  # 8 nodes for GLM-4.7 (4 train + 4 rollout)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
     
@@ -320,7 +323,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="H200:8",
     volumes={
         MODELS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
@@ -337,7 +340,7 @@ async def train_single_node(config: str = "qwen-0.5b-sync"):
     """Single-node GRPO training on Modal.
     
     Args:
-        config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
+        config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async"). File name with underscores replaced with dashes.
     """
     from configs import get_config
     
