@@ -33,6 +33,7 @@ _ARCHITECTURE = ModelArchitectureConfig(
     disable_bias_linear=False,
     add_qkv_bias=True,  # attention_bias: true
     qk_layernorm=True,  # use_qk_norm: true
+    untie_embeddings_and_output_weights=True,  # tie_word_embeddings: false in HF
     # MoE (Mixture of Experts)
     moe_layer_freq="[0]*3+[1]*89",  # first_k_dense_replace=3, remaining 89 MoE
     num_experts=160,  # n_routed_experts
@@ -54,17 +55,19 @@ _ARCHITECTURE = ModelArchitectureConfig(
 )
 
 _TRAINING = MegatronConfig(
-    # Parallelism
-    tensor_model_parallel_size=1,
-    pipeline_model_parallel_size=1,
-    context_parallel_size=1,
-    expert_model_parallel_size=1,
+    # Parallelism - 358B model needs heavy distribution
+    # With 64 GPUs: TP=8 (within node) * PP=4 (across nodes) * DP=2 = 64
+    tensor_model_parallel_size=8,
+    pipeline_model_parallel_size=2,
+    context_parallel_size=2,
+    expert_model_parallel_size=16,  # 160 experts / 8 = 20 experts per GPU
     expert_tensor_parallel_size=1,
     sequence_parallel=True,
+    decoder_last_pipeline_num_layers=46,  # 92 layers / 4 pipeline stages = 23
     # Batching
-    max_tokens_per_gpu=32768,
+    max_tokens_per_gpu=16384,  # Reduced for large model
     use_dynamic_batch_size=True,
-    global_batch_size=1024,
+    global_batch_size=512,  # Reduced for memory
     # Optimizer
     optimizer="adam",
     lr=1e-6,
@@ -76,44 +79,42 @@ _TRAINING = MegatronConfig(
     attention_dropout=0.0,
     hidden_dropout=0.0,
     attention_backend="flash",
-    # Recompute (memory optimization)
+    # Recompute (memory optimization) - ESSENTIAL for 358B
     recompute_granularity="full",
     recompute_method="uniform",
     recompute_num_layers=1,
-    decoder_last_pipeline_num_layers=46,  # 92 layers / 2 pipeline stages
-    # Optimizer offload
+    # Optimizer offload - ESSENTIAL for 358B
     optimizer_cpu_offload=True,
     overlap_cpu_optimizer_d2h_h2d=True,
     use_precision_aware_optimizer=True,
 )
 
 _SGLANG = SGLangConfig(
+    # 358B model needs TP=8 for inference too
     rollout_num_gpus_per_engine=8,
-    sglang_data_parallel_size=8,
-    sglang_mem_fraction_static=0.8,
-    rollout_batch_size=128,
+    sglang_dp_size=4,  # 32 rollout GPUs / 8 TP = 4 DP engines
+    sglang_mem_fraction_static=0.85,
+    rollout_batch_size=64, 
     n_samples_per_prompt=8,
-    rollout_max_response_len=32768,
+    rollout_max_response_len=16384,
     rollout_temperature=1.0,
-    # Advanced features
     sglang_enable_dp_attention=True,
     sglang_enable_dp_lm_head=True,
-    sglang_moe_dense_tp_size=1,
-    # Speculative decoding
+    sglang_moe_dense_tp_size=8,  # Must match rollout TP for attention heads to divide evenly
+    sglang_cuda_graph_max_bs=32,  # Reduced
+    sglang_max_running_requests=256,  # Reduced
+
     sglang_speculative_algorithm="EAGLE",
     sglang_speculative_num_steps=2,
     sglang_speculative_eagle_topk=1,
     sglang_speculative_num_draft_tokens=3,
-    # Performance
-    sglang_cuda_graph_max_bs=64,
-    sglang_max_running_requests=512,
 )
 
 _ORCHESTRATION = OrchestrationConfig(
-    actor_num_nodes=2,
-    actor_num_gpus_per_node=8, # training
-    rollout_num_gpus=2*8, # rollout
-    colocate=False,
+    actor_num_nodes=4,  # 4 nodes for training (32 GPUs)
+    actor_num_gpus_per_node=8,
+    rollout_num_gpus=4*8,  # 4 nodes for rollout (32 GPUs)
+    colocate=False,  # Separate training and rollout
     num_gpus_per_node=8,
 )
 _GRPO = GRPOConfig(
@@ -150,10 +151,10 @@ def get_config() -> RLConfig:
         orchestration=_ORCHESTRATION,
         grpo=_GRPO,
         eval=_EVAL,
-        n_nodes=4,
-        gpu="H200:8",
-        app_name="slime-grpo-glm-4.7-no-lora",
-        wandb_run_name_prefix="glm-4.7-grpo-no-lora",
+        n_nodes=8,  # 4 training + 4 rollout nodes
+        gpu="B200:8",
+        app_name="slime-grpo-glm-4.7-1-26-cp2-ep-16-fix-rope",
+        wandb_run_name_prefix="glm-4.7-grpo",
         wandb_project="slime-grpo",
         sync=False,
         extra_args=_EXTRA_ARGS,
