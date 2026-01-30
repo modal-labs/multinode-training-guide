@@ -57,8 +57,8 @@ _ARCHITECTURE = ModelArchitectureConfig(
 _TRAINING = MegatronConfig(
     # Parallelism - 358B model needs heavy distribution
     # With 64 GPUs: TP=8 (within node) * PP=4 (across nodes) * DP=2 = 64
-    tensor_model_parallel_size=2,
-    pipeline_model_parallel_size=8,
+    tensor_model_parallel_size=8,
+    pipeline_model_parallel_size=4,
     context_parallel_size=2,
     expert_model_parallel_size=16,  # 160 experts / 8 = 20 experts per GPU
     expert_tensor_parallel_size=1,
@@ -111,7 +111,7 @@ _SGLANG = SGLangConfig(
 )
 
 _ORCHESTRATION = OrchestrationConfig(
-    actor_num_nodes=4,  # 4 nodes for training (32 GPUs)
+    actor_num_nodes=8,
     actor_num_gpus_per_node=8,
     rollout_num_gpus=4*8,  # 4 nodes for rollout (32 GPUs)
     colocate=False,  # Separate training and rollout
