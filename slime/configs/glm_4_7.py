@@ -57,13 +57,13 @@ _ARCHITECTURE = ModelArchitectureConfig(
 _TRAINING = MegatronConfig(
     # Parallelism - 358B model needs heavy distribution
     # With 64 GPUs: TP=8 (within node) * PP=4 (across nodes) * DP=2 = 64
-    tensor_model_parallel_size=8,
-    pipeline_model_parallel_size=2,
+    tensor_model_parallel_size=2,
+    pipeline_model_parallel_size=8,
     context_parallel_size=2,
     expert_model_parallel_size=16,  # 160 experts / 8 = 20 experts per GPU
     expert_tensor_parallel_size=1,
     sequence_parallel=True,
-    decoder_last_pipeline_num_layers=46,  # 92 layers / 4 pipeline stages = 23
+    decoder_last_pipeline_num_layers=23,  # 92 layers / 4 pipeline stages = 23
     # Batching
     max_tokens_per_gpu=16384,  # Reduced for large model
     use_dynamic_batch_size=True,
@@ -94,13 +94,13 @@ _SGLANG = SGLangConfig(
     rollout_num_gpus_per_engine=8,
     sglang_dp_size=4,  # 32 rollout GPUs / 8 TP = 4 DP engines
     sglang_mem_fraction_static=0.85,
-    rollout_batch_size=64, 
+    rollout_batch_size=64,  # Reduced for large model
     n_samples_per_prompt=8,
-    rollout_max_response_len=16384,
+    rollout_max_response_len=16384,  # Reduced for memory
     rollout_temperature=1.0,
     sglang_enable_dp_attention=True,
     sglang_enable_dp_lm_head=True,
-    sglang_moe_dense_tp_size=8,  # Must match rollout TP for attention heads to divide evenly
+    sglang_moe_dense_tp_size=1,
     sglang_cuda_graph_max_bs=32,  # Reduced
     sglang_max_running_requests=256,  # Reduced
 
@@ -153,7 +153,7 @@ def get_config() -> RLConfig:
         eval=_EVAL,
         n_nodes=8,  # 4 training + 4 rollout nodes
         gpu="B200:8",
-        app_name="slime-grpo-glm-4.7-1-26-cp2-ep-16-fix-rope",
+        app_name="slime-grpo-glm-4.7-1-26-cp2-ep-16",
         wandb_run_name_prefix="glm-4.7-grpo",
         wandb_project="slime-grpo",
         sync=False,
