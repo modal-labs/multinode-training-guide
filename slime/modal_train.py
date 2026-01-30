@@ -44,15 +44,11 @@ from configs.base import RLConfig
 # =============================================================================
 
 image = (
-    modal.Image.from_registry("slimerl/slime")
+    modal.Image.from_registry("slimerl/slime:nightly-dev-20260126a")
     .run_commands(
-        # Update slime from GitHub to get the latest version
-        "cd /root/slime && git remote set-url origin https://github.com/czhang-modal/slime.git && git fetch origin && git checkout claire/slime && pip install -e .",
-        "pip install git+https://github.com/huggingface/transformers.git@eebf856",
-        # Patch sglang for transformers compatibility
+        "pip install git+https://github.com/huggingface/transformers.git@eebf856", # 4.54.1
         """sed -i 's/AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)/AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)/g' /sgl-workspace/sglang/python/sglang/srt/configs/utils.py""",
-        # Patch Megatron-Bridge: GLM-4.7 uses rope_parameters.rope_theta
-        """sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
+        r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
     )
     .entrypoint([])
     .add_local_python_source("configs")
@@ -274,7 +270,7 @@ def list_available_configs():
 
 @app.function(
     image=image,
-    gpu="B200:8",  # GLM-4.7 needs H200s for memory
+    gpu="H200:8",  # GLM-4.7 needs H200s for memory
     volumes={
         MODELS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
