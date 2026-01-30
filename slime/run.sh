@@ -28,6 +28,9 @@ if [ -n "$GPU_OVERRIDE" ]; then
     GPU="$GPU_OVERRIDE"
 fi
 
+# Update cluster size to match config's n_nodes
+sed -i "s/@modal.experimental.clustered([0-9]*, rdma=True)/@modal.experimental.clustered($N_NODES, rdma=True)/" modal_train.py
+
 echo "Config:  $CONFIG"
 echo "App:     $APP_NAME"
 echo "GPU:     $GPU"

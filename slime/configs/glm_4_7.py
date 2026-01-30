@@ -151,7 +151,7 @@ def get_config() -> RLConfig:
         orchestration=_ORCHESTRATION,
         grpo=_GRPO,
         eval=_EVAL,
-        n_nodes=8,  # 4 training + 4 rollout nodes
+        n_nodes=12,  # 8 training + 4 rollout nodes
         gpu="B200:8",
         app_name="slime-grpo-glm-4.7-1-26-cp2-ep-16",
         wandb_run_name_prefix="glm-4.7-grpo",

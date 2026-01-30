@@ -283,7 +283,7 @@ def list_available_configs():
         "efa_enabled": True,
     },
 )
-@modal.experimental.clustered(8, rdma=True)  # 8 nodes for GLM-4.7 (4 train + 4 rollout)
+@modal.experimental.clustered(12, rdma=True)  # 12 nodes for GLM-4.7 (8 train + 4 rollout)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
     
