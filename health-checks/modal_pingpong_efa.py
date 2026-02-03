@@ -15,7 +15,7 @@ image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10")
     .apt_install("libnl-route-3-200")  # required by fi_pingpong
 )
-app = modal.App("rdma-pingpong", image=image)
+app = modal.App("rdma-pingpong-efa", image=image)
 
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
 n_nodes = 2
