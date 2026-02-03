@@ -2,6 +2,12 @@
 
 Health checking inter-node communication over RoCE v2 and AWS EFA.
 
+## EFA vs InfiniBand
+
+**EFA (Elastic Fabric Adapter)**: AWS-specific RDMA implementation using libfabric API. Available on AWS instances with EFA support.
+
+**InfiniBand/RoCE**: Standard RDMA using IB Verbs API. Available on GCP and other clouds with Mellanox/NVIDIA ConnectX NICs.
+
 ## How It Works
 
 **InfiniBand/RoCE**: Discovers RDMA IPv4 addresses by parsing the GID table (`ibv_devinfo`) and extracting RoCE v2 addresses (`::ffff:10.200.0.x`). Ensures connections use the correct RDMA subnet.
@@ -43,3 +49,5 @@ bytes   #sent   #ack     total       time     MB/sec    usec/xfer   Mxfers/sec
 ```
 
 Ensure bytes are successfully being sent and ACK'd.
+
+## Difference between EFA and IB
