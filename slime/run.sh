@@ -22,14 +22,26 @@ N_NODES=$(python -c "from configs import get_config; print(get_config('$CONFIG')
 # Override GPU if specified
 if [ -n "$GPU_OVERRIDE" ]; then
     echo "Overriding GPU: $GPU -> $GPU_OVERRIDE"
-    # Update the gpu= line right before train_multi_node's @modal.experimental.clustered
-    # Match pattern: gpu="...", and replace with override (only first occurrence)
-    sed -i "0,/gpu=\"[A-Z0-9]*:[0-9]*\",  # GLM/s//gpu=\"$GPU_OVERRIDE\",  # GLM/" modal_train.py
+    python -c "
+import re
+with open('modal_train.py', 'r') as f:
+    content = f.read()
+content = re.sub(r'gpu=\"[A-Z0-9]*:[0-9]*\",  # GLM', 'gpu=\"$GPU_OVERRIDE\",  # GLM', content, count=1)
+with open('modal_train.py', 'w') as f:
+    f.write(content)
+"
     GPU="$GPU_OVERRIDE"
 fi
 
 # Update cluster size to match config's n_nodes
-sed -i "s/@modal.experimental.clustered([0-9]*, rdma=True)/@modal.experimental.clustered($N_NODES, rdma=True)/" modal_train.py
+python -c "
+import re
+with open('modal_train.py', 'r') as f:
+    content = f.read()
+content = re.sub(r'@modal\.experimental\.clustered\(\d+, rdma=True\)', '@modal.experimental.clustered($N_NODES, rdma=True)', content)
+with open('modal_train.py', 'w') as f:
+    f.write(content)
+"
 
 echo "Config:  $CONFIG"
 echo "App:     $APP_NAME"

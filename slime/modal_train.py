@@ -276,7 +276,7 @@ def list_available_configs():
         DATA_PATH.as_posix(): data_volume,
     },
     secrets=[
-        modal.Secret.from_name("wandb-secret-clairez"),
+        modal.Secret.from_name("wandb-secret"),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
@@ -325,7 +325,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
         DATA_PATH.as_posix(): data_volume,
     },
     secrets=[
-        modal.Secret.from_name("wandb-secret-clairez"),
+        modal.Secret.from_name("wandb-secret"),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
