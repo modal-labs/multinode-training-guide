@@ -38,6 +38,10 @@ import modal.experimental
 
 from configs.base import RLConfig
 
+GPU_NAME = os.environ.get("GPU_NAME", "H200")
+GPU_COUNT = int(os.environ.get("GPU_COUNT", "8"))
+NUM_NODES = int(os.environ.get("NUM_NODES", "4"))
+
 
 # =============================================================================
 # Modal Image & Volumes
@@ -80,8 +84,7 @@ SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 # =============================================================================
 
 # App name from environment variable (set before running modal)
-# Usage: SLIME_APP_NAME="my-experiment" modal run modal_train.py ...
-APP_NAME = os.environ.get("SLIME_APP_NAME", "slime-grpo")
+APP_NAME = os.environ.get("APP_NAME", "slime-grpo")
 app = modal.App(APP_NAME)
 
 
@@ -270,7 +273,7 @@ def list_available_configs():
 
 @app.function(
     image=image,
-    gpu="H200:8",  # GLM-4.7 needs H200s for memory
+    gpu=f"{GPU_NAME}:{GPU_COUNT}",
     volumes={
         MODELS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
@@ -283,7 +286,7 @@ def list_available_configs():
         "efa_enabled": True,
     },
 )
-@modal.experimental.clustered(12, rdma=True)  # 12 nodes for GLM-4.7 (8 train + 4 rollout)
+@modal.experimental.clustered(NUM_NODES, rdma=True)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
     
@@ -319,7 +322,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
 
 @app.function(
     image=image,
-    gpu="H200:8",
+    gpu=f"{GPU_NAME}:{GPU_COUNT}",
     volumes={
         MODELS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
