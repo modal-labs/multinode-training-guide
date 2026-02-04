@@ -272,9 +272,9 @@ class RLConfig:
     def train_script(self) -> str:
         return "slime/train.py" if self.sync else "slime/train_async.py"
     
-    def generate_train_args(self, models_path, data_path, is_infinite_run: bool) -> str:
+    def generate_train_args(self, model_path, data_path, is_infinite_run: bool) -> str:
         args = [
-            f"--hf-checkpoint {models_path}/{self.model_name}/ --ref-load {models_path}/{self.model_name}/",
+            f"--hf-checkpoint {model_path} --ref-load {model_path}",
             self.architecture.to_args(),
             self.training.to_args(),
             self.sglang.to_args(),

@@ -4,19 +4,16 @@ Unified SLIME GRPO training script for Modal.
 Usage:
     # Sync training with Qwen 0.5B (multi-node)
     modal run modal_train.py::train_multi_node --config qwen-0.5b-sync
-    
-    # Async training with Qwen 4B (multi-node)  
+
+    # Async training with Qwen 4B (multi-node)
     modal run modal_train.py::train_multi_node --config qwen-4b-async
-    
+
     # Single node training
     modal run modal_train.py::train_single_node --config qwen-0.5b-sync
-    
-    # Download model
-    modal run modal_train.py::download_model --config qwen-4b-sync
-    
+
     # Prepare dataset
     modal run modal_train.py::prepare_dataset
-    
+
     # List available configs
     modal run modal_train.py::list_available_configs
 
@@ -25,12 +22,13 @@ Available configs:
     - qwen-0.5b-async
     - qwen-4b-sync
     - qwen-4b-async
+
+Models are automatically downloaded and cached via the huggingface-cache volume.
 """
 
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
 import time
 
 import modal
@@ -48,12 +46,7 @@ NUM_NODES = int(os.environ.get("NUM_NODES", "4"))
 # =============================================================================
 
 image = (
-    modal.Image.from_registry("slimerl/slime:nightly-dev-20260126a")
-    .run_commands(
-        "pip install git+https://github.com/huggingface/transformers.git@eebf856", # 4.54.1
-        """sed -i 's/AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)/AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)/g' /sgl-workspace/sglang/python/sglang/srt/configs/utils.py""",
-        r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
-    )
+    modal.Image.from_registry("slimerl/slime:nightly-dev-20260202c")
     .entrypoint([])
     .add_local_python_source("configs")
 )
@@ -64,14 +57,14 @@ with image.imports():
 
 # Paths
 DATA_PATH: Path = Path("/data")
-MODELS_PATH: Path = Path("/models")
+HF_CACHE_PATH: Path = Path("/root/.cache/huggingface")
 
 # Volumes
 data_volume: modal.Volume = modal.Volume.from_name(
     "grpo-slime-example-data", create_if_missing=True
 )
-checkpoints_volume: modal.Volume = modal.Volume.from_name(
-    "grpo-slime-example-checkpoints", create_if_missing=True
+hf_cache_volume: modal.Volume = modal.Volume.from_name(
+    "huggingface-cache", create_if_missing=True
 )
 
 # Ray configuration
@@ -158,11 +151,18 @@ def generate_slime_cmd(
 ) -> tuple[str, dict]:
     """Generate the slime training command and runtime environment."""
     import slime.utils.external_utils.command_utils as U
+    from huggingface_hub import snapshot_download
 
     is_infinite_run = U.get_env_enable_infinite_run()
-    
+
+    # Download model to cache and get local path
+    hf_token = os.environ.get("HF_TOKEN")
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+    model_path = snapshot_download(config.model_id, token=hf_token)
+    print(f"Model path: {model_path}")
+
     # Generate all training args from config
-    train_args = config.generate_train_args(MODELS_PATH, DATA_PATH, is_infinite_run)
+    train_args = config.generate_train_args(model_path, DATA_PATH, is_infinite_run)
     
     # Add wandb args
     train_args += f" {U.get_default_wandb_args(__file__, config.wandb_run_name_prefix)} --wandb-project {config.wandb_project}"
@@ -175,6 +175,7 @@ def generate_slime_cmd(
             "NCCL_NVLS_ENABLE": "1",
             "no_proxy": master_addr,
             "MASTER_ADDR": master_addr,
+            "HF_XET_HIGH_PERFORMANCE": "1",
         }
     }
     
@@ -212,37 +213,10 @@ async def run_training(
 
 @app.function(
     image=image,
-    volumes={MODELS_PATH.as_posix(): checkpoints_volume},
-    timeout=24 * 60 * 60,
-)
-def download_model(
-    config: str = "qwen-0.5b",
-    revision: Optional[str] = None,
-):
-    """Download model from HuggingFace.
-    
-    Args:
-        config: Config name (e.g., "qwen-0.5b", "qwen-4b")
-        revision: Optional HF revision to pin
-    """
-    from huggingface_hub import snapshot_download
-    from configs import get_config
-    
-    cfg = get_config(config)
-    
-    snapshot_download(
-        repo_id=cfg.model_id,
-        local_dir=MODELS_PATH / cfg.model_name,
-        revision=revision,
-    )
-    print(f"Model downloaded to {MODELS_PATH / cfg.model_name}")
-    
-    checkpoints_volume.commit()
-
-
-@app.function(
-    image=image,
-    volumes={DATA_PATH.as_posix(): data_volume},
+    volumes={
+        DATA_PATH.as_posix(): data_volume,
+        HF_CACHE_PATH.as_posix(): hf_cache_volume,
+    },
     timeout=24 * 60 * 60,
 )
 def prepare_dataset():
@@ -275,11 +249,12 @@ def list_available_configs():
     image=image,
     gpu=f"{GPU_NAME}:{GPU_COUNT}",
     volumes={
-        MODELS_PATH.as_posix(): checkpoints_volume,
+        HF_CACHE_PATH.as_posix(): hf_cache_volume,
         DATA_PATH.as_posix(): data_volume,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("huggingface-secret"),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
@@ -296,8 +271,8 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     from configs import get_config
     
     cfg = get_config(config)
-    
-    checkpoints_volume.reload()
+
+    hf_cache_volume.reload()
     data_volume.reload()
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -324,11 +299,12 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     image=image,
     gpu=f"{GPU_NAME}:{GPU_COUNT}",
     volumes={
-        MODELS_PATH.as_posix(): checkpoints_volume,
+        HF_CACHE_PATH.as_posix(): hf_cache_volume,
         DATA_PATH.as_posix(): data_volume,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("huggingface-secret"),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
@@ -344,8 +320,8 @@ async def train_single_node(config: str = "qwen-0.5b-sync"):
     from configs import get_config
     
     cfg = get_config(config)
-    
-    checkpoints_volume.reload()
+
+    hf_cache_volume.reload()
     data_volume.reload()
 
     _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
