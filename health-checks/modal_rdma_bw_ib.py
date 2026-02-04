@@ -1,10 +1,11 @@
-import os
 import subprocess
 
 import modal
 import modal.experimental
 
 import time
+import json
+import re
 
 cuda_version = "12.4.0"  # should be no greater than host CUDA version
 flavor = "devel"  #  includes full CUDA toolkit
@@ -17,6 +18,8 @@ image = (
         "build-essential",
         "autoconf",
         "automake",
+        "ca-certificates",
+        "curl",
         "libtool",
         "libibverbs-dev",
         "ibverbs-utils",
@@ -26,95 +29,160 @@ image = (
         "libfabric-dev",
         "libfabric-bin",
         "iproute2",
-        "git",
     )
     .run_commands(
-        "git clone https://github.com/linux-rdma/perftest.git /opt/perftest",
+        "curl -fsSL -o /tmp/perftest-25.10.0-0.128.tar.gz https://github.com/linux-rdma/perftest/archive/refs/tags/25.10.0-0.128.tar.gz",
+        "rm -rf /opt/perftest && mkdir -p /opt && tar -xzf /tmp/perftest-25.10.0-0.128.tar.gz -C /opt && mv /opt/perftest-25.10.0-0.128 /opt/perftest",
+        "rm -f /tmp/perftest-25.10.0-0.128.tar.gz",
         "cd /opt/perftest && ./autogen.sh && ./configure --prefix=/usr/local/ && make -j && make install",
     )
 )
 app = modal.App("rdma-bandwidth-ib", image=image)
 
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
-n_nodes = 2
-# Typically this matches the number of GPUs per container.
-n_proc_per_node = 8
+N_NODES = 2
+# This is the default base port for the ib_write_bw command
+BASE_PORT = 18515
 
-bandwidth_dict = modal.Dict.from_name("bandwidth-dict", create_if_missing=True)
-bandwidth_dict.clear()
+server_ip_dict = modal.Dict.from_name("server-ip-dict", create_if_missing=True)
+LOGGING_DEBUG = False
 
 @app.function(
-    gpu=f"H200:{n_proc_per_node}",
+    gpu=f"H200:8",
     experimental_options={"efa_enabled": False},
     cloud="gcp",
     timeout=60 * 60, # 1 hour
 )
-@modal.experimental.clustered(n_nodes, rdma=True)
-def rdma_bandwidth_test():
-    import re
-    
+@modal.experimental.clustered(N_NODES, rdma=True)
+def infiniband_bandwidth_test():
+    """This health check runs a bi-directional RDMA bandwidth test using the perftest library. Node rank 0 is server and node rank 1 is client.
+    We create a Modal dict for storing the ip address of every RDMA device on the server. The client waits until the server has been populated with 8 items and then
+    runs a ib_write_bw with the --bidirectional flag. Please note that one node is a 8xH200 DGX rack and not a single H200. We test the 8 devices on each node."""
+
+    # get current node rank
     cluster_info = modal.experimental.get_cluster_info()
-    print(cluster_info)
     container_rank: int = cluster_info.rank
+    print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
     
-    rdma_device = "mlx5_0"
-    gid_index = 3  # Using GID index 3 for RoCE v2
+    # get local ib devices (sorted by device index from 0 to 7)
+    local_ib_devices = get_local_ib_devices()
+    print(f"[rank {container_rank}] Found {len(local_ib_devices)} local IB devices: {local_ib_devices}", flush=True)
     
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    
-    # Get GID table from ibv_devinfo to extract the IPv4 address
-    devinfo_result = subprocess.run(
-        ["/usr/bin/ibv_devinfo", "-v", "-d", rdma_device],
+    if container_rank == 0:
+        # only have the server clear the dict to prevent a race condition between the server and client
+        server_ip_dict.clear()
+        print(f"[rank {container_rank}] Dict cleared", flush=True)
+
+        # get all RDMA network interfaces and their ipv4 addresses
+        print(f"[rank {container_rank}] Getting IP addresses...", flush=True)
+        ip_addr = subprocess.run(
+            ["ip", "-j", "addr", "show"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        ib_stat_json = json.loads(ip_addr.stdout)
+        for device in ib_stat_json:
+            # only get devices that start with "gpu" such as "gpu0rdma0"
+            if device["ifname"].startswith("gpu"):
+                # get the device index (0->7) using regex exp to extract the first integer from the string
+                idx = re.search(r'\d', device["ifname"]).group(0)
+                # extract the ipv4 address from the addr_info
+                ip_address = device["addr_info"][0]["local"]
+                # update dict with new key-value pair
+                server_ip_dict[idx] = ip_address
+        print(f"[rank {container_rank}] Dict now has {server_ip_dict.len()} entries", flush=True)
+
+        # spawn 8 background processes to listen for connections on each device
+        processes = []
+        for idx, device in enumerate(local_ib_devices):
+            port = BASE_PORT + idx
+            print(f"[rank {container_rank}] Starting ib_write_bw server on device {device} port {port}", flush=True)
+            processes.append(run_ib_write_bw(device, port, None))
+        print(f"[rank {container_rank}] Started {len(processes)} server processes, waiting for them to complete...", flush=True)
+
+        # collect output from all server processes
+        results = []
+        for i, process in enumerate(processes):
+            print(f"[rank {container_rank}] Waiting for process {i} to complete...", flush=True)
+            process.wait()
+            for line in process.stdout:
+                results.append(line)
+        
+        # optionally print the output from all ib_write_bw commands
+        if LOGGING_DEBUG:
+            print(f"[rank {container_rank}] {''.join(results)}", flush=True)
+
+        # aggregate statistics from all server processes
+        mean_bw_peak, mean_bw_avg = aggregate_statistics(results)
+        print(f"[rank {container_rank}] Mean BW peak: {mean_bw_peak:.2f} Gb/s, Mean BW avg: {mean_bw_avg:.2f} Gb/s", flush=True)
+
+    else:
+        # wait until server has finished populating the dict with 8 items
+        print(f"[rank {container_rank}] Waiting for server to populate dict (need 8 entries)...", flush=True)
+        while server_ip_dict.len() < 8:
+            print(f"[rank {container_rank}] Dict has {server_ip_dict.len()} entries, waiting...", flush=True)
+            time.sleep(2)
+        print(f"[rank {container_rank}] Server dict ready, starting client connections...", flush=True)
+        
+        # spawn 8 background processes to write to the server's devices
+        processes = []
+        for idx, device in enumerate(local_ib_devices):
+            server_ip = server_ip_dict[str(idx)]
+            # assign each sender a unique ib_write_bw port to avoid conflicts
+            port = BASE_PORT + idx
+            print(f"[rank {container_rank}] Connecting device {device} to server {server_ip}:{port}", flush=True)
+            processes.append(run_ib_write_bw(device, port, server_ip))
+        
+        # wait for client processes to complete
+        results = []
+        for i, process in enumerate(processes):
+            print(f"[rank {container_rank}] Waiting for client process {i} to complete...", flush=True)
+            process.wait()
+
+# run ib_write_bw command with optional arg for server ip
+def run_ib_write_bw(device: str, port: int, server_ip: str | None = None) -> subprocess.Popen:
+    cmd = ["/usr/local/bin/ib_write_bw", "-d", device, "-p", str(port), "-R", "--report_gbits", "--bidirectional"] # bidirectional to test both direction
+    if server_ip is not None:
+        cmd.append(server_ip)
+    print(f"Running command: {' '.join(cmd)}", flush=True)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+# get a sorted list of infiniband device names: "mlx5_0", "mlx5_1", etc.
+def get_local_ib_devices() -> list[str]:
+    ib_devices = subprocess.run(
+        ["ls", "/sys/class/infiniband/"],
         capture_output=True,
         text=True,
         check=True,
-        env=env
     )
-    
-    print(f"[rank {container_rank}] [ibv_devinfo output]:", flush=True)
-    print(devinfo_result.stdout, flush=True)
-    
-    # Parse the IP address from GID[3] in the output
-    # Looking for: GID[  3]:		::ffff:10.200.0.10, RoCE v2
-    gid_pattern = rf'GID\[\s*{gid_index}\]:\s+::ffff:(\d+\.\d+\.\d+\.\d+)'
-    ip_match = re.search(gid_pattern, devinfo_result.stdout)
-    
-    if not ip_match:
-        raise RuntimeError(f"Could not find IPv4 address in GID[{gid_index}] for device {rdma_device}")
-    
-    local_ip = ip_match.group(1)
-    print(f"[rank {container_rank}] Extracted RDMA IPv4 address from GID[{gid_index}]: {local_ip}", flush=True)
+    devices = ib_devices.stdout.split("\n")[:-1] # trim the final new line character from the output
+    return sorted(devices)
 
-    cmd_args = ["-d", rdma_device, "-x", str(gid_index), "-R", "--report_gbits", "--bidirectional"]
-
-    if container_rank == 0:
-        bandwidth_dict["server_ip"] = local_ip
-    else:
-        while bandwidth_dict.get("server_ip") is None:
-            time.sleep(1)
-        server_ip = bandwidth_dict.get("server_ip")
-        cmd_args.append(server_ip)
-
-    cmd = ["/usr/local/bin/ib_write_bw", *cmd_args]
-    print(f"[rank {container_rank}] Running: {' '.join(cmd)}", flush=True)
+# Returns the mean peak bandwidth and the mean bandwidth average across all devices in Gb/s.
+def aggregate_statistics(results: list[str]) -> tuple[float, float]:
+    bw_peaks = []
+    bw_averages = []
     
-    proc = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
+    for line in results:
+        parts = line.split()
+        # results line has 5 columns: bytes, iterations, bw_peak, bw_avg, msg_rate
+        if len(parts) == 5:
+            try:
+                bw_peak = float(parts[2])
+                bw_avg = float(parts[3])
+                bw_peaks.append(bw_peak)
+                bw_averages.append(bw_avg)
+            except ValueError:
+                continue
     
-    for line in proc.stdout:
-        print(f"[rank {container_rank}] {line}", end="", flush=True)
+    if not bw_peaks:
+        return 0.0, 0.0
     
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    mean_bw_peak = sum(bw_peaks) / len(bw_peaks)
+    mean_bw_avg = sum(bw_averages) / len(bw_averages)
+    return mean_bw_peak, mean_bw_avg
 
 @app.local_entrypoint()
 def main():
-    rdma_bandwidth_test.remote()
+    infiniband_bandwidth_test.remote()
