@@ -45,6 +45,10 @@ N_NODES = 2
 BASE_PORT = 18515
 
 server_ip_dict = modal.Dict.from_name("server-ip-dict", create_if_missing=True)
+
+if modal.is_local():
+    server_ip_dict.clear()
+
 LOGGING_DEBUG = False
 
 @app.function(
