@@ -3,65 +3,72 @@
 Run SLIME GRPO training on Modal.
 
 Usage:
-    python run.py <config-name> [options]
-    python run.py glm-4-7
-    python run.py glm-4-7 --gpu-name H100 --gpu-count 8 --nodes 4
+    modal run run.py --config glm-4-7
+    modal run run.py --config glm-4-7 --gpu-name H100 --gpu-count 8 --nodes 4
 """
 
 import os
-import subprocess
-import sys
-from pathlib import Path
 from typing import Optional
 
-import typer
+from configs import get_config
 
-app = typer.Typer(help="Run SLIME GRPO training on Modal")
+def _setup_env_from_args():
+    import sys
 
+    config = None
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--config" and i + 1 < len(args):
+            config = args[i + 1]
+            break
+        elif arg.startswith("--config="):
+            config = arg.split("=", 1)[1]
+            break
 
-@app.command()
-def train(
-    config: str = typer.Argument(..., help="Config name (e.g., glm-4-7, qwen-4b)"),
-    gpu_name: Optional[str] = typer.Option(None, "--gpu-name", "-g", help="GPU name (e.g., H100, H200)"),
-    gpu_count: Optional[int] = typer.Option(None, "--gpu-count", "-c", help="GPU count per node"),
-    nodes: Optional[int] = typer.Option(None, "--nodes", "-n", help="Number of nodes"),
-):
-    """Run multi-node GRPO training with the specified config."""
-    script_dir = Path(__file__).parent
-
-    # Import config
-    sys.path.insert(0, str(script_dir))
-    from configs import get_config
+    if not config:
+        return
 
     cfg = get_config(config)
 
-    # Build environment variables with overrides
-    env = {
-        **os.environ,
-        "APP_NAME": cfg.app_name,
-        "GPU_NAME": gpu_name or cfg.gpu.split(":")[0],
-        "GPU_COUNT": str(gpu_count or cfg.gpu.split(":")[1]),
-        "NUM_NODES": str(nodes or cfg.n_nodes),
-    }
+    gpu_name = None
+    gpu_count = None
+    nodes = None
 
-    # Print config info
-    typer.echo(f"Config:  {config}")
-    typer.echo(f"App:     {cfg.app_name}")
-    typer.echo(f"GPU:     {env['GPU_NAME']}:{env['GPU_COUNT']}")
-    typer.echo(f"Nodes:   {env['NUM_NODES']}")
+    for i, arg in enumerate(args):
+        if arg == "--gpu-name" and i + 1 < len(args):
+            gpu_name = args[i + 1]
+        elif arg.startswith("--gpu-name="):
+            gpu_name = arg.split("=", 1)[1]
+        elif arg == "--gpu-count" and i + 1 < len(args):
+            gpu_count = args[i + 1]
+        elif arg.startswith("--gpu-count="):
+            gpu_count = arg.split("=", 1)[1]
+        elif arg == "--nodes" and i + 1 < len(args):
+            nodes = args[i + 1]
+        elif arg.startswith("--nodes="):
+            nodes = arg.split("=", 1)[1]
 
-    # Run modal
-    cmd = [
-        "modal",
-        "run",
-        "-d",
-        "modal_train.py::train_multi_node",
-        "--config",
-        config,
-    ]
-
-    subprocess.run(cmd, cwd=script_dir, env=env, check=True)
+    os.environ["APP_NAME"] = cfg.app_name
+    os.environ["GPU_NAME"] = gpu_name or cfg.gpu.split(":")[0]
+    os.environ["GPU_COUNT"] = str(gpu_count or int(cfg.gpu.split(":")[1]))
+    os.environ["NUM_NODES"] = str(nodes or cfg.n_nodes)
 
 
-if __name__ == "__main__":
-    app()
+_setup_env_from_args()
+
+from modal_train import app, train_multi_node
+
+
+@app.local_entrypoint()
+def main(
+    config: str,
+    gpu_name: Optional[str] = None,
+    gpu_count: Optional[int] = None,
+    nodes: Optional[int] = None,
+):
+    print(f"Config:  {config}")
+    print(f"App:     {os.environ['APP_NAME']}")
+    print(f"GPU:     {os.environ['GPU_NAME']}:{os.environ['GPU_COUNT']}")
+    print(f"Nodes:   {os.environ['NUM_NODES']}")
+
+    train_multi_node.remote(config)
