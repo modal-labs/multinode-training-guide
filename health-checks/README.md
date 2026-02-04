@@ -1,6 +1,6 @@
 # Multi-node Health Checks
 
-Health checking inter-node communication over RoCE v2 and AWS EFA.
+Health checking inter-node communication over GCP's RoCE v2 and AWS's EFA.
 
 ## EFA vs InfiniBand
 
@@ -10,9 +10,9 @@ Health checking inter-node communication over RoCE v2 and AWS EFA.
 
 ## How It Works
 
-**InfiniBand/RoCE**: Discovers RDMA IPv4 addresses by parsing the GID table (`ibv_devinfo`) and extracting RoCE v2 addresses (`::ffff:10.200.0.x`). Ensures connections use the correct RDMA subnet.
+**InfiniBand/RoCE**: Discovers RDMA device IPv4 address for all devices.
 
-**EFA**: Uses Modal's container IPv4 addresses directly with libfabric's EFA provider (`fi_pingpong -p efa`).
+**EFA**: Uses the container's IPv4 address directly.
 
 ## Infiniband Test
 
@@ -24,10 +24,9 @@ modal run modal_rdma_bw_ib.py::main
 
 ### Sample Output
 ```
-#bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
-65536      5000             740.30             739.87                      1.411195
+[rank 0] Mean BW peak: 734.26 Gb/s, Mean BW avg: 733.92 Gb/s
 ```
-Ensure a peak bi-directional bandwidth near 800gb/s for GCP's ConnectX-7 Mellanox Fabric.
+Ensure a mean bi-directional bandwidth close to 800gb/s.
 
 ## EFA Test
 
@@ -41,13 +40,18 @@ modal run modal_pingpong_efa.py
 
 ### Sample Output
 ```
-bytes   #sent   #ack     total       time     MB/sec    usec/xfer   Mxfers/sec
-64      10      =10      1.2k        0.00s      2.52      25.35       0.04
-256     10      =10      5k          0.00s     14.38      17.80       0.06
-1k      10      =10      20k         0.00s     60.06      17.05       0.06
-4k      10      =10      80k         0.00s    222.61      18.40       0.05
+[rank 0] Running: /opt/amazon/efa/bin/fi_pingpong -p efa
+[rank 1] Running: /opt/amazon/efa/bin/fi_pingpong -p efa 10.100.0.1
+[rank 1] bytes   #sent   #ack     total       time     MB/sec    usec/xfer   Mxfers/sec
+[rank 1] 64      10      =10      1.2k        0.00s      1.77      36.25       0.03
+[rank 1] 256     10      =10      5k          0.00s     14.80      17.30       0.06
+[rank 1] 1k      10      =10      20k         0.00s     57.21      17.90       0.06
+[rank 1] 4k      10      =10      80k         0.00s    215.58      19.00       0.05
+[rank 0] bytes   #sent   #ack     total       time     MB/sec    usec/xfer   Mxfers/sec
+[rank 0] 64      10      =10      1.2k        0.00s      1.66      38.50       0.03
+[rank 0] 256     10      =10      5k          0.00s     13.26      19.30       0.05
+[rank 0] 1k      10      =10      20k         0.00s     52.11      19.65       0.05
+[rank 0] 4k      10      =10      80k         0.00s    196.92      20.80       0.05
 ```
 
-Ensure bytes are successfully being sent and ACK'd.
-
-## Difference between EFA and IB
+Ensure there are packets being #sent and #ack. 
