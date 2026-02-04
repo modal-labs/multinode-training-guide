@@ -178,7 +178,7 @@ def main():
             tokenizer_model=args.hf_model,
         ),
         checkpoint=CheckpointConfig(
-            save_interval=130,
+            save_interval=1,
             save=f"{args.checkpoints_dir}/glm47_lora",
             pretrained_checkpoint=args.megatron_checkpoint,
             ckpt_format="torch_dist",

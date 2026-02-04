@@ -245,9 +245,9 @@ def main():
     with open(tracker_file, "r") as f:
         iteration = int(f.read().strip())
 
-    patch_disable_peft_filtering_entirely()
-    patch_moe_expert_sharded_state_dict()
-    patch_checkpoint_load_with_logging()
+    # patch_peft_filter_to_use_name_matching()
+    # patch_moe_expert_sharded_state_dict()
+    # patch_checkpoint_load_with_logging()
 
     print("=" * 60)
     print("GLM-4.7 LoRA EVALUATION (Megatron Native)")
