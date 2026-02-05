@@ -4,7 +4,7 @@ Health checking inter-node communication over GCP's RoCE v2 and AWS's EFA.
 
 ## EFA vs InfiniBand
 
-**EFA (Elastic Fabric Adapter)**: AWS-specific RDMA implementation using libfabric API. Available on AWS with Elastic Fabric Adapter (EFA).
+**EFA (Elastic Fabric Adapter)**: AWS-specific RDMA implementation using libfabric API.
 
 **InfiniBand/RoCE**: Standard RDMA using IB Verbs API. Available on GCP with NVIDIA Mellanox ConnectX NICs.
 

@@ -7,8 +7,8 @@ import time
 import json
 import re
 
-cuda_version = "12.4.0"  # should be no greater than host CUDA version
-flavor = "devel"  #  includes full CUDA toolkit
+cuda_version = "12.4.0"  # Should be no greater than host CUDA version
+flavor = "devel"  #  Includes full CUDA toolkit
 operating_sys = "ubuntu22.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
@@ -26,8 +26,6 @@ image = (
         "librdmacm-dev",
         "libibumad-dev",
         "libpci-dev",
-        "libfabric-dev",
-        "libfabric-bin",
         "iproute2",
     )
     .run_commands(
@@ -59,25 +57,25 @@ LOGGING_DEBUG = False
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
 def infiniband_bandwidth_test():
-    """This health check runs a bi-directional RDMA bandwidth test using the perftest library. Node rank 0 is server and node rank 1 is client.
+    """Runs a bidirectional RDMA bandwidth test using the perftest library. Node rank 0 is server and node rank 1 is client.
     We create a Modal dict for storing the ip address of every RDMA device on the server. The client waits until the server has been populated with 8 items and then
     runs a ib_write_bw with the --bidirectional flag. Please note that one node is a 8xH200 DGX rack and not a single H200. We test the 8 devices on each node."""
 
-    # get current node rank
+    # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
     print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
     
-    # get local ib devices (sorted by device index from 0 to 7)
+    # Get local ib devices (sorted by device index from 0 to 7)
     local_ib_devices = get_local_ib_devices()
     print(f"[rank {container_rank}] Found {len(local_ib_devices)} local IB devices: {local_ib_devices}", flush=True)
     
     if container_rank == 0:
-        # only have the server clear the dict to prevent a race condition between the server and client
+        # Only have the server clear the dict to prevent a race condition between the server and client
         server_ip_dict.clear()
         print(f"[rank {container_rank}] Dict cleared", flush=True)
 
-        # get all RDMA network interfaces and their ipv4 addresses
+        # Get all RDMA network interfaces and their ipv4 addresses
         print(f"[rank {container_rank}] Getting IP addresses...", flush=True)
         ip_addr = subprocess.run(
             ["ip", "-j", "addr", "show"],
@@ -87,25 +85,25 @@ def infiniband_bandwidth_test():
         )
         ib_stat_json = json.loads(ip_addr.stdout)
         for device in ib_stat_json:
-            # only get devices that start with "gpu" such as "gpu0rdma0"
+            # Only get devices that start with "gpu" such as "gpu0rdma0"
             if device["ifname"].startswith("gpu"):
-                # get the device index (0->7) using regex exp to extract the first integer from the string
+                # Get the device index (0->7) using regex exp to extract the first integer from the string
                 idx = re.search(r'\d', device["ifname"]).group(0)
-                # extract the ipv4 address from the addr_info
+                # Extract the ipv4 address from the addr_info
                 ip_address = device["addr_info"][0]["local"]
-                # update dict with new key-value pair
+                # Update dict with new key-value pair
                 server_ip_dict[idx] = ip_address
         print(f"[rank {container_rank}] Dict now has {server_ip_dict.len()} entries", flush=True)
 
-        # spawn 8 background processes to listen for connections on each device
+        # Spawn 8 background processes to listen for connections on each device
         processes = []
         for idx, device in enumerate(local_ib_devices):
             port = BASE_PORT + idx
             print(f"[rank {container_rank}] Starting ib_write_bw server on device {device} port {port}", flush=True)
-            processes.append(run_ib_write_bw(device, port, None))
+            processes.append(run_ib_write_server(device, port))
         print(f"[rank {container_rank}] Started {len(processes)} server processes, waiting for them to complete...", flush=True)
 
-        # collect output from all server processes
+        # Collect output from all server processes
         results = []
         for i, process in enumerate(processes):
             print(f"[rank {container_rank}] Waiting for process {i} to complete...", flush=True)
@@ -113,46 +111,50 @@ def infiniband_bandwidth_test():
             for line in process.stdout:
                 results.append(line)
         
-        # optionally print the output from all ib_write_bw commands
+        # Optionally print the output from all ib_write_bw commands
         if LOGGING_DEBUG:
             print(f"[rank {container_rank}] {''.join(results)}", flush=True)
 
-        # aggregate statistics from all server processes
+        # Aggregate statistics from all server processes
         mean_bw_peak, mean_bw_avg = aggregate_statistics(results)
         print(f"[rank {container_rank}] Mean BW peak: {mean_bw_peak:.2f} Gb/s, Mean BW avg: {mean_bw_avg:.2f} Gb/s", flush=True)
 
     else:
-        # wait until server has finished populating the dict with 8 items
+        # Wait until server has finished populating the dict with 8 items
         print(f"[rank {container_rank}] Waiting for server to populate dict (need 8 entries)...", flush=True)
         while server_ip_dict.len() < 8:
             print(f"[rank {container_rank}] Dict has {server_ip_dict.len()} entries, waiting...", flush=True)
             time.sleep(2)
         print(f"[rank {container_rank}] Server dict ready, starting client connections...", flush=True)
         
-        # spawn 8 background processes to write to the server's devices
+        # Spawn 8 background processes to write to the server's devices
         processes = []
         for idx, device in enumerate(local_ib_devices):
             server_ip = server_ip_dict[str(idx)]
-            # assign each sender a unique ib_write_bw port to avoid conflicts
+            # Assign each sender a unique ib_write_bw port to avoid conflicts
             port = BASE_PORT + idx
             print(f"[rank {container_rank}] Connecting device {device} to server {server_ip}:{port}", flush=True)
-            processes.append(run_ib_write_bw(device, port, server_ip))
+            processes.append(run_ib_write_client(device, port, server_ip))
         
-        # wait for client processes to complete
+        # Wait for client processes to complete
         results = []
         for i, process in enumerate(processes):
             print(f"[rank {container_rank}] Waiting for client process {i} to complete...", flush=True)
             process.wait()
 
-# run ib_write_bw command with optional arg for server ip
-def run_ib_write_bw(device: str, port: int, server_ip: str | None = None) -> subprocess.Popen:
-    cmd = ["/usr/local/bin/ib_write_bw", "-d", device, "-p", str(port), "-R", "--report_gbits", "--bidirectional"] # bidirectional to test both direction
-    if server_ip is not None:
-        cmd.append(server_ip)
+# Run ib_write_bw command for server
+def run_ib_write_server(device: str, port: int) -> subprocess.Popen:
+    cmd = ["/usr/local/bin/ib_write_bw", "-d", device, "-p", str(port), "-R", "--report_gbits", "--bidirectional"] # Bidirectional to test both direction
     print(f"Running command: {' '.join(cmd)}", flush=True)
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-# get a sorted list of infiniband device names: "mlx5_0", "mlx5_1", etc.
+# Run ib_write_bw command for client with rank 0 IP as the server IP
+def run_ib_write_client(device: str, port: int, server_ip: str) -> subprocess.Popen:
+    cmd = ["/usr/local/bin/ib_write_bw", "-d", device, "-p", str(port), "-R", "--report_gbits", "--bidirectional", server_ip]
+    print(f"Running command: {' '.join(cmd)}", flush=True)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+# Get a sorted list of infiniband device names: "mlx5_0", "mlx5_1", etc.
 def get_local_ib_devices() -> list[str]:
     ib_devices = subprocess.run(
         ["ls", "/sys/class/infiniband/"],
@@ -160,7 +162,7 @@ def get_local_ib_devices() -> list[str]:
         text=True,
         check=True,
     )
-    devices = ib_devices.stdout.split("\n")[:-1] # trim the final new line character from the output
+    devices = ib_devices.stdout.split("\n")[:-1] # Trim the final new line character from the output
     return sorted(devices)
 
 # Returns the mean peak bandwidth and the mean bandwidth average across all devices in Gb/s.
@@ -170,7 +172,7 @@ def aggregate_statistics(results: list[str]) -> tuple[float, float]:
     
     for line in results:
         parts = line.split()
-        # results line has 5 columns: bytes, iterations, bw_peak, bw_avg, msg_rate
+        # Results line has 5 columns: bytes, iterations, bw_peak, bw_avg, msg_rate
         if len(parts) == 5:
             try:
                 bw_peak = float(parts[2])
