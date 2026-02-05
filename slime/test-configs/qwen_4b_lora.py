@@ -1,6 +1,6 @@
-"""Configuration for Qwen3-4B GRPO training (pass-through style)."""
+"""Configuration for Qwen3-4B GRPO training with LoRA (pass-through style)."""
 
-from .base import (
+from configs.base import (
     RLConfig,
     QWEN3_4B_MODEL_ARGS,
     DEFAULT_TRAINING_ARGS,
@@ -18,17 +18,24 @@ def get_config() -> RLConfig:
         # Modal settings
         n_nodes=1,
         gpu="H100:8",
-        app_name="slime-qwen3-4b",
+        app_name="slime-qwen3-4b-lora",
         sync=True,
 
         # Wandb
-        wandb_project="slime-grpo",
-        wandb_run_name_prefix="qwen3-4b-gsm8k",
+        wandb_project="slime-grpo-lora",
+        wandb_run_name_prefix="qwen3-4b-lora-gsm8k",
 
         # All slime args as raw CLI string
         slime_args=f"""
             # Model architecture
             {QWEN3_4B_MODEL_ARGS}
+
+            # PEFT/LoRA configuration
+            --peft-type lora
+            --lora-rank 32
+            --lora-alpha 32
+            --lora-dropout 0.0
+            --lora-target-modules linear_qkv linear_proj linear_fc1 linear_fc2
 
             # Training parallelism and optimization
             {DEFAULT_TRAINING_ARGS}
