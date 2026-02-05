@@ -72,6 +72,19 @@ def parse_args():
     return p.parse_args()
 
 
+def patch_disable_peft_filtering_for_full_checkpoints():
+    """
+    Disable PEFT filtering for checkpoint save.
+    This allows saving full checkpoints (Base + LoRA).
+    """
+    from megatron.bridge.training import checkpointing
+
+    def _pass_through_state_dict(state_dict, peft_config):
+        return state_dict
+
+    checkpointing.apply_peft_adapter_filter_to_state_dict = _pass_through_state_dict
+
+
 def main():
     args = parse_args()
 
@@ -104,6 +117,10 @@ def main():
 
     TransformerBlock.forward = _patched_transformer_forward
     print("[PEFT+Recompute FIX] Patched TransformerBlock.forward for gradient flow")
+
+    patch_disable_peft_filtering_for_full_checkpoints()
+    if rank == 0:
+        print("[PEFT] Full checkpoint saving enabled (Base + LoRA)")
 
     # LoRA config
     lora_config = LoRA(

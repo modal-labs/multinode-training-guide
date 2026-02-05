@@ -70,6 +70,11 @@ def parse_args():
         default=5,
         help="Number of validation iterations (default 5 to match training)",
     )
+    p.add_argument(
+        "--full_checkpoint",
+        action="store_true",
+        help="Load full checkpoint (Base + LoRA) from checkpoint_dir",
+    )
     return p.parse_args()
 
 
@@ -245,6 +250,9 @@ def main():
     with open(tracker_file, "r") as f:
         iteration = int(f.read().strip())
 
+    if args.full_checkpoint:
+        patch_disable_peft_filtering_entirely()
+
     # patch_peft_filter_to_use_name_matching()
     # patch_moe_expert_sharded_state_dict()
     # patch_checkpoint_load_with_logging()
@@ -254,6 +262,7 @@ def main():
     print("=" * 60)
     print(f"  Base model: {args.base_checkpoint}")
     print(f"  LoRA checkpoint: {args.checkpoint_dir}")
+    print(f"  Full checkpoint load: {args.full_checkpoint}")
     print(f"  Loading iteration: {iteration}")
     print(f"  Dataset: {args.preprocessed_dir}")
     print(f"  Eval iters: {args.eval_iters}")

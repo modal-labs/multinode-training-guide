@@ -509,6 +509,7 @@ def eval_lora(
         resolved_checkpoint_dir,
         "--base_checkpoint",
         MEGATRON_CHECKPOINT,
+        "--full_checkpoint",
         "--hf_model",
         HF_MODEL,
         "--context",
