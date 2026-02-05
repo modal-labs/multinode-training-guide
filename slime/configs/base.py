@@ -1,288 +1,213 @@
-"""Base configuration with defaults for SLIME GRPO training on Modal."""
+"""Base configuration for SLIME training on Modal.
 
-from dataclasses import dataclass, field, fields
+This module provides a simple pass-through config system that is decoupled from
+slime's internal argument structure. Configs just pass raw CLI args to slime.
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
-
-
-def _to_cli_args(obj, exclude: list[str] | None = None) -> list[str]:
-    """Convert dataclass fields to CLI args. Underscores become hyphens. Bools become flags."""
-    args = []
-    exclude = exclude or []
-    for f in fields(obj):
-        if f.name in exclude:
-            continue
-        val = getattr(obj, f.name)
-        flag = f"--{f.name.replace('_', '-')}"
-        if val is None:
-            continue
-        elif isinstance(val, bool):
-            if val:
-                args.append(flag)
-        else:
-            args.append(f"{flag} {val}")
-    return args
-
-
-@dataclass
-class ModelArchitectureConfig:
-    """Model architecture parameters."""
-    num_layers: int
-    hidden_size: int
-    ffn_hidden_size: int
-    num_attention_heads: int
-    num_query_groups: Optional[int] = None  # For GQA models
-    vocab_size: int = 151936
-    make_vocab_size_divisible_by: Optional[int] = None  # e.g., 64
-    rotary_base: Optional[int] = None
-    norm_epsilon: float = 1e-6
-    kv_channels: Optional[int] = None
-    normalization: str = "RMSNorm"
-    swiglu: bool = True
-    group_query_attention: bool = True
-    position_embedding_type: Optional[str] = None  # "rope" for rotary
-    no_position_embedding: bool = False  # Use with position_embedding_type=rope
-    use_rotary_position_embeddings: bool = True
-    no_rope_fusion: bool = False  # Disable rope fusion kernel
-    disable_bias_linear: bool = True
-    add_qkv_bias: bool = False
-    qk_layernorm: bool = False
-    untie_embeddings_and_output_weights: bool = False  # True when HF tie_word_embeddings=false
-    # MLA (Multi-Latent Attention) - for DeepSeek-V2/V3, GLM-4.7-Flash style models
-    multi_latent_attention: bool = False
-    q_lora_rank: Optional[int] = None
-    kv_lora_rank: Optional[int] = None
-    qk_head_dim: Optional[int] = None  # qk_nope_head_dim
-    v_head_dim: Optional[int] = None
-    qk_pos_emb_head_dim: Optional[int] = None  # qk_rope_head_dim
-    # MoE (Mixture of Experts)
-    moe_layer_freq: Optional[str] = None  # e.g., "[0]*1+[1]*46" for 1 dense + 46 MoE
-    num_experts: Optional[int] = None
-    moe_shared_expert_intermediate_size: Optional[int] = None
-    moe_router_topk: Optional[int] = None  # num_experts_per_tok
-    moe_grouped_gemm: bool = False
-    moe_permute_fusion: bool = False
-    moe_ffn_hidden_size: Optional[int] = None
-    moe_router_score_function: Optional[str] = None  # e.g., "sigmoid"
-    moe_router_pre_softmax: bool = False
-    moe_router_enable_expert_bias: bool = False
-    moe_router_bias_update_rate: Optional[int] = None
-    moe_router_load_balancing_type: Optional[str] = None  # e.g., "seq_aux_loss"
-    moe_router_topk_scaling_factor: Optional[float] = None
-    moe_aux_loss_coeff: Optional[float] = None
-    moe_router_dtype: Optional[str] = None  # e.g., "fp32"
-    moe_token_dispatcher_type: Optional[str] = None  # e.g., "flex"
-    moe_enable_deepep: bool = False
-
-    def to_args(self) -> str:
-        return " ".join(_to_cli_args(self))
-
-
-@dataclass
-class MegatronConfig:
-    """Megatron training settings - parallelism, batching, optimizer."""
-    # Parallelism
-    tensor_model_parallel_size: int = 1  # Split model horizontally across GPUs (TP)
-    pipeline_model_parallel_size: int = 1  # Split model layers across GPUs (PP)
-    context_parallel_size: int = 1  # Parallelism for long sequences
-    expert_model_parallel_size: int = 1  # MoE: split experts across GPUs
-    expert_tensor_parallel_size: Optional[int] = None  # MoE: TP within each expert
-    sequence_parallel: bool = True  # Reduce activation memory
-    decoder_last_pipeline_num_layers: Optional[int] = None  # For uneven PP splits
-    # Batching
-    max_tokens_per_gpu: int = 9216  # Micro-batch size in tokens
-    use_dynamic_batch_size: bool = True  # Variable batch sizes based on sequence lengths
-    global_batch_size: int = 256  # Total batch size across all GPUs
-    # Optimizer
-    optimizer: str = "adam"
-    lr: float = 1e-6
-    lr_decay_style: str = "constant"
-    weight_decay: float = 0.1
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.98
-    # Misc
-    attention_dropout: float = 0.0
-    hidden_dropout: float = 0.0
-    attention_backend: Optional[str] = None  # "flash" - but don't use with MLA models
-    megatron_to_hf_mode: str = "bridge"
-    # Recompute (memory optimization)
-    recompute_granularity: Optional[str] = None  # "full" or "selective"
-    recompute_method: Optional[str] = None  # "uniform" or "block"
-    recompute_num_layers: Optional[int] = None
-    # Optimizer offload (CPU offload for large models)
-    optimizer_cpu_offload: bool = False
-    overlap_cpu_optimizer_d2h_h2d: bool = False
-    use_precision_aware_optimizer: bool = False
-
-    def to_args(self) -> str:
-        return " ".join([
-            *_to_cli_args(self),
-            "--accumulate-allreduce-grads-in-fp32",
-            "--attention-softmax-in-fp32",
-        ])
-
-
-@dataclass
-class SGLangConfig:
-    """SGLang inference engine settings - parallelism, memory, generation."""
-    # Parallelism
-    rollout_num_gpus_per_engine: Optional[int] = None  # TP size - GPUs per engine
-    sglang_dp_size: Optional[int] = None  # DP size - data parallel within engine
-    sglang_data_parallel_size: Optional[int] = None  # Alias for sglang_dp_size (older name)
-    sglang_pipeline_parallel_size: Optional[int] = None  # PP size - pipeline parallel
-    sglang_expert_parallel_size: Optional[int] = None  # EP size - expert parallel (MoE)
-    # Memory
-    sglang_mem_fraction_static: float = 0.7  # Fraction of GPU memory for KV cache
-    # Generation
-    rollout_batch_size: int = 32  # Prompts per inference batch
-    n_samples_per_prompt: int = 8  # Responses to generate per prompt
-    rollout_max_response_len: int = 1024  # Max tokens to generate
-    rollout_temperature: float = 1.0  # Sampling temperature
-    # Advanced features
-    sglang_enable_dp_attention: bool = False
-    sglang_enable_dp_lm_head: bool = False
-    sglang_moe_dense_tp_size: Optional[int] = None
-    sglang_tool_call_parser: Optional[str] = None
-    sglang_reasoning_parser: Optional[str] = None
-    # Speculative decoding
-    sglang_speculative_algorithm: Optional[str] = None  # e.g., "EAGLE"
-    sglang_speculative_num_steps: Optional[int] = None
-    sglang_speculative_eagle_topk: Optional[int] = None
-    sglang_speculative_num_draft_tokens: Optional[int] = None
-    # Performance tuning
-    sglang_cuda_graph_max_bs: Optional[int] = None
-    sglang_max_running_requests: Optional[int] = None
-    sglang_disable_cuda_graph: bool = False
-
-    def to_args(self) -> str:
-        return " ".join([*_to_cli_args(self), "--sglang-enable-metrics"])
-
-
-@dataclass
-class OrchestrationConfig:
-    """Cluster allocation, colocation, and run settings."""
-    # Actor (training) GPU allocation
-    actor_num_nodes: int = 2
-    actor_num_gpus_per_node: int = 8 # overrides num_gpus_per_node
-    # Critic (for PPO, None for GRPO)
-    critic_num_nodes: Optional[int] = None
-    critic_num_gpus_per_node: Optional[int] = None
-    # Rollout GPU allocation
-    rollout_num_gpus: Optional[int] = None  # Total GPUs for rollout (defaults to actor GPUs)
-    num_gpus_per_node: int = 8
-    # Colocation (training and rollout share GPUs)
-    colocate: bool = False
-    offload: bool = False
-    offload_train: Optional[bool] = None
-    offload_rollout: Optional[bool] = None
-    # Run settings
-    num_rollout_infinite: int = 3000  # Rollout batches for infinite runs
-    num_rollout_default: int = 250  # Rollout batches for default runs
-    over_sampling_batch_size: int = None  # Oversampling buffer size
-
-    def to_args(self, data_path, is_infinite_run: bool) -> str:
-        num_rollout = self.num_rollout_infinite if is_infinite_run else self.num_rollout_default
-        return " ".join([
-            f"--prompt-data {data_path}/gsm8k/train.parquet",
-            "--input-key messages --label-key label --apply-chat-template --rollout-shuffle --rm-type math",
-            f"--num-rollout {num_rollout}",
-            "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std",
-            *_to_cli_args(self, exclude=["num_rollout_infinite", "num_rollout_default"]),
-        ])
-
-
-@dataclass
-class GRPOConfig:
-    """GRPO algorithm settings."""
-    advantage_estimator: str = "grpo"
-    use_kl_loss: bool = True
-    kl_loss_coef: float = 0.00
-    kl_loss_type: str = "low_var_kl"
-    kl_coef: float = 0.00  # Separate from kl_loss_coef
-    entropy_coef: float = 0.00
-    eps_clip: float = 0.2
-    eps_clip_high: float = 0.28
-
-    def to_args(self) -> str:
-        return " ".join(_to_cli_args(self))
-
-
-@dataclass
-class EvalConfig:
-    """Evaluation settings."""
-    eval_interval: int = 20
-    n_samples_per_eval_prompt: int = 1
-    eval_max_response_len: int = 1024
-    eval_top_k: Optional[int] = None
-    eval_temperature: Optional[float] = None
-    eval_top_p: Optional[float] = None
-
-    def to_args(self, data_path) -> str:
-        return " ".join([f"--eval-prompt-data gsm8k {data_path}/gsm8k/test.parquet", *_to_cli_args(self)])
-
-
-@dataclass
-class CIConfig:
-    """CI and testing settings."""
-    ci_test: bool = True
-    ci_disable_kl_checker: bool = True
-    ci_metric_checker_key: str = "eval/gsm8k"
-    ci_metric_checker_threshold: float = 0.55
-
-    def to_args(self) -> str:
-        return " ".join(_to_cli_args(self))
+import textwrap
 
 
 @dataclass
 class RLConfig:
-    """Main RL training configuration."""
-    
-    # Model
+    """Minimal config - just metadata and raw args passthrough.
+
+    This config is intentionally simple and decoupled from slime's internal
+    argument structure. It passes raw CLI args directly to slime without
+    parsing or validation, making it robust to slime version changes.
+    """
+
+    # Required metadata
     model_name: str
-    model_org: str = "Qwen"
-    
-    # Nested configs
-    architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
-    training: MegatronConfig = field(default_factory=MegatronConfig)
-    sglang: SGLangConfig = field(default_factory=SGLangConfig)
-    orchestration: OrchestrationConfig = field(default_factory=OrchestrationConfig)
-    grpo: GRPOConfig = field(default_factory=GRPOConfig)
-    eval: EvalConfig = field(default_factory=EvalConfig)
-    ci: CIConfig = field(default_factory=CIConfig)
-    
-    # Modal
+    model_id: str  # HuggingFace model ID (e.g., "Qwen/Qwen3-4B")
+
+    # Modal settings
     app_name: str = "slime-grpo"
     n_nodes: int = 4
-    gpu: str = "H100:8"  # Modal GPU spec (e.g., "H100:8", "A100:4")
-    
+    gpu: str = "H100:8"
+
+    # Training mode
+    sync: bool = True
+
     # Wandb
     wandb_project: str = "slime-grpo"
     wandb_run_name_prefix: str = ""
-    
-    # Training mode
-    sync: bool = True
-    
-    # Extra args passthrough (for any slime arg not in configs)
+
+    # Raw CLI args - passed directly to slime, no parsing/validation
+    # Use triple-quoted strings for readability with comments
+    slime_args: str = ""
+
+    # Extra args that get appended (for easy overrides)
     extra_args: list[str] = field(default_factory=list)
-    
-    @property
-    def model_id(self) -> str:
-        return f"{self.model_org}/{self.model_name}"
-    
+
     @property
     def train_script(self) -> str:
         return "slime/train.py" if self.sync else "slime/train_async.py"
-    
-    def generate_train_args(self, models_path, data_path, is_infinite_run: bool) -> str:
-        args = [
-            f"--hf-checkpoint {models_path}/{self.model_name}/ --ref-load {models_path}/{self.model_name}/",
-            self.architecture.to_args(),
-            self.training.to_args(),
-            self.sglang.to_args(),
-            self.orchestration.to_args(data_path, is_infinite_run),
-            self.grpo.to_args(),
-            self.eval.to_args(data_path),
-            self.ci.to_args(),
-        ]
-        if self.extra_args:
-            args.extend(self.extra_args)
-        return " ".join(args)
+
+    def _clean_args(self, args: str) -> str:
+        """Clean up arg string: remove comments, normalize whitespace."""
+        lines = []
+        for line in args.split("\n"):
+            # Remove comments
+            if "#" in line:
+                line = line[:line.index("#")]
+            line = line.strip()
+            if line:
+                lines.append(line)
+        return " ".join(lines)
+
+    def generate_train_args(self, models_path: Path, data_path: Path, is_infinite_run: bool) -> str:
+        """Generate full command line args for slime."""
+        # Base args that are always needed (no trailing slash - transformers 5.x doesn't like it)
+        base_args = f"--hf-checkpoint {models_path}/{self.model_name} --ref-load {models_path}/{self.model_name}"
+
+        # Add prompt data path (config should include --prompt-data with placeholder or we add default)
+        # Replace {data_path} placeholder if present in slime_args
+        cleaned_slime_args = self._clean_args(self.slime_args)
+        cleaned_slime_args = cleaned_slime_args.replace("{data_path}", str(data_path))
+        cleaned_slime_args = cleaned_slime_args.replace("{models_path}", str(models_path))
+
+        extra = " ".join(self.extra_args) if self.extra_args else ""
+
+        return f"{base_args} {cleaned_slime_args} {extra}".strip()
+
+
+# Common arg templates for convenience
+QWEN3_4B_MODEL_ARGS = """
+    --num-layers 36 --hidden-size 2560 --ffn-hidden-size 9728
+    --num-attention-heads 32 --group-query-attention --num-query-groups 8
+    --kv-channels 128 --vocab-size 151936
+    --normalization RMSNorm --norm-epsilon 1e-6 --swiglu
+    --disable-bias-linear --qk-layernorm
+    --use-rotary-position-embeddings --rotary-base 1000000
+"""
+
+QWEN3_0_5B_MODEL_ARGS = """
+    --num-layers 24 --hidden-size 1024 --ffn-hidden-size 3072
+    --num-attention-heads 16 --group-query-attention --num-query-groups 8
+    --kv-channels 64 --vocab-size 151936
+    --normalization RMSNorm --norm-epsilon 1e-6 --swiglu
+    --disable-bias-linear --qk-layernorm
+    --use-rotary-position-embeddings --rotary-base 1000000
+"""
+
+DEFAULT_TRAINING_ARGS = """
+    --tensor-model-parallel-size 2 --sequence-parallel
+    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
+    --use-dynamic-batch-size --max-tokens-per-gpu 9216
+    --megatron-to-hf-mode bridge
+    --attention-dropout 0.0 --hidden-dropout 0.0
+    --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
+"""
+
+DEFAULT_OPTIMIZER_ARGS = """
+    --optimizer adam
+    --lr 1e-6 --lr-decay-style constant
+    --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98
+"""
+
+DEFAULT_GRPO_ARGS = """
+    --advantage-estimator grpo
+    --use-kl-loss --kl-loss-coef 0.00 --kl-loss-type low_var_kl
+    --entropy-coef 0.00
+    --eps-clip 0.2 --eps-clip-high 0.28
+"""
+
+DEFAULT_DATA_ARGS = """
+    --input-key messages --label-key label
+    --apply-chat-template --rollout-shuffle --rm-type math
+"""
+
+# GLM-4.7 (358B MoE) model architecture args
+# Based on: https://huggingface.co/zai-org/GLM-4.7/blob/main/config.json
+GLM_4_7_MODEL_ARGS = """
+    --num-layers 92 --hidden-size 5120 --ffn-hidden-size 12288
+    --num-attention-heads 96 --group-query-attention --num-query-groups 8
+    --kv-channels 128 --vocab-size 151552
+    --normalization RMSNorm --norm-epsilon 1e-5 --swiglu
+    --add-qkv-bias --qk-layernorm
+    --untie-embeddings-and-output-weights
+    --use-rotary-position-embeddings --rotary-base 1000000
+    --num-experts 160
+    --moe-layer-freq "[0]*3+[1]*89"
+    --moe-shared-expert-intermediate-size 1536
+    --moe-router-topk 8
+    --moe-grouped-gemm --moe-permute-fusion
+    --moe-ffn-hidden-size 1536
+    --moe-router-score-function sigmoid
+    --moe-router-pre-softmax
+    --moe-router-enable-expert-bias
+    --moe-router-bias-update-rate 0
+    --moe-router-load-balancing-type seq_aux_loss
+    --moe-router-topk-scaling-factor 2.5
+    --moe-aux-loss-coeff 0
+    --moe-router-dtype fp32
+    --moe-token-dispatcher-type flex
+    --moe-enable-deepep
+"""
+
+# GLM-4.7-Flash (30B MoE with MLA) model architecture args
+# Based on: scripts/models/glm4.7-30B-A3B.sh
+GLM_4_7_FLASH_MODEL_ARGS = """
+    --num-layers 47 --hidden-size 2048 --ffn-hidden-size 10240
+    --num-attention-heads 20 --vocab-size 154880
+    --make-vocab-size-divisible-by 64
+    --normalization RMSNorm --norm-epsilon 1e-5 --swiglu
+    --disable-bias-linear --add-qkv-bias --qk-layernorm
+    --untie-embeddings-and-output-weights
+    --position-embedding-type rope --no-position-embedding
+    --use-rotary-position-embeddings --rotary-base 1000000 --no-rope-fusion
+    --multi-latent-attention
+    --q-lora-rank 768 --kv-lora-rank 512
+    --qk-head-dim 192 --v-head-dim 256 --kv-channels 192
+    --qk-pos-emb-head-dim 64
+    --num-experts 64
+    --moe-layer-freq "[0]*1+[1]*46"
+    --moe-shared-expert-intermediate-size 1536
+    --moe-router-topk 4
+    --moe-grouped-gemm --moe-permute-fusion
+    --moe-ffn-hidden-size 1536
+    --moe-router-score-function sigmoid
+    --moe-router-pre-softmax
+    --moe-router-enable-expert-bias
+    --moe-router-bias-update-rate 0
+    --moe-router-load-balancing-type aux_loss
+    --moe-router-topk-scaling-factor 1.8
+    --moe-aux-loss-coeff 0
+    --moe-router-dtype fp32
+    --moe-token-dispatcher-type flex
+    --moe-enable-deepep
+"""
+
+# GLM training args with MoE parallelism
+GLM_4_7_TRAINING_ARGS = """
+    --tensor-model-parallel-size 8 --pipeline-model-parallel-size 4
+    --context-parallel-size 2
+    --expert-model-parallel-size 16 --expert-tensor-parallel-size 1
+    --sequence-parallel
+    --decoder-last-pipeline-num-layers 23
+    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
+    --use-dynamic-batch-size --max-tokens-per-gpu 16384
+    --megatron-to-hf-mode bridge
+    --attention-dropout 0.0 --hidden-dropout 0.0
+    --attention-backend flash
+    --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d
+    --use-precision-aware-optimizer
+"""
+
+GLM_4_7_FLASH_TRAINING_ARGS = """
+    --tensor-model-parallel-size 4 --pipeline-model-parallel-size 2
+    --context-parallel-size 2
+    --expert-model-parallel-size 8 --expert-tensor-parallel-size 1
+    --sequence-parallel
+    --decoder-last-pipeline-num-layers 23
+    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
+    --use-dynamic-batch-size --max-tokens-per-gpu 32768
+    --megatron-to-hf-mode bridge
+    --attention-dropout 0.0 --hidden-dropout 0.0
+    --attention-backend flash
+    --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d
+    --use-precision-aware-optimizer
+"""
