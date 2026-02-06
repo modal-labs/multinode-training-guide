@@ -4,7 +4,7 @@ Health checking inter-node communication over GCP's RoCE v2 and AWS's EFA.
 
 ## EFA vs InfiniBand
 
-**EFA (Elastic Fabric Adapter)**: AWS-specific RDMA implementation using libfabric API.
+**EFA (Elastic Fabric Adapter)**: AWS-specific RDMA implementation using libfabric API and Ethernet.
 
 **InfiniBand/RoCE**: Standard RDMA using IB Verbs API. Available on GCP with NVIDIA Mellanox ConnectX NICs.
 
@@ -19,14 +19,14 @@ Health checking inter-node communication over GCP's RoCE v2 and AWS's EFA.
 **2 x 8 x H200, multi-node:**
 
 ```bash
-modal run modal_rdma_bw_ib.py::main
+modal run modal_bw_ib.py
 ```
 
 ### Sample Output
 ```
 [rank 0] Mean BW peak: 734.26 Gb/s, Mean BW avg: 733.92 Gb/s
 ```
-Ensure a mean bi-directional bandwidth close to 800gb/s.
+Ensure a mean bidirectional bandwidth close to 800gb/s.
 
 ## EFA Test
 
@@ -55,3 +55,21 @@ modal run modal_pingpong_efa.py
 ```
 
 Ensure there are packets being #sent and #ack. 
+
+## EFA Bandwidth Test
+
+**2 x 8 x H100, multi-node:**
+
+Tests GPU Direct RDMA where data travels from the GPU VRAM to the NIC without a host cudaMemcpy.
+
+**Usage:**
+
+```bash
+modal run modal_bw_efa.py
+```
+
+### Sample Output
+```
+[rank 0] Total BW: 278GB/s
+```
+Ensure a total bidirectional bandwidth between 200 and 400 GB/s.
