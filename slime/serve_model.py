@@ -24,7 +24,7 @@ vllm_image = (
 # Point to your trained checkpoint
 # After training, checkpoints are saved to /models/{model_name}/checkpoints/
 # Check your volume to find the exact path
-MODEL_PATH = "/models/Qwen3-4B-singlenode-20260206-170445/iter_0000004-hf"  # Update this!
+MODEL_PATH = "/models/Qwen3-4B"  # Update this!
 MODEL_NAME = "slime-qwen"
 N_GPU = 1
 MINUTES = 60

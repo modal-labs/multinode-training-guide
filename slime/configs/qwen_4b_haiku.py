@@ -46,7 +46,7 @@ def get_config() -> RLConfig:
             # Custom reward model - SLIME may support this pattern
             # Check SLIME docs for exact flag name
             --rm-type remote_rm
-            --rm-url https://modal-labs-joy-dev--llm-judge-reward-model-llmjudge-score.modal.run
+            --rm-url https://modal-labs-joy-dev--llm-judge-reward-model-llmjudgeflash.us-east.modal.direct
 
             --num-rollout 2
             --rollout-batch-size 16

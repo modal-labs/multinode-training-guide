@@ -89,7 +89,7 @@ DATA_PATH: Path = Path("/data")
 MODELS_PATH: Path = Path("/models")
 
 # Volumes
-data_volume: modal.Volume = modal.Volume.from_name("grpo-slime-example-data", create_if_missing=True)
+data_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-data", create_if_missing=True)
 checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints", create_if_missing=True)
 
 # Ray configuration
@@ -277,10 +277,6 @@ async def run_training(
     await checkpoints_volume.commit.aio()
     print("Checkpoints saved and committed to volume")
 
-    checkpoint_dir = MODELS_PATH / experiment_name
-    origin_hf_dir = MODELS_PATH / config.model_name
-
-
         
 
 
@@ -331,14 +327,10 @@ def prepare_dataset():
 
     data_volume.reload()
     
-    # Load the haiku dataset
     ds = load_dataset("statworx/haiku")
     
-    # Transform the dataset to match the expected format
-    # prompt: "Write me a haiku about {keyword}"
-    # expected response: the haiku text
     def transform_example(example):
-        question = f"Write me a haiku about {example['keyword']}"
+        question = f"Write me a haiku about {example['keywords']}"
         answer = example["text"]
         return {
             "question": question,
@@ -355,9 +347,15 @@ def prepare_dataset():
             ]
         }
     
-    # Apply transformation to both splits
-    train_transformed = ds["train"].map(transform_example, remove_columns=["keyword"])
-    test_transformed = ds["test"].map(transform_example, remove_columns=["keyword"])
+    # this dataset only has "train", but no "test", so we manually split out the last 20% of the train dataset as test
+    # and remove them from the train dataset
+    test_size = int(len(ds["train"]) * 0.2)
+    test_ds = ds["train"].select(range(len(ds["train"]) - test_size, len(ds["train"])))
+    ds["train"] = ds["train"].select(range(test_size))
+    ds["test"] = test_ds
+    
+    train_transformed = ds["train"].map(transform_example, remove_columns=["keywords"])
+    test_transformed = ds["test"].map(transform_example, remove_columns=["keywords"])
     
     # Save as parquet
     train_transformed.to_parquet(f"{DATA_PATH}/haiku/train.parquet")
@@ -368,8 +366,8 @@ def prepare_dataset():
     print(f"Train examples: {len(train_transformed)}")
     print(f"Test examples: {len(test_transformed)}")
     print("\nExample:")
-    print(f"Prompt: {train_transformed[0]['prompt']}")
-    print(f"Text: {train_transformed[0]['text']}")
+    print(f"Prompt: {train_transformed[0]['question']}")
+    print(f"Text: {train_transformed[0]['label']}")
 
 
 @app.local_entrypoint()
@@ -419,8 +417,8 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     model_short = cfg.model_name.split("/")[-1]
     experiment_name = f"{model_short}-multinode-{timestamp}"
 
-    checkpoints_volume.reload()
-    data_volume.reload()
+    await checkpoints_volume.reload.aio()
+    await data_volume.reload.aio()
 
     cluster_info = modal.experimental.get_cluster_info()
     print(f"Rank: {cluster_info.rank}, task id: {os.environ['MODAL_TASK_ID']}")
@@ -478,7 +476,7 @@ async def train_single_node(config: str = "qwen-0.5b-sync", num_rollout: Optiona
     experiment_name = f"{model_short}-singlenode-{timestamp}"
 
     await checkpoints_volume.reload.aio()
-    data_volume.reload()
+    await data_volume.reload.aio()
 
     _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
 
