@@ -54,42 +54,38 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
 # Shared Prompt Template
 # =============================================================================
 
-# TODO(joy): better prompt
-HAIKU_JUDGE_PROMPT = """You are a haiku poetry critic. Rate the following haiku response on a scale of 0-10.
+def generate_haiku_judge_prompt(prompt: str, response: str) -> str:
+    return f"""You are evaluating a haiku poem. Analyze the response step-by-step, then provide a score.
 
-A haiku is a three-line poem that follows a specific syllable pattern: 5-7-5.
+    A haiku has three lines with a 5-7-5 syllable pattern, separated by '/'.
 
-========================================
-Correctness (5 points total):
-========================================
-- Count the number of lines in the response, delimited by '/'. If the response contains three lines, score 3 points.
-- Find the first line of the Haiku. If the first line exists and has 5 syllables, score 1 points.
-- Find the second line of the Haiku. If the second line exists and has 7 syllables, score 1 points.
-- Find the third line of the Haiku. If the third line exists and has 5 syllables, score 1 points.
-Add up the points for each line. The total score is the sum of the points for each line.
-========================================
-On topic (3 points total):
-========================================
+    ## Evaluation Criteria
 
-- Check if the response about the user request on topic {prompt}.
-- If it is, score 3 points.
-- If it is not, score 0 points.
+    ### Structure (8 points)
+    - 2 points: Exactly 3 lines (separated by '/')
+    - 2 point: First line is approximately 5 syllables
+    - 2 point: Second line is approximately 7 syllables
+    - 2 point: Third line is approximately 5 syllables
+    (Note: Syllable counting is approximate—focus on whether lines feel short/long/medium)
 
-========================================
-Style and creativity (2 points total):
-========================================
-- Rate the style and creativity of the haiku on a scale of 0-2.
-========================================
+    ### Relevance (1 point)
+    - 1 points: Addresses the topic "{prompt}"
+    - 0 points: Does not address the topic "{prompt}"
 
+    ### Poetic Quality (1 point)
+    - 1 points: Is considered a poem that evokes meaning and emotion
+    - 0 points: No poetic merit
 
-Add up the points for each line. The total score is the sum of the points for each line.
+    Add up the points for each line. The total score is the sum of the points for each line.
 
+    --
+    **Topic:** {prompt}
 
-User request: {prompt}
+    **Response to evaluate:**
+    {response}
+    ---
 
-Response: {response}
-
-Output ONLY a single number (0-10), nothing else."""
+    Output ONLY a single number (0-10), nothing else."""
 
 
 # =============================================================================
@@ -104,7 +100,7 @@ async def score_single(
     response: str,
 ) -> float:
     """Score a single response using Claude."""
-    judge_prompt = HAIKU_JUDGE_PROMPT.format(prompt=prompt, response=response)
+    judge_prompt = generate_haiku_judge_prompt(prompt, response)
 
     try:
         async with session.post(
