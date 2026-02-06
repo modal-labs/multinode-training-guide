@@ -433,7 +433,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     _init_ray(cluster_info.rank, ray_main_node_addr, my_ip_addr, n_nodes)
 
     if cluster_info.rank == 0:
-        with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
+        async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
             print(f"Dashboard URL: {tunnel.url}")
             await run_training(cfg, n_nodes, ray_main_node_addr, experiment_name)
     else:
