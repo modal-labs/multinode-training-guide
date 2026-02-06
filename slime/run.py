@@ -5,6 +5,9 @@ Run SLIME GRPO training on Modal.
 Usage:
     modal run run.py --config glm-4-7
     modal run run.py --config glm-4-7 --gpu-name H100 --gpu-count 8 --nodes 4
+    modal run run.py --config qwen-4b --slime-args "--eval-interval 5 --rollout-batch-size 64"
+    modal run run.py --config qwen-4b --slime-args-file /data/experiment_override.args
+    modal run run.py --config qwen-4b --train-script slime/train.py
 """
 
 import os
@@ -65,10 +68,22 @@ def main(
     gpu_name: Optional[str] = None,
     gpu_count: Optional[int] = None,
     nodes: Optional[int] = None,
+    slime_args: Optional[str] = None,
+    slime_args_file: Optional[str] = None,
+    train_script: Optional[str] = None,
 ):
     print(f"Config:  {config}")
     print(f"App:     {os.environ['APP_NAME']}")
     print(f"GPU:     {os.environ['GPU_NAME']}:{os.environ['GPU_COUNT']}")
     print(f"Nodes:   {os.environ['NUM_NODES']}")
+    if train_script:
+        print(f"Script:  {train_script}")
+    if slime_args_file:
+        print(f"Args file: {slime_args_file}")
 
-    train_multi_node.remote(config)
+    train_multi_node.remote(
+        config,
+        slime_args=slime_args or "",
+        slime_args_file=slime_args_file or "",
+        train_script=train_script or "",
+    )

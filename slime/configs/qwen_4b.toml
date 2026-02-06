@@ -1,0 +1,14 @@
+model_id = "Qwen/Qwen3-4B-Instruct-2507"
+model_args_script = "qwen3-4B-Instruct-2507.sh"
+
+app_name = "slime-grpo-qwen-4b-async-1replica-train-staticmem0.9-bs8192-4gpus-maxresponse2048"
+wandb_run_name_prefix = "async-qwen-3-4b-instruct-gsm8k--train-1replica-staticmem0.9-bs8192-4gpus-maxresponse2048"
+
+n_nodes = 2
+gpu = "H100:2"
+sync = false
+
+args_files = [
+  "args/common/defaults.args",
+  "args/variants/qwen_4b.args",
+]

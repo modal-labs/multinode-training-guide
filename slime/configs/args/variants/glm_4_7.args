@@ -1,0 +1,45 @@
+# GLM-4.7 (358B) runtime/training settings
+--tensor-model-parallel-size 8
+--pipeline-model-parallel-size 4
+--context-parallel-size 2
+--expert-model-parallel-size 16
+--expert-tensor-parallel-size 1
+--decoder-last-pipeline-num-layers 23
+--max-tokens-per-gpu 16384
+--global-batch-size 512
+--attention-backend flash
+--recompute-granularity full
+--recompute-method uniform
+--recompute-num-layers 1
+--optimizer-cpu-offload
+--overlap-cpu-optimizer-d2h-h2d
+--use-precision-aware-optimizer
+
+--rollout-num-gpus-per-engine 8
+--sglang-dp-size 4
+--sglang-mem-fraction-static 0.85
+--rollout-batch-size 64
+--rollout-max-response-len 16384
+--sglang-enable-dp-attention
+--sglang-enable-dp-lm-head
+--sglang-moe-dense-tp-size 1
+--sglang-cuda-graph-max-bs 32
+--sglang-max-running-requests 256
+--sglang-speculative-algorithm EAGLE
+--sglang-speculative-num-steps 2
+--sglang-speculative-eagle-topk 1
+--sglang-speculative-num-draft-tokens 3
+
+--actor-num-nodes 8
+--actor-num-gpus-per-node 8
+--rollout-num-gpus 32
+
+--n-samples-per-eval-prompt 2
+--eval-max-response-len 16384
+--eval-top-k 1
+--eval-temperature 0.6
+--eval-top-p 0.95
+
+# Upstream glm4.5 model args defaults are adapted to local behavior.
+--moe-token-dispatcher-type flex
+--moe-enable-deepep

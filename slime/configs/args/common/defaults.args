@@ -1,0 +1,67 @@
+# Baseline SLIME args equivalent to legacy local defaults.
+
+# Data / rollout defaults
+--prompt-data /data/gsm8k/train.parquet
+--input-key messages
+--label-key label
+--apply-chat-template
+--rollout-shuffle
+--rm-type math
+--num-rollout 250
+--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+
+# Cluster allocation defaults
+--actor-num-nodes 2
+--actor-num-gpus-per-node 8
+--num-gpus-per-node 8
+
+# Megatron defaults
+--tensor-model-parallel-size 1
+--pipeline-model-parallel-size 1
+--context-parallel-size 1
+--expert-model-parallel-size 1
+--sequence-parallel
+--max-tokens-per-gpu 9216
+--use-dynamic-batch-size
+--global-batch-size 256
+--optimizer adam
+--lr 1e-6
+--lr-decay-style constant
+--weight-decay 0.1
+--adam-beta1 0.9
+--adam-beta2 0.98
+--attention-dropout 0.0
+--hidden-dropout 0.0
+--megatron-to-hf-mode bridge
+--accumulate-allreduce-grads-in-fp32
+--attention-softmax-in-fp32
+
+# SGLang defaults
+--sglang-mem-fraction-static 0.7
+--rollout-batch-size 32
+--n-samples-per-prompt 8
+--rollout-max-response-len 1024
+--rollout-temperature 1.0
+--sglang-enable-metrics
+
+# GRPO defaults
+--advantage-estimator grpo
+--use-kl-loss
+--kl-loss-coef 0.00
+--kl-loss-type low_var_kl
+--kl-coef 0.00
+--entropy-coef 0.00
+--eps-clip 0.2
+--eps-clip-high 0.28
+
+# Eval defaults
+--eval-prompt-data gsm8k /data/gsm8k/test.parquet
+--eval-interval 20
+--n-samples-per-eval-prompt 1
+--eval-max-response-len 1024
+
+# CI defaults
+--ci-test
+--ci-disable-kl-checker
+--ci-metric-checker-key eval/gsm8k
+--ci-metric-checker-threshold 0.55

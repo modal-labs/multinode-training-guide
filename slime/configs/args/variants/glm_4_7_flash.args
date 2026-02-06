@@ -1,0 +1,40 @@
+# GLM-4.7-Flash runtime/training settings
+--tensor-model-parallel-size 4
+--pipeline-model-parallel-size 2
+--context-parallel-size 2
+--expert-model-parallel-size 8
+--expert-tensor-parallel-size 1
+--decoder-last-pipeline-num-layers 23
+--recompute-granularity full
+--recompute-method uniform
+--recompute-num-layers 1
+--max-tokens-per-gpu 32768
+--global-batch-size 1024
+--attention-backend flash
+--optimizer-cpu-offload
+--overlap-cpu-optimizer-d2h-h2d
+--use-precision-aware-optimizer
+
+--rollout-num-gpus-per-engine 8
+--sglang-dp-size 8
+--sglang-mem-fraction-static 0.8
+--sglang-enable-dp-attention
+--sglang-enable-dp-lm-head
+--sglang-moe-dense-tp-size 1
+--sglang-speculative-algorithm EAGLE
+--sglang-speculative-num-steps 2
+--sglang-speculative-eagle-topk 1
+--sglang-speculative-num-draft-tokens 3
+--sglang-cuda-graph-max-bs 64
+--sglang-max-running-requests 512
+--rollout-batch-size 128
+--rollout-max-response-len 32768
+
+--actor-num-nodes 2
+--actor-num-gpus-per-node 8
+--rollout-num-gpus 16
+
+--n-samples-per-eval-prompt 2
+--eval-max-response-len 16384
+--eval-temperature 0.6
+--eval-top-p 0.95

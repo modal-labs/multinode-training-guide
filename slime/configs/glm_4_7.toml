@@ -1,0 +1,16 @@
+model_id = "zai-org/GLM-4.7"
+# Closest upstream 358B MoE model args source.
+model_args_script = "glm4.5-355B-A32B.sh"
+
+app_name = "slime-grpo-glm-4.7-1-26-cp2-ep-16"
+wandb_run_name_prefix = "glm-4.7-grpo"
+wandb_project = "slime-grpo"
+
+n_nodes = 12
+gpu = "B200:8"
+sync = false
+
+args_files = [
+  "args/common/defaults.args",
+  "args/variants/glm_4_7.args",
+]

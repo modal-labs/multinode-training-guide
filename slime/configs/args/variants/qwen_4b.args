@@ -1,0 +1,14 @@
+# Qwen3-4B async main config
+--tensor-model-parallel-size 2
+--global-batch-size 8192
+
+--rollout-num-gpus-per-engine 2
+--sglang-data-parallel-size 1
+--sglang-mem-fraction-static 0.9
+--rollout-batch-size 8192
+--rollout-max-response-len 2048
+
+--actor-num-nodes 1
+--actor-num-gpus-per-node 2
+--rollout-num-gpus 2
+--num-gpus-per-node 2
