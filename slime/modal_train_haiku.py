@@ -100,7 +100,7 @@ SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 
 # App name from environment variable (set before running modal)
 # Usage: SLIME_APP_NAME="my-experiment" modal run modal_train.py ...
-APP_NAME = os.environ.get("SLIME_APP_NAME", "slime-grpo")
+APP_NAME = os.environ.get("SLIME_APP_NAME", "slime-haiku-grpo")
 app = modal.App(APP_NAME)
 
 
@@ -173,6 +173,7 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
 def generate_slime_cmd(
     config: RLConfig,
     master_addr: str,
+    experiment_name: str,
 ) -> tuple[str, dict]:
     """Generate the slime training command and runtime environment."""
     import datetime
@@ -183,6 +184,9 @@ def generate_slime_cmd(
 
     # Generate all training args from config
     train_args = config.generate_train_args(MODELS_PATH, DATA_PATH, is_infinite_run)
+
+    checkpoint_dir = MODELS_PATH / experiment_name
+    train_args += f" --save {checkpoint_dir} --save-interval {config.save_steps if hasattr(config, 'save_steps') else 100}"
 
     # Add wandb args if API key is available
     wandb_key = os.environ.get("WANDB_API_KEY")
@@ -226,22 +230,28 @@ async def run_training(
     config: RLConfig,
     n_nodes: int,
     master_addr: str,
+    experiment_name: str, 
 ):
     """Submit SLIME training job to Ray cluster and stream logs."""
     client = JobSubmissionClient("http://127.0.0.1:8265")
 
-    slime_cmd, runtime_env = generate_slime_cmd(config, master_addr)
+    slime_cmd, runtime_env = generate_slime_cmd(config, master_addr, experiment_name)
 
     print("Submitting training job...")
     print(f"  Model: {config.model_name}")
     print(f"  Mode: {'sync' if config.sync else 'async'}")
     print(f"  Nodes: {n_nodes}")
+    print(f"  Experiment: {experiment_name}")
+    print(f"  Checkpoint dir: {MODELS_PATH / experiment_name}")
 
     job_id = client.submit_job(entrypoint=slime_cmd, runtime_env=runtime_env)
     print(f"Job submitted with ID: {job_id}")
 
     async for line in client.tail_job_logs(job_id):
         print(line, end="", flush=True)
+
+    checkpoints_volume.commit()
+    print("Checkpoints saved and committed to volume")
 
 
 # =============================================================================
@@ -285,15 +295,51 @@ def download_model(
     timeout=24 * 60 * 60,
 )
 def prepare_dataset():
-    """Download and prepare the GSM8K dataset."""
+    """Download and prepare the Haiku dataset."""
     from datasets import load_dataset
+    import pandas as pd
 
     data_volume.reload()
-    dataset = load_dataset("zhuzilin/gsm8k")
-    dataset["train"].to_parquet(f"{DATA_PATH}/gsm8k/train.parquet")
-    dataset["test"].to_parquet(f"{DATA_PATH}/gsm8k/test.parquet")
+    
+    # Load the haiku dataset
+    ds = load_dataset("statworx/haiku")
+    
+    # Transform the dataset to match the expected format
+    # prompt: "Write me a haiku about {keyword}"
+    # expected response: the haiku text
+    def transform_example(example):
+        question = f"Write me a haiku about {example['keyword']}"
+        answer = example["text"]
+        return {
+            "question": question,
+            "label": answer,
+            "messages": [
+                {
+                    "content": "You are a helpful assistant.",
+                    "role": "system"
+                },
+                {
+                    "content": question,
+                    "role": "user"
+                }
+            ]
+        }
+    
+    # Apply transformation to both splits
+    train_transformed = ds["train"].map(transform_example, remove_columns=["keyword"])
+    test_transformed = ds["test"].map(transform_example, remove_columns=["keyword"])
+    
+    # Save as parquet
+    train_transformed.to_parquet(f"{DATA_PATH}/haiku/train.parquet")
+    test_transformed.to_parquet(f"{DATA_PATH}/haiku/test.parquet")
+    
     data_volume.commit()
-    print("Dataset prepared successfully")
+    print("Haiku dataset prepared successfully")
+    print(f"Train examples: {len(train_transformed)}")
+    print(f"Test examples: {len(test_transformed)}")
+    print("\nExample:")
+    print(f"Prompt: {train_transformed[0]['prompt']}")
+    print(f"Text: {train_transformed[0]['text']}")
 
 
 @app.local_entrypoint()
@@ -334,8 +380,13 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
         config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async")
     """
     from configs import get_config
+    from datetime import datetime
 
     cfg = get_config(config)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    model_short = cfg.model_name.split("/")[-1]
+    experiment_name = f"{model_short}-multinode-{timestamp}"
 
     checkpoints_volume.reload()
     data_volume.reload()
@@ -343,6 +394,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     cluster_info = modal.experimental.get_cluster_info()
     print(f"Rank: {cluster_info.rank}, task id: {os.environ['MODAL_TASK_ID']}")
     print(f"Config: {config}")
+    print(f"Experiment: {experiment_name}")
     print(f"Container IPv4 IPs: {cluster_info.container_ipv4_ips}")
 
     ray_main_node_addr = cluster_info.container_ipv4_ips[0]
@@ -354,7 +406,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     if cluster_info.rank == 0:
         with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
             print(f"Dashboard URL: {tunnel.url}")
-            await run_training(cfg, n_nodes, ray_main_node_addr)
+            await run_training(cfg, n_nodes, ray_main_node_addr, experiment_name)
     else:
         while True:
             time.sleep(10)
@@ -382,13 +434,18 @@ async def train_single_node(config: str = "qwen-0.5b-sync", num_rollout: Optiona
         config: Config name (e.g., "qwen-0.5b-sync", "qwen-4b-async"). File name with underscores replaced with dashes.
     """
     from configs import get_config
+    from datetime import datetime
 
     cfg = get_config(config)
 
     if num_rollout is not None:
         cfg.extra_args.append(f"--num-rollout {num_rollout}")
 
-    checkpoints_volume.reload()
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    model_short = cfg.model_name.split("/")[-1]
+    experiment_name = f"{model_short}-singlenode-{timestamp}"
+
+    await checkpoints_volume.reload.aio()
     data_volume.reload()
 
     _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
@@ -396,4 +453,5 @@ async def train_single_node(config: str = "qwen-0.5b-sync", num_rollout: Optiona
     with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
         print(f"Dashboard URL: {tunnel.url}")
         print(f"Config: {config}")
-        await run_training(cfg, 1, SINGLE_NODE_MASTER_ADDR)
+        print(f"Experiment: {experiment_name}")
+        await run_training(cfg, 1, SINGLE_NODE_MASTER_ADDR, experiment_name)
