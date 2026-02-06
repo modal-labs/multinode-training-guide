@@ -58,6 +58,7 @@ image = (
     modal.Image.from_registry("slimerl/slime:nightly-dev-20260126a")
     .run_commands(
         "uv pip install --system git+https://github.com/huggingface/transformers.git@eebf856",  # 4.54.1
+        "uv pip install --system aiohttp",  # For LLM judge reward model
         """sed -i 's/AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)/AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)/g' /sgl-workspace/sglang/python/sglang/srt/configs/utils.py""",
         # Fix rope_theta access for transformers 5.x (moved to rope_parameters dict)
         r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
@@ -65,7 +66,9 @@ image = (
     )
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
+    .add_local_python_source("reward_models", copy=True)
     .add_local_dir("test-configs", remote_path="/root/test-configs", copy=True)
+    .add_local_dir("tools", remote_path="/root/tools", copy=True)
 )
 
 # Overlay local slime code for development
@@ -87,7 +90,7 @@ MODELS_PATH: Path = Path("/models")
 
 # Volumes
 data_volume: modal.Volume = modal.Volume.from_name("grpo-slime-example-data", create_if_missing=True)
-checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-example-checkpoints", create_if_missing=True)
+checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints", create_if_missing=True)
 
 # Ray configuration
 RAY_PORT = 6379
@@ -224,7 +227,28 @@ def generate_slime_cmd(
         train_script = f"{dev_path}/{script_name}"
 
     return f"python3 {train_script} {train_args}", runtime_env
+    
+@app.function(
+    image=image,
+    timeout=24 * 60 * 60,
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+    ],
+    volumes={MODELS_PATH.as_posix(): checkpoints_volume},
+)
+async def convert_checkpoint(
+    checkpoint_dir: str = "Qwen3-4B-multinode-20260206-170445/iter_0000004",
+    origin_hf_dir: str = "Qwen3-4B"
+):
+    """Convert Megatron checkpoint to HuggingFace format."""
+    from huggingface_hub import snapshot_download
 
+    checkpoints_volume.reload()
+
+    local_hf_dir = MODELS_PATH / origin_hf_dir
+    snapshot_download(repo_id=f"Qwen/{origin_hf_dir}", local_dir=local_hf_dir)
+
+    subprocess.run(f"PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py --input-dir {MODELS_PATH / checkpoint_dir} --output-dir {MODELS_PATH / checkpoint_dir}-hf --origin-hf-dir {local_hf_dir}", shell=True, check=True)
 
 async def run_training(
     config: RLConfig,
@@ -250,8 +274,14 @@ async def run_training(
     async for line in client.tail_job_logs(job_id):
         print(line, end="", flush=True)
 
-    checkpoints_volume.commit()
+    await checkpoints_volume.commit.aio()
     print("Checkpoints saved and committed to volume")
+
+    checkpoint_dir = MODELS_PATH / experiment_name
+    origin_hf_dir = MODELS_PATH / config.model_name
+
+
+        
 
 
 # =============================================================================
@@ -366,6 +396,7 @@ def list_available_configs():
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("anthropic-secret"),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
@@ -421,6 +452,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("anthropic-secret"),
     ],
     timeout=24 * 60 * 60,
     experimental_options={
