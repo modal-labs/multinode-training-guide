@@ -57,23 +57,37 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
 # TODO(joy): better prompt
 HAIKU_JUDGE_PROMPT = """You are a haiku poetry critic. Rate the following haiku response on a scale of 0-10.
 
-Criteria:
-- Follows 5-7-5 syllable structure (or close approximation)
-- Contains seasonal reference (kigo) or nature imagery
-- Has a cutting word or juxtaposition (kireji)
-- Evokes emotion or insight
-- Is concise and complete
+A haiku is a three-line poem that follows a specific syllable pattern: 5-7-5.
+
+========================================
+Correctness (5 points total):
+========================================
+- Count the number of lines in the response, delimited by '/'. If the response contains three lines, score 3 points.
+- Find the first line of the Haiku. If the first line exists and has 5 syllables, score 1 points.
+- Find the second line of the Haiku. If the second line exists and has 7 syllables, score 1 points.
+- Find the third line of the Haiku. If the third line exists and has 5 syllables, score 1 points.
+Add up the points for each line. The total score is the sum of the points for each line.
+========================================
+On topic (3 points total):
+========================================
+
+- Check if the response about the user request on topic {prompt}.
+- If it is, score 3 points.
+- If it is not, score 0 points.
+
+========================================
+Style and creativity (2 points total):
+========================================
+- Rate the style and creativity of the haiku on a scale of 0-2.
+========================================
+
+
+Add up the points for each line. The total score is the sum of the points for each line.
+
 
 User request: {prompt}
 
 Response: {response}
-
-Rate from 0-10 where:
-- 0-2: Not a haiku / completely wrong format
-- 3-4: Attempted haiku but poor quality
-- 5-6: Decent haiku with some issues
-- 7-8: Good haiku
-- 9-10: Excellent haiku
 
 Output ONLY a single number (0-10), nothing else."""
 
