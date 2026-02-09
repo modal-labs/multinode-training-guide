@@ -42,12 +42,6 @@ N_NODES = 2
 # This is the default base port for the ib_write_bw command
 BASE_PORT = 18515
 
-server_ip_dict = modal.Dict.from_name(
-    "rdma-bw-ib-server-ips", create_if_missing=True
-)
-if modal.is_local():
-    server_ip_dict.clear()
-
 LOGGING_DEBUG = False
 
 
@@ -58,7 +52,7 @@ LOGGING_DEBUG = False
     timeout=60 * 60,  # 1 hour
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
-def infiniband_bandwidth_test():
+def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     """Runs a bidirectional RDMA bandwidth test using perftest.
     Node rank 0 acts as server and node rank 1 acts as client. The client
     waits until the Modal dict has 8 IPs, then runs ib_write_bw.
@@ -261,4 +255,5 @@ def aggregate_statistics(results: list[str]) -> tuple[float, float]:
 
 @app.local_entrypoint()
 def main():
-    infiniband_bandwidth_test.remote()
+    with modal.Dict.ephemeral() as server_ip_dict:
+        infiniband_bandwidth_test.remote(server_ip_dict)
