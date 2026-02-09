@@ -21,12 +21,6 @@ app = modal.App("rdma-pingpong-efa", image=image)
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
 N_NODES = 2
 
-server_ip_dict = modal.Dict.from_name(
-    "rdma-pingpong-efa-server-ips", create_if_missing=True
-)
-if modal.is_local():
-    server_ip_dict.clear()
-
 @app.function(
     gpu="H100:8",
     experimental_options={"efa_enabled": True},
@@ -34,7 +28,7 @@ if modal.is_local():
     timeout=60 * 60,  # 1 hour
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
-def fi_pingpong():
+def fi_pingpong(server_ip_dict: modal.Dict):
     """
     Runs a ping-pong test between two nodes on EFA.
     Node rank 0 adds its IPv4 address to the dict, then starts the
@@ -79,4 +73,5 @@ def fi_pingpong():
 
 @app.local_entrypoint()
 def main():
-    fi_pingpong.remote()
+    with modal.Dict.ephemeral() as server_ip_dict:
+        fi_pingpong.remote(server_ip_dict)

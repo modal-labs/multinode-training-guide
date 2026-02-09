@@ -42,12 +42,6 @@ N_NODES = 2
 # Default port for the ib_send_lat command
 BASE_PORT = 18515
 
-server_ip_dict = modal.Dict.from_name(
-    "rdma-pingpong-ib-server-ips", create_if_missing=True
-)
-if modal.is_local():
-    server_ip_dict.clear()
-
 
 @app.function(
     gpu="H200:8",
@@ -56,7 +50,7 @@ if modal.is_local():
     timeout=60 * 60,  # 1 hour
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
-def infiniband_pingpong_test():
+def infiniband_pingpong_test(server_ip_dict: modal.Dict):
     """Runs a ping-pong latency test over InfiniBand using ib_send_lat from the perftest suite.
     Tests only the first RDMA device (mlx5_0) between two nodes. Node rank 0 acts as the server
     and node rank 1 acts as the client."""
@@ -180,4 +174,5 @@ def get_local_ib_devices() -> list[str]:
 
 @app.local_entrypoint()
 def main():
-    infiniband_pingpong_test.remote()
+    with modal.Dict.ephemeral() as server_ip_dict:
+        infiniband_pingpong_test.remote(server_ip_dict)

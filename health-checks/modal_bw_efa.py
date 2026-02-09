@@ -37,12 +37,6 @@ BASE_PORT = 30000
 # RDMA Message Size. IMPORTANT: Keep < 1 or libfabric will use the read message protocol, which triggers a slow, multi-turn trip.
 MB_PER_WRITE = 1
 
-server_ip_dict = modal.Dict.from_name(
-    "rdma-bw-efa-server-ips", create_if_missing=True
-)
-if modal.is_local():
-    server_ip_dict.clear()
-
 LOGGING_DEBUG = True
 
 
@@ -53,7 +47,7 @@ LOGGING_DEBUG = True
     timeout=60 * 60,  # 1 hour
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
-def efa_bandwidth_test():
+def efa_bandwidth_test(server_ip_dict: modal.Dict):
     """Runs a bidirectional RDMA bandwidth test using the fabtests library. Creates a Modal dict for storing the server's container IP address.
     The client waits until this value has been added and then runs a fi_rma_bw command to benchmark bandwidth. On AWS EFA, every device has 2 NICs
     and each NIC has its own RDM (reliable datagram) domain. 16 fi_rma_bw processes (one per domain) are spun up in parrallel.
@@ -323,4 +317,5 @@ def aggregate_statistics(results: list[str]) -> float:
 
 @app.local_entrypoint()
 def main():
-    efa_bandwidth_test.remote()
+    with modal.Dict.ephemeral() as server_ip_dict:
+        efa_bandwidth_test.remote(server_ip_dict)
