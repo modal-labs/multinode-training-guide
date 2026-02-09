@@ -42,8 +42,9 @@ N_NODES = 2
 # This is the default base port for the ib_write_bw command
 BASE_PORT = 18515
 
-server_ip_dict = modal.Dict.from_name("server-ip-dict", create_if_missing=True)
-
+server_ip_dict = modal.Dict.from_name(
+    "rdma-bw-ib-server-ips", create_if_missing=True
+)
 if modal.is_local():
     server_ip_dict.clear()
 
@@ -57,7 +58,7 @@ LOGGING_DEBUG = False
     timeout=60 * 60,  # 1 hour
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
-def InfiniBand_bandwidth_test():
+def infiniband_bandwidth_test():
     """Runs a bidirectional RDMA bandwidth test using perftest.
     Node rank 0 acts as server and node rank 1 acts as client. The client
     waits until the Modal dict has 8 IPs, then runs ib_write_bw.
@@ -76,10 +77,6 @@ def InfiniBand_bandwidth_test():
     )
 
     if container_rank == 0:
-        # Only have the server clear the dict to prevent a race condition between the server and client
-        server_ip_dict.clear()
-        print(f"[rank {container_rank}] Dict cleared", flush=True)
-
         # Get all RDMA network interfaces and their ipv4 addresses
         print(f"[rank {container_rank}] Getting IP addresses...", flush=True)
         ip_addr = subprocess.run(
@@ -201,9 +198,7 @@ def run_ib_write_server(device: str, port: int) -> subprocess.Popen:
 
 
 # Run ib_write_bw command for client with rank 0 IP as the server IP
-def run_ib_write_client(
-    device: str, port: int, server_ip: str
-) -> subprocess.Popen:
+def run_ib_write_client(device: str, port: int, server_ip: str) -> subprocess.Popen:
     cmd = [
         "/usr/local/bin/ib_write_bw",
         "-d",
@@ -228,7 +223,7 @@ def run_ib_write_client(
 # Get a sorted list of InfiniBand device names: "mlx5_0", "mlx5_1", etc.
 def get_local_ib_devices() -> list[str]:
     ib_devices = subprocess.run(
-        ["ls", "/sys/class/InfiniBand/"],
+        ["ls", "/sys/class/infiniband/"],
         capture_output=True,
         text=True,
         check=True,
@@ -266,4 +261,4 @@ def aggregate_statistics(results: list[str]) -> tuple[float, float]:
 
 @app.local_entrypoint()
 def main():
-    InfiniBand_bandwidth_test.remote()
+    infiniband_bandwidth_test.remote()

@@ -43,9 +43,8 @@ N_NODES = 2
 BASE_PORT = 18515
 
 server_ip_dict = modal.Dict.from_name(
-    "server-ip-dict-pingpong", create_if_missing=True
+    "rdma-pingpong-ib-server-ips", create_if_missing=True
 )
-
 if modal.is_local():
     server_ip_dict.clear()
 
@@ -57,7 +56,7 @@ if modal.is_local():
     timeout=60 * 60,  # 1 hour
 )
 @modal.experimental.clustered(N_NODES, rdma=True)
-def InfiniBand_pingpong_test():
+def infiniband_pingpong_test():
     """Runs a ping-pong latency test over InfiniBand using ib_send_lat from the perftest suite.
     Tests only the first RDMA device (mlx5_0) between two nodes. Node rank 0 acts as the server
     and node rank 1 acts as the client."""
@@ -82,10 +81,6 @@ def InfiniBand_pingpong_test():
     print(f"[rank {container_rank}] Using first device: {device}", flush=True)
 
     if container_rank == 0:
-        # Server: clear dict and publish RDMA IP for the first device
-        server_ip_dict.clear()
-        print(f"[rank {container_rank}] Dict cleared", flush=True)
-
         # Get RDMA network interfaces and find the IP for the first gpu device
         ip_addr = subprocess.run(
             ["ip", "-j", "addr", "show"],
@@ -174,17 +169,15 @@ def InfiniBand_pingpong_test():
 # Get a sorted list of InfiniBand device names: "mlx5_0", "mlx5_1", etc.
 def get_local_ib_devices() -> list[str]:
     ib_devices = subprocess.run(
-        ["ls", "/sys/class/InfiniBand/"],
+        ["ls", "/sys/class/infiniband/"],
         capture_output=True,
         text=True,
         check=True,
     )
-    devices = ib_devices.stdout.split("\n")[
-        :-1
-    ]  # Trim the final new line character
+    devices = ib_devices.stdout.split("\n")[:-1]  # Trim the final new line character
     return sorted(devices)
 
 
 @app.local_entrypoint()
 def main():
-    InfiniBand_pingpong_test.remote()
+    infiniband_pingpong_test.remote()

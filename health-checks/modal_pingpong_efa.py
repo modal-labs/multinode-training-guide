@@ -10,9 +10,7 @@ flavor = "devel"  #  Includes full CUDA toolkit
 operating_sys = "ubuntu22.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
-image = modal.Image.from_registry(
-    f"nvidia/cuda:{tag}", add_python="3.10"
-).apt_install(
+image = modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.10").apt_install(
     "libibverbs-dev",
     "libibverbs1",
     "libhwloc15",
@@ -23,8 +21,11 @@ app = modal.App("rdma-pingpong-efa", image=image)
 # The number of containers (i.e. nodes) in the cluster. This can be between 1 and 8.
 N_NODES = 2
 
-server_ip_dict = modal.Dict.from_name("server-ip-dict", create_if_missing=True)
-
+server_ip_dict = modal.Dict.from_name(
+    "rdma-pingpong-efa-server-ips", create_if_missing=True
+)
+if modal.is_local():
+    server_ip_dict.clear()
 
 @app.function(
     gpu="H100:8",

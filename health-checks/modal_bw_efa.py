@@ -37,8 +37,9 @@ BASE_PORT = 30000
 # RDMA Message Size. IMPORTANT: Keep < 1 or libfabric will use the read message protocol, which triggers a slow, multi-turn trip.
 MB_PER_WRITE = 1
 
-server_ip_dict = modal.Dict.from_name("server-ip-dict", create_if_missing=True)
-
+server_ip_dict = modal.Dict.from_name(
+    "rdma-bw-efa-server-ips", create_if_missing=True
+)
 if modal.is_local():
     server_ip_dict.clear()
 
@@ -74,10 +75,6 @@ def efa_bandwidth_test():
     )
 
     if container_rank == 0:
-        # Only have the server clear the dict to prevent a race condition between the server and client
-        server_ip_dict.clear()
-        print(f"[rank {container_rank}] Dict cleared", flush=True)
-
         # Add server ip address to dict
         server_ip_dict["server_ip"] = cluster_info.container_ipv4_ips[0]
         print(
@@ -186,9 +183,7 @@ def efa_bandwidth_test():
 
 
 # Run fi_rma_bw command for server
-def run_efa_write_server(
-    domain: str, port: int, gpu_id: int
-) -> subprocess.Popen:
+def run_efa_write_server(domain: str, port: int, gpu_id: int) -> subprocess.Popen:
     env = {
         **os.environ,
         "LD_LIBRARY_PATH": "/opt/amazon/efa/lib",
@@ -206,9 +201,7 @@ def run_efa_write_server(
         str(gpu_id),
         f"-b={port}",
         "-S",
-        str(
-            (MB_PER_WRITE << 20) - 1
-        ),  # To keep < 1MB for read message protocol
+        str((MB_PER_WRITE << 20) - 1),  # To keep < 1MB for read message protocol
         "-W",
         "128",  # Large window size
         "-w",
@@ -248,9 +241,7 @@ def run_efa_write_client(
         str(gpu_id),
         f"-b={port}",
         "-S",
-        str(
-            (MB_PER_WRITE << 20) - 1
-        ),  # To keep < 1MB for read message protocol
+        str((MB_PER_WRITE << 20) - 1),  # To keep < 1MB for read message protocol
         "-W",
         "128",
         "-w",
