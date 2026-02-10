@@ -176,3 +176,5 @@ cython_debug/
 
 # claire, experimental
 slime/test_configs
+# Ruff cache
+.ruff_cache/
