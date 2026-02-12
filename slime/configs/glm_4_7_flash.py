@@ -2,7 +2,7 @@
 
 Based on: scripts/models/glm4.7-30B-A3B.sh and run.sh from THUDM internal
 
-NOTE: You must download GLM-4.7-Flash to /models/ volume before running.
+NOTE: You must download GLM-4.7-Flash before running (see download_model).
 
 modal run slime/modal_train.py::train_multi_node --config "glm-4-7-flash"
 modal run -d slime/modal_train.py::train_multi_node --config "glm-4-7-flash"
