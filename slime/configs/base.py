@@ -58,16 +58,14 @@ class RLConfig:
                 lines.append(line)
         return " ".join(lines)
 
-    def generate_train_args(self, models_path: Path, data_path: Path, is_infinite_run: bool) -> str:
+    def generate_train_args(self, hf_model_path: str, checkpoints_path: Path, data_path: Path, is_infinite_run: bool) -> str:
         """Generate full command line args for slime."""
-        # Base args that are always needed (no trailing slash - transformers 5.x doesn't like it)
-        base_args = f"--hf-checkpoint {models_path}/{self.model_name} --ref-load {models_path}/{self.model_name}"
+        # HF model path resolved from cache (snapshot_download with local_files_only=True)
+        base_args = f"--hf-checkpoint {hf_model_path} --ref-load {hf_model_path}"
 
-        # Add prompt data path (config should include --prompt-data with placeholder or we add default)
-        # Replace {data_path} placeholder if present in slime_args
         cleaned_slime_args = self._clean_args(self.slime_args)
         cleaned_slime_args = cleaned_slime_args.replace("{data_path}", str(data_path))
-        cleaned_slime_args = cleaned_slime_args.replace("{models_path}", str(models_path))
+        cleaned_slime_args = cleaned_slime_args.replace("{checkpoints_path}", str(checkpoints_path))
 
         extra = " ".join(self.extra_args) if self.extra_args else ""
 

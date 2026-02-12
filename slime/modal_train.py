@@ -65,7 +65,7 @@ image = (
     )
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
-    .add_local_dir("test-configs", remote_path="/root/test-configs", copy=True)
+    # .add_local_dir("test-configs", remote_path="/root/test-configs", copy=True)
 )
 
 # Overlay local slime code for development
@@ -73,7 +73,12 @@ image = (
 SLIME_DEV_PATH = "/opt/slime-dev"
 if LOCAL_SLIME_PATH:
     # Copy the entire slime repo (has pyproject.toml) and install it
-    image = image.add_local_dir(LOCAL_SLIME_PATH, remote_path=SLIME_DEV_PATH, copy=True, ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv", "**/modal"]).run_commands(f"uv pip install --system -e {SLIME_DEV_PATH}")
+    image = image.add_local_dir(
+        LOCAL_SLIME_PATH,
+        remote_path=SLIME_DEV_PATH,
+        copy=True,
+        ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv", "**/modal"],
+    ).run_commands(f"uv pip install --system -e {SLIME_DEV_PATH}")
 else:
     SLIME_DEV_PATH = None
 
@@ -83,11 +88,19 @@ with image.imports():
 
 # Paths
 DATA_PATH: Path = Path("/data")
-MODELS_PATH: Path = Path("/models")
+HF_CACHE_PATH: Path = Path("/root/.cache/huggingface")
+CHECKPOINTS_PATH: Path = Path("/checkpoints")
 
 # Volumes
-data_volume: modal.Volume = modal.Volume.from_name("grpo-slime-example-data", create_if_missing=True)
-checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-example-checkpoints", create_if_missing=True)
+data_volume: modal.Volume = modal.Volume.from_name(
+    "grpo-slime-example-data", create_if_missing=True
+)
+hf_cache_volume: modal.Volume = modal.Volume.from_name(
+    "huggingface-cache", create_if_missing=True
+)
+checkpoints_volume: modal.Volume = modal.Volume.from_name(
+    "grpo-slime-checkpoints", create_if_missing=True
+)
 
 # Ray configuration
 RAY_PORT = 6379
@@ -130,7 +143,7 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
             ]
         )
 
-        for _ in range(10):
+        for _ in range(30):
             try:
                 ray.init(address="auto")
             except ConnectionError:
@@ -153,7 +166,9 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
         else:
             raise Exception("Failed to connect to all worker nodes")
     else:
-        print(f"Starting Ray worker node at {node_ip_addr}, connecting to {main_node_addr}")
+        print(
+            f"Starting Ray worker node at {node_ip_addr}, connecting to {main_node_addr}"
+        )
         subprocess.Popen(
             [
                 "ray",
@@ -179,23 +194,45 @@ def generate_slime_cmd(
     import random
 
     # Check for infinite run mode
-    is_infinite_run = os.environ.get("SLIME_TEST_ENABLE_INFINITE_RUN", "0").lower() in ("true", "1")
+    is_infinite_run = os.environ.get("SLIME_TEST_ENABLE_INFINITE_RUN", "0").lower() in (
+        "true",
+        "1",
+    )
+
+    # Resolve HF model path from cache (volume mounted at default HF cache dir)
+    from huggingface_hub import snapshot_download
+
+    hf_model_path = snapshot_download(repo_id=config.model_id, local_files_only=True)
 
     # Generate all training args from config
-    train_args = config.generate_train_args(MODELS_PATH, DATA_PATH, is_infinite_run)
+    train_args = config.generate_train_args(
+        hf_model_path, CHECKPOINTS_PATH, DATA_PATH, is_infinite_run
+    )
 
     # Add wandb args if API key is available
     wandb_key = os.environ.get("WANDB_API_KEY")
     if wandb_key:
-        run_id = datetime.datetime.utcnow().strftime("%y%m%d-%H%M%S") + f"-{random.randint(0, 999):03d}"
-        wandb_run_name = f"{config.wandb_run_name_prefix}_{run_id}" if config.wandb_run_name_prefix else run_id
+        run_id = (
+            datetime.datetime.utcnow().strftime("%y%m%d-%H%M%S")
+            + f"-{random.randint(0, 999):03d}"
+        )
+        wandb_run_name = (
+            f"{config.wandb_run_name_prefix}_{run_id}"
+            if config.wandb_run_name_prefix
+            else run_id
+        )
         train_args += f" --use-wandb --wandb-project {config.wandb_project} --wandb-group {wandb_run_name} --wandb-key '{wandb_key}' --disable-wandb-random-suffix"
 
     # Build PYTHONPATH by appending to existing (don't clobber)
     import os as _os
+
     existing_pythonpath = _os.environ.get("PYTHONPATH", "")
     megatron_path = "/root/Megatron-LM/"
-    pythonpath = f"{megatron_path}:{existing_pythonpath}" if existing_pythonpath else megatron_path
+    pythonpath = (
+        f"{megatron_path}:{existing_pythonpath}"
+        if existing_pythonpath
+        else megatron_path
+    )
 
     runtime_env = {
         "env_vars": {
@@ -251,7 +288,7 @@ async def run_training(
 
 @app.function(
     image=image,
-    volumes={MODELS_PATH.as_posix(): checkpoints_volume},
+    volumes={HF_CACHE_PATH.as_posix(): hf_cache_volume},
     timeout=24 * 60 * 60,
 )
 def download_model(
@@ -269,14 +306,10 @@ def download_model(
 
     cfg = get_config(config)
 
-    snapshot_download(
-        repo_id=cfg.model_id,
-        local_dir=MODELS_PATH / cfg.model_name,
-        revision=revision,
-    )
-    print(f"Model downloaded to {MODELS_PATH / cfg.model_name}")
+    path = snapshot_download(repo_id=cfg.model_id, revision=revision)
+    print(f"Model downloaded to {path}")
 
-    checkpoints_volume.commit()
+    hf_cache_volume.commit()
 
 
 @app.function(
@@ -315,7 +348,8 @@ def list_available_configs():
     image=image,
     gpu="H200:8",  # GLM-4.7 needs H200s for memory
     volumes={
-        MODELS_PATH.as_posix(): checkpoints_volume,
+        HF_CACHE_PATH.as_posix(): hf_cache_volume,
+        CHECKPOINTS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
     },
     secrets=[
@@ -326,7 +360,9 @@ def list_available_configs():
         "efa_enabled": True,
     },
 )
-@modal.experimental.clustered(12, rdma=True)  # 12 nodes for GLM-4.7 (8 train + 4 rollout)
+@modal.experimental.clustered(
+    4, rdma=True
+)  # 12 nodes for GLM-4.7 (8 train + 4 rollout)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
 
@@ -337,7 +373,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
 
     cfg = get_config(config)
 
-    checkpoints_volume.reload()
+    hf_cache_volume.reload()
     data_volume.reload()
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -364,7 +400,8 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     image=image,
     gpu="H200:8",
     volumes={
-        MODELS_PATH.as_posix(): checkpoints_volume,
+        HF_CACHE_PATH.as_posix(): hf_cache_volume,
+        CHECKPOINTS_PATH.as_posix(): checkpoints_volume,
         DATA_PATH.as_posix(): data_volume,
     },
     secrets=[
@@ -385,7 +422,7 @@ async def train_single_node(config: str = "qwen-0.5b-sync"):
 
     cfg = get_config(config)
 
-    checkpoints_volume.reload()
+    hf_cache_volume.reload()
     data_volume.reload()
 
     _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)

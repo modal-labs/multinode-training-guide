@@ -2,7 +2,7 @@
 
 Based on: https://huggingface.co/zai-org/GLM-4.7/blob/main/config.json
 
-NOTE: You must download GLM-4.7 to /models/ volume before running.
+NOTE: You must download GLM-4.7 before running (see download_model).
 """
 
 from .base import (
