@@ -22,10 +22,11 @@ Create the required secret:
 modal secret create huggingface-secret HF_TOKEN=<your-token>
 ```
 
-Optional (only if you want W&B logging):
+Optional (only if you want W&B logging): pass `WANDB_API_KEY` as an env var
+when launching training, for example:
 
 ```bash
-modal secret create wandb-secret WANDB_API_KEY=<your-key>
+WANDB_API_KEY=<your-key> modal run --detach ms-swift/modal_train.py::train_sft
 ```
 
 ## Quick Start
