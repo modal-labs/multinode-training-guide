@@ -174,7 +174,8 @@ cython_debug/
 .pypirc
 
 
-# claire, experimental
+# experimental
 slime/test_configs
+
 # Ruff cache
 .ruff_cache/
