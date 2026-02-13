@@ -80,6 +80,15 @@ QWEN3_4B_MODEL_ARGS = """
     --use-rotary-position-embeddings --rotary-base 1000000
 """
 
+QWEN3_8B_MODEL_ARGS = """
+    --num-layers 36 --hidden-size 4096 --ffn-hidden-size 12288
+    --num-attention-heads 32 --group-query-attention --num-query-groups 8
+    --kv-channels 128 --vocab-size 151936
+    --normalization RMSNorm --norm-epsilon 1e-6 --swiglu
+    --disable-bias-linear --qk-layernorm
+    --use-rotary-position-embeddings --rotary-base 1000000
+"""
+
 DEFAULT_TRAINING_ARGS = """
     --tensor-model-parallel-size 2 --sequence-parallel
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
