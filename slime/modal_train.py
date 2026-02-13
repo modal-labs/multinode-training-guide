@@ -346,7 +346,7 @@ def list_available_configs():
 
 @app.function(
     image=image,
-    gpu="H200:8",  # GLM-4.7 needs H200s for memory
+    gpu="H200:8",
     volumes={
         HF_CACHE_PATH.as_posix(): hf_cache_volume,
         CHECKPOINTS_PATH.as_posix(): checkpoints_volume,
@@ -362,7 +362,7 @@ def list_available_configs():
 )
 @modal.experimental.clustered(
     4, rdma=True
-)  # 12 nodes for GLM-4.7 (8 train + 4 rollout)
+)
 async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """Main entry point for multi-node GRPO training on Modal.
 
