@@ -21,11 +21,12 @@ def get_config() -> RLConfig:
         model_id="zai-org/GLM-4.7",
 
         # Modal settings - 358B model needs heavy distribution
+        # TODO: training updates are faster than rollouts
         # 8 training + 4 rollout nodes
         n_nodes=12,
         gpu="B200:8",
         app_name="slime-grpo-glm-4.7",
-        sync=False,
+        sync=True,
 
         # Wandb
         wandb_project="slime-grpo",
@@ -48,7 +49,7 @@ def get_config() -> RLConfig:
             # Data
             {DEFAULT_DATA_ARGS}
             --prompt-data {{data_path}}/gsm8k/train.parquet
-            --num-rollout 3000
+            --num-rollout 10
             --rollout-batch-size 64
             --n-samples-per-prompt 8
             --global-batch-size 512
@@ -57,10 +58,10 @@ def get_config() -> RLConfig:
             --eval-prompt-data gsm8k {{data_path}}/gsm8k/test.parquet
 
             # SGLang - 358B model needs TP=8 for inference
-            --rollout-num-gpus-per-engine 8
+            --rollout-num-gpus-per-engine 32 # TODO: SUSSSSSS
             --sglang-dp-size 4
-            --sglang-mem-fraction-static 0.85
-            --rollout-max-response-len 16384
+            --sglang-mem-fraction-static 0.7
+            --rollout-max-response-len 8192
             --rollout-temperature 1
             --sglang-enable-dp-attention
             --sglang-enable-dp-lm-head

@@ -6,7 +6,7 @@ Recommended by various packages such as `syllables` and `nltk`.
 """
 
 import asyncio
-import re
+from enum import Enum
 import threading
 
 import aiohttp
@@ -14,11 +14,28 @@ import aiohttp
 import modal
 import modal.experimental
 
+
+# =============================================================================
+
+class JudgeType(str, Enum):
+    STRICT = "strict"
+    STRICT_LEVELED = "strict_leveled"
+
+ACTIVE_JUDGE_TYPE = JudgeType.STRICT_LEVELED
+
+def get_judge_url(judge_type: JudgeType) -> str:
+    if judge_type == JudgeType.STRICT:
+        return "https://modal-labs-joy-dev--llm-judge-strict-llmjudge.us-east.modal.direct"
+    elif judge_type == JudgeType.STRICT_LEVELED:
+        return "https://modal-labs-joy-dev--llm-judge-strict-leveled-llmjudge.us-east.modal.direct"
+    else:
+        raise ValueError(f"Invalid judge type: {judge_type}")
+
 # =============================================================================
 # Modal App Setup
 # =============================================================================
 
-app = modal.App("llm-judge-reward-model")
+app = modal.App(f"llm-judge-{ACTIVE_JUDGE_TYPE.value}")
 
 FLASH_PORT = 8000
 VLLM_PORT = 8001
@@ -28,10 +45,25 @@ MODEL_NAME = "qwen3-30b-a3b-instruct"
 N_GPU = 1
 MINUTES = 60
 
-
 checkpoint_volume = modal.Volume.from_name("unsloth-checkpoints")
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
+
+
+
+
+
+def _make_judge(judge_type: JudgeType):
+    from llm_judges.strict import StrictJudge
+    from llm_judges.strict_leveled import StrictLeveledJudge
+
+    judges = {
+        JudgeType.STRICT: StrictJudge,
+        JudgeType.STRICT_LEVELED: StrictLeveledJudge,
+    }
+    return judges[judge_type]()
+
+# =============================================================================
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
@@ -50,175 +82,22 @@ image = (
     .run_commands(
         "python -c \"import nltk; nltk.download('cmudict'); nltk.download('punkt_tab')\""
     )
+    .add_local_dir("llm_judges", "/root/llm_judges")
 )
-
-
-# =============================================================================
-# NLTK Syllable & Sentence Utilities
-# =============================================================================
-
-
-# Ref: https://stackoverflow.com/questions/49581705/using-cmudict-to-count-syllables
-# CMU dict stores phonemes; syllables = count of vowel sounds (digits in phoneme)
-def lookup_word(word_s, cmudict: dict):
-    return cmudict.get(word_s, None)
-
-
-def count_syllables_for_word(word, cmudict):
-    count = 0
-    word = word.lower().strip()
-    phones = lookup_word(
-        word, cmudict
-    )  # this returns a list of matching phonetic rep's
-    if phones:  # if the list isn't empty (the word was found)
-        phones0 = phones[0]  #     process the first
-        count = len([p for p in phones0 if p[-1].isdigit()])  # count the vowels
-        return count
-    # Fallback heuristic for words not in CMU dict
-    print(f"WARNING: Word {word} not found in CMU dict")
-    return -1
-
-
-def diff_syllables_count(text: str, target_syllables: int, cmudict: dict) -> int:
-    """Output the difference between the number of syllables in the text and the target number of syllables."""
-    words = re.findall(r"[a-zA-Z]+", text)
-    total_syllables = sum(count_syllables_for_word(w, cmudict) for w in words)
-    return abs(total_syllables - target_syllables)
-
-
-def segment_haiku_lines(response: str) -> list[str]:
-    if "/" in response:
-        lines = [line.strip() for line in response.split("/")]
-    elif ". " in response:
-        lines = [line.strip() for line in response.split(". ")]
-    else:
-        lines = [line.strip() for line in response.split("\n")]
-    return [line for line in lines if line]
-
-
-# =============================================================================
-# Shared Prompt Template
-# =============================================================================
-
-
-def generate_haiku_judge_prompt(prompt: str, response: str) -> str:
-    return f"""You are evaluating a haiku poem.
-
-    Score the response based on the following criteria:
-    - 2 points: if the response is relevant to the topic "{prompt}" and evokes meaning and emotion
-    - 1 point: if the response is relevant to the topic "{prompt}" but very plain
-    - 0 points: if the response is not relevant to the topic "{prompt}"
-
-    --
-    **Topic:** {prompt}
-
-    **Response to evaluate:**
-    {response}
-    ---
-
-    Output ONLY a single number (0-2), nothing else."""
-
-
-# =============================================================================
-# Scoring Logic
-# =============================================================================
-def score_syllable_line(diff: int) -> float:
-    """Score a single line's syllable count: 2 for exact, 1 for off-by-1, 0 otherwise."""
-    if diff == 0:
-        return 2
-    elif diff == 1:
-        return 1
-    return 0
-
-
-def score_haiku_structure(response: str, cmudict: dict) -> float:
-    # - 2 points: Exactly 3 lines (separated by '/')
-    # - Up to 2 points each line: exact syllable match = 2, off by 1 = 1, else 0
-    lines = segment_haiku_lines(response)
-    score = 0.0
-    if len(lines) == 3:
-        score += 2
-
-    if len(lines) > 0:
-        score += score_syllable_line(diff_syllables_count(lines[0], 5, cmudict))
-    if len(lines) > 1:
-        score += score_syllable_line(diff_syllables_count(lines[1], 7, cmudict))
-    if len(lines) > 2:
-        score += score_syllable_line(diff_syllables_count(lines[2], 5, cmudict))
-
-    return score
-
-
-async def score_haiku_style(
-    session: aiohttp.ClientSession,
-    prompt: str,
-    response: str,
-    vllm_base_url: str = f"http://localhost:{VLLM_PORT}",
-) -> int:
-    judge_prompt = generate_haiku_judge_prompt(prompt, response)
-
-    try:
-        async with session.post(
-            f"{vllm_base_url}/v1/chat/completions",
-            headers={
-                "content-type": "application/json",
-            },
-            json={
-                "model": MODEL_NAME,
-                "messages": [{"role": "user", "content": judge_prompt}],
-                "max_tokens": 100,
-            },
-        ) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                print(f"vLLM error: {resp.status} - {error_text}")
-                return -1
-
-            data = await resp.json()
-            print(data)
-            score_text = data["choices"][0]["message"]["content"].strip()
-
-            match = re.search(r"(\d+(?:\.\d+)?)", score_text)
-            if match:
-                score = float(match.group(1))
-                print(f"Score: {score}")
-                return min(max(score, 0), 2)
-            return -1
-    except Exception as e:
-        print(f"Error scoring response: {e}")
-        return -1
-
-
-async def score_single(
-    session: aiohttp.ClientSession,
-    prompt: str,
-    response: str,
-    cmudict: dict,
-) -> float:
-    print(f"Prompt: {prompt}")
-    print(f"Response: {response}")
-
-    structure_score = score_haiku_structure(response, cmudict)
-    style_score = (
-        await score_haiku_style(session, prompt, response) if structure_score > 4 else 0
-    )
-    print(f"Structure score: {structure_score}, Style score: {style_score}")
-
-    return (structure_score + style_score) / 10
-
 
 # =============================================================================
 # Modal Flash Endpoint
 # =============================================================================
 
 
-def create_fastapi_app():
+def create_fastapi_app(judge_type: JudgeType):
     from fastapi import FastAPI
     from pydantic import BaseModel
     import nltk
 
     fastapi_app = FastAPI(title="LLM Judge Reward Model", docs_url="/docs")
     cmudict = nltk.corpus.cmudict.dict()
+    judge = _make_judge(judge_type)
 
     class ScoreRequest(BaseModel):
         prompt: str
@@ -254,13 +133,15 @@ def create_fastapi_app():
             return None
 
         async with aiohttp.ClientSession() as session:
-            score = await score_single(session, prompt, response_text, cmudict)
+            result = await judge.score_single(
+                MODEL_NAME, session, prompt, response_text, cmudict
+            )
 
-        return float(score)
+        return float(result)
 
     @fastapi_app.get("/health")
     def health():
-        return {"status": "ok", "model": "claude-sonnet-4-20250514"}
+        return {"status": "ok", "model": MODEL_NAME, "judge": judge_type.value}
 
     return fastapi_app
 
@@ -282,14 +163,19 @@ def create_fastapi_app():
 @modal.concurrent(  # how many requests can one replica handle? tune carefully!
     target_inputs=8
 )
-class LLMJudgeFlash:
-    """Modal Flash endpoint combining vLLM + scoring logic in one container."""
+class LLMJudge:
+    """Modal Flash endpoint combining vLLM + scoring logic in one container.
+
+    Each judge_type value gets its own independent container pool via modal.parameter().
+    Deploy with: LLMJudge(judge_type="strict") or LLMJudge(judge_type="balanced")
+    """
 
     @modal.enter()
     def setup(self):
         import subprocess
 
         import uvicorn
+
 
         # Start vLLM on VLLM_PORT (internal)
         cmd = [
@@ -315,7 +201,7 @@ class LLMJudgeFlash:
         print(f"vLLM ready on port {VLLM_PORT}")
 
         # Start FastAPI scoring endpoint on FLASH_PORT (exposed)
-        self._fastapi_app = create_fastapi_app()
+        self._fastapi_app = create_fastapi_app(ACTIVE_JUDGE_TYPE)
         config = uvicorn.Config(
             self._fastapi_app,
             host="0.0.0.0",
@@ -328,7 +214,7 @@ class LLMJudgeFlash:
 
         self._wait_for_port(FLASH_PORT, timeout=30)
         self.flash_manager = modal.experimental.flash_forward(FLASH_PORT)
-        print(f"Flash endpoint ready on port {FLASH_PORT}")
+        print(f"Flash endpoint ready on port {FLASH_PORT} (judge={ACTIVE_JUDGE_TYPE.value})")
 
     def _wait_for_port(self, port: int, timeout: int = 30):
         import socket
@@ -383,9 +269,12 @@ class LLMJudgeRewardModel:
     def __init__(
         self,
         endpoint_url: str | None = None,
+        judge_type: JudgeType = JudgeType.STRICT,
     ):
         self.endpoint_url = endpoint_url
+        self.judge = _make_judge(judge_type)
         self._session: aiohttp.ClientSession | None = None
+        self._cmudict: dict | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         import aiohttp
@@ -406,11 +295,22 @@ class LLMJudgeRewardModel:
             data = await resp.json()
             return data.get("scores", [-1.0] * len(prompts))
 
+    def _get_cmudict(self) -> dict:
+        if self._cmudict is None:
+            import nltk
+
+            self._cmudict = nltk.corpus.cmudict.dict()
+        return self._cmudict
+
     async def _score_direct(
         self, prompts: list[str], responses: list[str]
     ) -> list[float]:
         session = await self._get_session()
-        tasks = [score_single(session, p, r) for p, r in zip(prompts, responses)]
+        cmudict = self._get_cmudict()
+        tasks = [
+            self.judge.score_single(MODEL_NAME, session, p, r, cmudict)
+            for p, r in zip(prompts, responses)
+        ]
         return list(await asyncio.gather(*tasks))
 
     async def score_batch(

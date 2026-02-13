@@ -8,6 +8,9 @@ from .base import (
     DEFAULT_GRPO_ARGS,
 )
 
+from llm_judges.deploy import get_judge_url, ACTIVE_JUDGE_TYPE
+
+NUM_ROLLOUT = 200
 
 def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
     return RLConfig(
@@ -17,11 +20,11 @@ def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
         # Modal settings
         n_nodes=1,
         gpu="H200:8",
-        app_name="slime-qwen3-4b-haiku",
+        app_name=f"slime-qwen3-4b-haiku-{ACTIVE_JUDGE_TYPE.value}",
         sync=True,
 
         # Wandb
-        wandb_project="slime-grpo-haiku",
+        wandb_project="slime-haiku",
         wandb_run_name_prefix=run_name,
 
         # All slime args as raw CLI string
@@ -41,13 +44,14 @@ def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
             # Data - using custom reward model path instead of --rm-type
             --input-key messages --label-key label
             --apply-chat-template --rollout-shuffle
+            --apply-chat-template-kwargs '{{"enable_thinking": false}}'
             --prompt-data {{data_path}}/haiku/train.parquet
 
             # Custom reward model - MUST extract final answer (see below)
             --rm-type remote_rm
-            --rm-url https://modal-labs-joy-dev--llm-judge-reward-model-llmjudgeflash.us-east.modal.direct/score
+            --rm-url {get_judge_url(ACTIVE_JUDGE_TYPE)}/score
 
-            --num-rollout 50
+            --num-rollout {NUM_ROLLOUT}
             --rollout-batch-size 128
             --n-samples-per-prompt 8
             --global-batch-size 64
@@ -57,7 +61,7 @@ def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
             --sglang-mem-fraction-static 0.7
             
             # IMPORTANT: Allow reasoning + answer, but keep it reasonable
-            --rollout-max-response-len 300
+            --rollout-max-response-len 100
             
             --rollout-temperature 1
             --rollout-skip-special-tokens 

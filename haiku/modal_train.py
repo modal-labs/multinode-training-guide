@@ -306,12 +306,14 @@ def prepare_dataset():
     def transform_example(example):
         question = f"Write me a haiku about {example['keywords'].lower()}."
         answer = example["text"]
+        # The dataset split the sentences by /, but we want to replace / with a new line
+        answer = answer.replace("/ ", "\n")
         return {
             "question": question,
             "label": answer,
             "messages": [
                 {
-                    "content": "You are a helpful assistant. /no_think",
+                    "content": "You are a helpful assistant.",
                     "role": "system"
                 },
                 {
