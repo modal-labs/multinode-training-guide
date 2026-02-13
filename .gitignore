@@ -173,5 +173,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+
+# experimental
+slime/test_configs
+
 # Ruff cache
 .ruff_cache/
