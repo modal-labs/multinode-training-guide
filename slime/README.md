@@ -2,12 +2,13 @@
 
 ## Example of Async RL using slime on Modal
 
+In separate processes, run:
 ```
-modal profile activate modal-labs
-modal deploy slime/tests/modal_train.py # once
-modal run slime/tests/modal_train.py::prepare # once
-modal run slime/tests/modal_train.py::execute
+modal run slime/modal_train.py::prepare_dataset  # once
+modal run slime/modal_train.py::download_model --config qwen-4b  # once
 ```
-<!-- prepare_dataset
-download_model
-train -->
+
+Then you can run:
+```
+modal run slime/modal_train.py::train_multi_node --config qwen-8b-multi
+```
