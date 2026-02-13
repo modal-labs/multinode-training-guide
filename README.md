@@ -21,6 +21,7 @@ Use this repository to learn how to build distributed training jobs on Modal.
 - [**`nanoGPT/`**](/nanoGPT/) training Karpathy's nanoGPT reproduction of OpenAI's GPT-2.
 - [**`resnet50/`**](/resnet50/) training a ResNet50 model on the ImageNet dataset.
 - [**`starcoder/`**](/starcoder) accelerated finetuning of Llama-2-7B on Rust and Go code, supporting either `torchrun` or `accelerate`.
+- [**`ms-swift/`**](/ms-swift/) LoRA SFT of GLM-4.7 with ms-swift on the same LongMIT-128K dataset used in the Megatron example.
 
 # Documentation
 
