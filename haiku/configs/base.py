@@ -35,6 +35,8 @@ class RLConfig:
     wandb_project: str = "slime-grpo"
     wandb_run_name_prefix: str = ""
 
+    save_steps: int = 10  # Save checkpoint every N rollouts
+
     # Raw CLI args - passed directly to slime, no parsing/validation
     # Use triple-quoted strings for readability with comments
     slime_args: str = ""

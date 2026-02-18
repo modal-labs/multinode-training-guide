@@ -1,12 +1,13 @@
 """
 LLM-as-a-Judge Reward Model for SLIME GRPO training.
 
-Uses CMUdict for syllable counting: https://github.com/cmusphinx/cmudict
-Recommended by various packages such as `syllables` and `nltk`.
+Uses vLLM's built-in OpenAI-compatible server with tool-calling support,
+and CMUdict for syllable counting: https://github.com/cmusphinx/cmudict
 """
 
 import asyncio
 from enum import Enum
+import os
 import threading
 
 import aiohttp
@@ -40,16 +41,14 @@ app = modal.App(f"llm-judge-{ACTIVE_JUDGE_TYPE.value}")
 FLASH_PORT = 8000
 VLLM_PORT = 8001
 
-MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-MODEL_NAME = "qwen3-30b-a3b-instruct"
-N_GPU = 1
+MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+MODEL_NAME = "qwen3-235b-a22b-instruct"
+N_GPU = 4
 MINUTES = 60
+IDLE_TIMEOUT = 600
 
-checkpoint_volume = modal.Volume.from_name("unsloth-checkpoints")
-hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
-
-
+model_cache = modal.Volume.from_name("haiku-llm-judge-model-cache", create_if_missing=True, version=2)
+triton_cache = modal.Volume.from_name("haiku-llm-judge-triton-cache", create_if_missing=True, version=2)
 
 
 
@@ -66,24 +65,24 @@ def _make_judge(judge_type: JudgeType):
 # =============================================================================
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
-    .entrypoint([])
+    modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
-        "vllm==0.11.2",
-        "huggingface-hub==0.36.0",
-        "flashinfer-python==0.5.2",
+        "vllm>=0.8.0",
+        "torch",
+        "transformers",
+        "huggingface_hub",
         "aiohttp>=3.9.0",
         "pydantic>=2.0.0",
         "fastapi[standard]>=0.115.0",
         "uvicorn>=0.30.0",
         "nltk>=3.8.0",
     )
-    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
     .run_commands(
         "python -c \"import nltk; nltk.download('cmudict'); nltk.download('punkt_tab')\""
     )
     .add_local_dir("llm_judges", "/root/llm_judges")
 )
+
 
 # =============================================================================
 # Modal Flash Endpoint
@@ -102,6 +101,7 @@ def create_fastapi_app(judge_type: JudgeType):
     class ScoreRequest(BaseModel):
         prompt: str
         response: str
+        label: str
 
     @fastapi_app.post("/score")
     async def score(request: ScoreRequest) -> float:
@@ -128,13 +128,14 @@ def create_fastapi_app(judge_type: JudgeType):
 
         prompt = request.prompt
         response_text = request.response
+        label = request.label
 
         if prompt is None or response_text is None:
             return None
 
         async with aiohttp.ClientSession() as session:
             result = await judge.score_single(
-                MODEL_NAME, session, prompt, response_text, cmudict
+                MODEL_NAME, session, prompt, response_text, label, cmudict
             )
 
         return float(result)
@@ -149,19 +150,19 @@ def create_fastapi_app(judge_type: JudgeType):
 @app.cls(
     image=image,
     gpu=f"H100:{N_GPU}",
-    min_containers=3,
-    scaledown_window=15 * MINUTES,
+    min_containers=10,
+    scaledown_window=IDLE_TIMEOUT,
     volumes={
-        "/root/.cache/huggingface": hf_cache_vol,
-        "/root/.cache/vllm": vllm_cache_vol,
-        "/checkpoints": checkpoint_volume,
+        "/root/.cache/huggingface": model_cache,
+        "/root/.triton/cache": triton_cache,
     },
     secrets=[modal.Secret.from_name("huggingface-secret")],
     experimental_options={"flash": "us-east"},
     region="us-east",
+    startup_timeout=1800,
 )
 @modal.concurrent(  # how many requests can one replica handle? tune carefully!
-    target_inputs=8
+    target_inputs=64
 )
 class LLMJudge:
     """Modal Flash endpoint combining vLLM + scoring logic in one container.
@@ -177,27 +178,36 @@ class LLMJudge:
         import uvicorn
 
 
-        # Start vLLM on VLLM_PORT (internal)
+        # Start vLLM OpenAI-compatible server on VLLM_PORT (internal)
         cmd = [
-            "vllm",
-            "serve",
-            "--uvicorn-log-level=info",
-            MODEL,
-            "--served-model-name",
-            MODEL_NAME,
-            "--port",
-            str(VLLM_PORT),
-            "--enforce-eager",
-            "--tensor-parallel-size",
-            str(N_GPU),
-            "--max-model-len",
-            "8192",
+            "python", "-m", "vllm.entrypoints.openai.api_server",
+            "--model", MODEL_ID,
+            "--served-model-name", MODEL_NAME,
+            "--tensor-parallel-size", str(N_GPU),
+            "--dtype", "auto",
+            "--max-model-len", "8192",
+            "--gpu-memory-utilization", "0.90",
+            "--max-num-seqs", "32",
+            "--trust-remote-code",
+            "--port", str(VLLM_PORT),
+            "--host", "0.0.0.0",
         ]
         print(" ".join(cmd))
-        self._vllm_process = subprocess.Popen(" ".join(cmd), shell=True)
+        env = {
+            **os.environ,
+            "VLLM_LOGGING_LEVEL": "DEBUG",
+            "PYTHONUNBUFFERED": "1",
+        }
+        self._vllm_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        self._start_log_reader()
 
-        # Wait for vLLM to be ready
-        self._wait_for_port(VLLM_PORT, timeout=600)
+        self._wait_for_vllm_ready(VLLM_PORT, timeout=1800)
         print(f"vLLM ready on port {VLLM_PORT}")
 
         # Start FastAPI scoring endpoint on FLASH_PORT (exposed)
@@ -216,6 +226,41 @@ class LLMJudge:
         self.flash_manager = modal.experimental.flash_forward(FLASH_PORT)
         print(f"Flash endpoint ready on port {FLASH_PORT} (judge={ACTIVE_JUDGE_TYPE.value})")
 
+    def _start_log_reader(self):
+        def reader():
+            for line in self._vllm_process.stdout:
+                print(f"[vLLM] {line}", end="", flush=True)
+        self._log_thread = threading.Thread(target=reader, daemon=True)
+        self._log_thread.start()
+
+    def _wait_for_vllm_ready(self, port: int, timeout: int = 600):
+        """Wait for vLLM's /health endpoint to return 200 (model fully loaded)."""
+        import time
+        import urllib.error
+        import urllib.request
+
+        start = time.time()
+        health_url = f"http://localhost:{port}/health"
+
+        while time.time() - start < timeout:
+            rc = self._vllm_process.poll()
+            if rc is not None:
+                raise RuntimeError(f"vLLM process exited with code {rc}")
+
+            try:
+                with urllib.request.urlopen(health_url, timeout=5) as resp:
+                    if resp.status == 200:
+                        return
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+                pass
+
+            elapsed = int(time.time() - start)
+            if elapsed % 30 == 0 and elapsed > 0:
+                print(f"Still waiting for vLLM to load model... ({elapsed}s elapsed)")
+            time.sleep(2)
+
+        raise RuntimeError(f"vLLM failed to become ready after {timeout}s")
+
     def _wait_for_port(self, port: int, timeout: int = 30):
         import socket
         import time
@@ -226,7 +271,7 @@ class LLMJudge:
                 return
             except OSError:
                 time.sleep(1)
-        raise RuntimeError(f"Server failed to start on port {port}")
+        raise RuntimeError(f"Server failed to start on port {port} after {timeout}s")
 
     @modal.method()
     def keepalive(self):

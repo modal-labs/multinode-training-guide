@@ -19,38 +19,46 @@ from llm_judges.nlp import diff_syllables_count, segment_haiku_lines
 # Shared Prompt Template
 # =============================================================================
 
+MODAL_VOCABS = [
+    "modal",
+    "volume"
+    "function",
+    "sandbox",
+    "flash",
+    "inference",
+    "train",
+]
 
-def generate_haiku_judge_prompt(prompt: str, response: str) -> str:
-    modal_vocabs = [
-        "modal",
-        "volume"
-        "function",
-        "sandbox",
-        "flash",
-        "inference",
-        "train",
-    ]
-
-    modal_vocab_str = ", ".join(modal_vocabs)
+def generate_haiku_judge_prompt(prompt: str, response: str, label: str) -> str:
+    modal_vocab_str = ", ".join(MODAL_VOCABS)
 
     return f"""You are evaluating a haiku poem.
 
     Score the response based on the following criteria:
     
-    Relevance (3 points total)
-    - 3 points: if the response is relevant to the topic "{prompt}" and it is the central theme of the haiku
+    Relevance (5 points total)
+    - 5 points: if the central theme and punchline of the haiku is "{prompt}"
+    - 3 points: if the response directly discusses "{prompt}" but it is not the central theme
     - 2 points: if the response is relevant to the topic "{prompt}" but very plain
     - 0 points: if the response is not relevant to the topic "{prompt}"
 
-    Poetic quality (2 points total)
-    - 2 points: if the response can be considered a poem and proper haiku, with a clear theme and punchline
-    - 1 point: if the response is somewhat themed but not a proper poem or incoherent
+    Poetic quality (5 points total)
+    - 5 points: if the response makes sense, can be considered a poetic haiku, with a clear theme and punchline
+    - 3 point: if the response makes sense, but is not very poetic
+    - 1 point: if the response doesn't make sense
     - 0 points: if the response is not poetic and incoherent
 
-    Uses Modal vocabulary (5 points total): {modal_vocab_str}
-    - 5 points: if the response uses the above words in a way that is relevant to the topic "{prompt}"
+    Uses Modal vocabulary (5 points total): (modal vocab: {modal_vocab_str})
+    - 5 points: if the response uses the above words in a way that is coherent and relevant to the topic "{prompt}"
     - 3 points: if the response uses the above words in a way that is not relevant to the topic "{prompt}"
     - 0 points: if the response does not use the above words
+
+    Better than the existing poem (5 points total):
+    Given the existing poem, score the response by comparing its quality to the existing poem:
+    {label}
+    - 5 points: if the response is better than the poem "{label}".
+    - 3 points: if the response is equal in quality to the poem "{label}".
+    - 0 points: if the response is worse than the poem "{label}".
 
     Add up the scores from the above criteria to get the total score.
 
@@ -61,7 +69,7 @@ def generate_haiku_judge_prompt(prompt: str, response: str) -> str:
     {response}
     ---
 
-    Output ONLY a single number (0-10), nothing else."""
+    Output ONLY a single number (0-20), nothing else."""
 
 
 class HaikuJudge(ABC):
@@ -75,7 +83,7 @@ class HaikuJudge(ABC):
     """
 
     MAX_STRUCTURE_SCORE = 1
-    MAX_STYLE_SCORE = 10
+    MAX_STYLE_SCORE = 20
 
     @property
     @abstractmethod
@@ -123,10 +131,11 @@ class HaikuJudge(ABC):
         session: aiohttp.ClientSession,
         prompt: str,
         response: str,
+        label: str,
         vllm_base_url: str = f"http://localhost:{VLLM_PORT}",
     ) -> float:
         """Score haiku style via LLM judge (0-1), or 0 on error."""
-        judge_prompt = generate_haiku_judge_prompt(prompt, response)
+        judge_prompt = generate_haiku_judge_prompt(prompt, response, label)
 
         try:
             async with session.post(
@@ -163,6 +172,7 @@ class HaikuJudge(ABC):
         session: aiohttp.ClientSession,
         prompt: str,
         response: str,
+        label: str,
         cmudict: dict,
     ) -> float:
         """Score a single haiku. Returns a normalized score in [0, 1]."""

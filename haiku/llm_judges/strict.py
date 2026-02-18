@@ -27,6 +27,7 @@ class StrictJudge(HaikuJudge):
         session: aiohttp.ClientSession,
         prompt: str,
         response: str,
+        label: str,
         cmudict: dict,
     ) -> float:
         structure_score = self.score_haiku_structure(response, cmudict, allow_off_by_one=False)

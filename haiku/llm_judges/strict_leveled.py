@@ -27,14 +27,15 @@ class StrictLeveledJudge(HaikuJudge):
         session: aiohttp.ClientSession,
         prompt: str,
         response: str,
+        label: str,
         cmudict: dict,
     ) -> float:
-        structure_score = self.score_haiku_structure(response, cmudict, allow_off_by_one=False)
+        structure_score = self.score_haiku_structure(response=response, cmudict=cmudict, allow_off_by_one=False)
 
         style_score = 0.0
         if structure_score >= 1.0:
             style_score = await self.score_haiku_style(
-                model_name, session, prompt, response
+                model_name=model_name, session=session, prompt=prompt, label=label, response=response
             )
             if style_score < 0:
                 style_score = 0.0

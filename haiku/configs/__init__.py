@@ -9,7 +9,7 @@ from .base import RLConfig
 _CONFIGS: dict[str, Callable[[str], RLConfig]] = {}
 
 
-def get_config(name: str, run_name: str) -> RLConfig:
+def get_config(name: str, run_name: str = "") -> RLConfig:
     """Get a config by name."""
     if name not in _CONFIGS:
         available = ", ".join(sorted(_CONFIGS.keys()))

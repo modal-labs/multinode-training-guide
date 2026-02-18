@@ -7,10 +7,29 @@ import modal
 app = modal.App("serve-haiku-model")
 
 MODELS_PATH: Path = Path("/models")
-MODEL_PATH = "Qwen3-4B-singlenode-20260211-161245"  # Update this!
-BASE_MODEL_NAME = "Qwen3-0.6B"
 
-ITERS_DIR = "iter_0000049"
+TRAINED_MODELS = {
+    "step-9": {
+        "MODEL_PATH": "Qwen3-4B-singlenode-20260217-214733",
+        "ITERS_DIR": "iter_0000009",
+    },
+    "step-19": {
+        "MODEL_PATH": "Qwen3-4B-singlenode-20260217-214733",
+        "ITERS_DIR": "iter_0000019",
+    },
+    "step-29": {
+        "MODEL_PATH": "Qwen3-4B-singlenode-20260217-214733",
+        "ITERS_DIR": "iter_0000029",
+    },
+    "step-31": {
+        "MODEL_PATH": "Qwen3-4B-singlenode-20260217-214232",
+        "ITERS_DIR": "iter_0000031",
+    },
+}
+
+MODEL_PATH = "Qwen3-4B-singlenode-20260217-214232"  # Update this!
+BASE_MODEL_NAME = "Qwen3-4B"
+
 HF_DIR = "hf"
 
 MODEL_NAME = "slime-qwen"
@@ -20,9 +39,9 @@ VLLM_PORT = 8000
 
 
 # Same volume used in training
-checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints")
-hf_cache_vol = modal.Volume.from_name("huggingface-cache")
-vllm_cache_vol = modal.Volume.from_name("vllm-cache")
+checkpoints_volume: modal.Volume = modal.Volume.from_name("slime-haiku-checkpoints", create_if_missing=True)
+hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 vllm_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
@@ -45,7 +64,6 @@ slime_image = (
         r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
         r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/qwen/qwen3_bridge.py""",
     )
-    .add_local_dir("test-configs", remote_path="/root/test-configs", copy=True)
     .add_local_dir("tools", remote_path="/root/tools", copy=True)
     .entrypoint([])
 )
@@ -67,7 +85,8 @@ def get_megatron_checkpoint_path() -> str:
 async def convert_checkpoint(
     model_path: str,
     iter_dir: str,
-    origin_hf_dir: str = BASE_MODEL_NAME
+    origin_hf_dir: str = BASE_MODEL_NAME,
+    force: bool = False
 ):
     """Convert Megatron checkpoint to HuggingFace format."""
     from huggingface_hub import snapshot_download
@@ -85,7 +104,40 @@ async def convert_checkpoint(
     megatron_checkpoint_path = MODELS_PATH / model_path / iter_dir
     output_hf_path = MODELS_PATH / model_path / HF_DIR
     
-    subprocess.run(f"PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py --input-dir {megatron_checkpoint_path} --output-dir {output_hf_path} --origin-hf-dir {local_hf_dir}", shell=True, check=True)
+    subprocess.run(f"PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py --input-dir {megatron_checkpoint_path} --output-dir {output_hf_path} --origin-hf-dir {local_hf_dir}" + (f" --force" if force else ""), shell=True, check=True)
+
+
+def _serve_step(step_name: str):
+    import subprocess
+
+    model_path = TRAINED_MODELS[step_name]["MODEL_PATH"]
+    iter_dir = TRAINED_MODELS[step_name]["ITERS_DIR"]
+
+    if not (MODELS_PATH / model_path / HF_DIR).joinpath("config.json").exists():
+        print(f"Converting checkpoint {MODEL_PATH} to HuggingFace format...")
+        convert_checkpoint.remote(model_path=MODEL_PATH, iter_dir=iter_dir)
+        print(f"Checkpoint {MODEL_PATH}/{iter_dir} converted to HuggingFace format.")
+
+    cmd = [
+        "vllm",
+        "serve",
+        str(MODELS_PATH / MODEL_PATH / HF_DIR),
+        "--served-model-name",
+        MODEL_NAME,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(VLLM_PORT),
+        "--enforce-eager",
+        "--tensor-parallel-size",
+        str(N_GPU),
+        "--reasoning-parser",
+        "qwen3",
+    ]
+
+    print(" ".join(cmd))
+    subprocess.Popen(" ".join(cmd), shell=True)
+
 
 
 @app.function(
@@ -104,34 +156,70 @@ async def convert_checkpoint(
 )
 @modal.concurrent(max_inputs=32)
 @modal.web_server(port=VLLM_PORT, startup_timeout=10 * MINUTES)
-def serve():
-    import subprocess
+def serve_step_9():
+    _serve_step("step-9")
 
-    if not (MODELS_PATH / MODEL_PATH / HF_DIR).joinpath("config.json").exists():
-        print(f"Converting checkpoint {MODEL_PATH} to HuggingFace format...")
-        convert_checkpoint.remote(model_path=MODEL_PATH, iter_dir=ITERS_DIR)
-        print(f"Checkpoint {MODEL_PATH}/{ITERS_DIR} converted to HuggingFace format.")
 
-    cmd = [
-        "vllm",
-        "serve",
-        str(MODELS_PATH / MODEL_PATH / HF_DIR),
-        "--served-model-name",
-        MODEL_NAME,
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(VLLM_PORT),
-        "--enforce-eager",
-        "--tensor-parallel-size",
-        str(N_GPU),
-        "--reasoning-parser",
-        "qwen3"
-    ]
+@app.function(
+    image=vllm_image,
+    gpu=f"H100:{N_GPU}",
+    scaledown_window=15 * MINUTES,
+    timeout=10 * MINUTES,
+    min_containers=1,
+    max_containers=1,
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+        MODELS_PATH.as_posix(): checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+@modal.concurrent(max_inputs=32)
+@modal.web_server(port=VLLM_PORT, startup_timeout=10 * MINUTES)
+def serve_step_19():
+    _serve_step("step-19")
 
-    print(" ".join(cmd))
-    subprocess.Popen(" ".join(cmd), shell=True)
 
+
+
+@app.function(
+    image=vllm_image,
+    gpu=f"H100:{N_GPU}",
+    scaledown_window=15 * MINUTES,
+    timeout=10 * MINUTES,
+    min_containers=1,
+    max_containers=1,
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+        MODELS_PATH.as_posix(): checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+@modal.concurrent(max_inputs=32)
+@modal.web_server(port=VLLM_PORT, startup_timeout=10 * MINUTES)
+def serve_step_29():
+    _serve_step("step-29")
+
+
+@app.function(
+    image=vllm_image,
+    gpu=f"H100:{N_GPU}",
+    scaledown_window=15 * MINUTES,
+    timeout=10 * MINUTES,
+    min_containers=1,
+    max_containers=1,
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+        MODELS_PATH.as_posix(): checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+@modal.concurrent(max_inputs=32)
+@modal.web_server(port=VLLM_PORT, startup_timeout=10 * MINUTES)
+def serve_step_31():
+    _serve_step("step-31")
 
 
 @app.function(
@@ -178,7 +266,11 @@ def serve_base():
         "--tensor-parallel-size",
         str(N_GPU),
         "--reasoning-parser",
-        "qwen3"
+        "qwen3",
+        # CORS for browser requests
+        "--allowed-origins", "*",
+        "--allowed-methods", "GET,POST,OPTIONS",
+        "--allowed-headers", "*",
     ]
 
     print(" ".join(cmd))

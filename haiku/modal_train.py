@@ -37,8 +37,9 @@ from pathlib import Path
 from typing import Optional
 import time
 
+from llm_judges.base import MODAL_VOCABS
+from llm_judges.deploy import ACTIVE_JUDGE_TYPE
 import modal
-import modal.experimental
 
 from configs.base import RLConfig
 
@@ -63,6 +64,7 @@ image = (
     )
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
+    .add_local_python_source("llm_judges", copy=True)
     .add_local_dir("tools", remote_path="/root/tools", copy=True)
 )
 
@@ -84,8 +86,8 @@ DATA_PATH: Path = Path("/data")
 MODELS_PATH: Path = Path("/models")
 
 # Volumes
-data_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-data", create_if_missing=True)
-checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints", create_if_missing=True)
+data_volume: modal.Volume = modal.Volume.from_name("slime-haiku-data", create_if_missing=True, version=2)
+checkpoints_volume: modal.Volume = modal.Volume.from_name("slime-haiku-checkpoints", create_if_missing=True, version=2)
 
 # Ray configuration
 RAY_PORT = 6379
@@ -98,7 +100,7 @@ SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 
 # App name from environment variable (set before running modal)
 # Usage: SLIME_APP_NAME="my-experiment" modal run modal_train.py ...
-APP_NAME = os.environ.get("SLIME_APP_NAME", "slime-haiku-grpo")
+APP_NAME = os.environ.get("SLIME_APP_NAME", f"slime-haiku-grpo-{ACTIVE_JUDGE_TYPE.value}")
 app = modal.App(APP_NAME)
 
 
@@ -245,11 +247,13 @@ async def run_training(
     job_id = client.submit_job(entrypoint=slime_cmd, runtime_env=runtime_env)
     print(f"Job submitted with ID: {job_id}")
 
-    async for line in client.tail_job_logs(job_id):
-        print(line, end="", flush=True)
-
-    await checkpoints_volume.commit.aio()
-    print("Checkpoints saved and committed to volume")
+    try:
+        async for line in client.tail_job_logs(job_id):
+            print(line, end="", flush=True)
+    finally:
+        # Always commit checkpoints, even on failure
+        await checkpoints_volume.commit.aio()
+        print("Checkpoints saved and committed to volume")
 
         
 
@@ -313,7 +317,7 @@ def prepare_dataset():
             "label": answer,
             "messages": [
                 {
-                    "content": "You are a helpful assistant.",
+                    "content": "You are a haiku poet. You will be given a prompt and you will need to write a haiku about the prompt. Try to incorproate these words into the haiku if possible: " + ", ".join(MODAL_VOCABS),
                     "role": "system"
                 },
                 {

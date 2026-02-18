@@ -10,7 +10,8 @@ from .base import (
 
 from llm_judges.deploy import get_judge_url, ACTIVE_JUDGE_TYPE
 
-NUM_ROLLOUT = 200
+NUM_ROLLOUT = 32
+SAVE_INTERVAL = 10  # Save checkpoint every 10 (default is 100)
 
 def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
     return RLConfig(
@@ -25,7 +26,10 @@ def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
 
         # Wandb
         wandb_project="slime-haiku",
-        wandb_run_name_prefix=run_name,
+        wandb_run_name_prefix=f"{run_name}-rollout_{NUM_ROLLOUT}_judge_{ACTIVE_JUDGE_TYPE.value}",
+
+        # Checkpointing - save frequently to avoid losing progress on crash
+        save_steps=SAVE_INTERVAL,
 
         # All slime args as raw CLI string
         slime_args=f"""
@@ -52,7 +56,8 @@ def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
             --rm-url {get_judge_url(ACTIVE_JUDGE_TYPE)}/score
 
             --num-rollout {NUM_ROLLOUT}
-            --rollout-batch-size 128
+            --num-rollout-iters 100
+            --rollout-batch-size 64
             --n-samples-per-prompt 8
             --global-batch-size 64
 
@@ -73,7 +78,7 @@ def get_config(run_name: str = "qwen3-4b-haiku") -> RLConfig:
 
             # Eval
             --eval-prompt-data haiku {{data_path}}/haiku/test.parquet
-            --eval-interval 20
+            --eval-interval 5
             --n-samples-per-eval-prompt 8
             --eval-max-response-len 300
             --eval-top-p 1
