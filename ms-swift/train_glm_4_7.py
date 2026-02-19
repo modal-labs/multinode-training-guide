@@ -26,7 +26,6 @@ import modal.experimental
 
 HF_MODEL = "zai-org/GLM-4.7"
 
-COMMON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common")
 DEFAULT_MAX_EPOCHS = 4
 DEFAULT_MAX_LENGTH = 2048
 DEFAULT_LORA_RANK = 128
@@ -37,7 +36,7 @@ PP_SIZE = 4
 EP_SIZE = 4
 CP_SIZE = 1
 
-app = modal.App("glm-4-7-ms-swift")
+app = modal.App("example-ms-swift-glm_4_7-lora")
 
 # Volumes — use volumes V2
 models_volume = modal.Volume.from_name(
@@ -96,8 +95,8 @@ msswift_v4_image = (
         # Reinstall transformers with GLM-4 MoE support
         # Stay in 4.x — Baseten's peft is incompatible with transformers 5.x
         "transformers==4.57.3",
-        # ms-swift v4 from main — verify it supports glm4_moe in Megatron mode
-        "ms-swift @ git+https://github.com/modelscope/ms-swift.git@main",
+        # ms-swift v4, patched to support pipeline parallelism and n_steps in logging
+        "ms-swift @ git+https://github.com/joyliu-q/ms-swift.git@joy/patch-pp-log-emission-issue",
         "einops",
         "wandb==0.19.1",
     )
@@ -125,7 +124,6 @@ msswift_v4_image = (
             "TORCH_NCCL_BLOCKING_WAIT": "1",
         }
     )
-    .add_local_dir(COMMON_DIR, remote_path="/root/common/")
 )
 
 
@@ -279,7 +277,6 @@ def train_model(
     run_id: str,
     data_folder: str = "gsm8k",
     dataset: str = "",
-    cached_dataset: bool = False,
     train_type: str = "lora",
     merge_lora: bool = False,
     lora_rank: int = DEFAULT_LORA_RANK,
@@ -316,18 +313,6 @@ def train_model(
         raise ValueError(
             f"TP/EP/PP/CP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}"
         )
-    # if total_gpus % (tp_size * pp_size * cp_size) != 0:
-    #     raise ValueError(
-    #         f"Invalid non-expert parallelism for {total_gpus} GPUs: "
-    #         f"TP={tp_size}, PP={pp_size}, CP={cp_size} "
-    #         "(total_gpus must be divisible by TP*PP*CP)"
-    #     )
-    # if total_gpus % (tp_size * ep_size * pp_size * cp_size) != 0:
-    #     raise ValueError(
-    #         f"Invalid expert parallelism for {total_gpus} GPUs: "
-    #         f"TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size} "
-    #         "(total_gpus must be divisible by TP*EP*PP*CP)"
-    #     )
     non_expert_dp = total_gpus // (tp_size * pp_size * cp_size)
     expert_dp = total_gpus // (tp_size * ep_size * pp_size * cp_size)
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
@@ -395,9 +380,7 @@ def train_model(
                     total_text_chars += len(line)
         return rows, total_text_chars, parse_errors
 
-    if cached_dataset:
-        print("Dataset preflight: using cached dataset; skipping local row/token estimate")
-    elif dataset.endswith(".jsonl") and os.path.exists(dataset):
+    if dataset.endswith(".jsonl") and os.path.exists(dataset):
         dataset_rows, total_text_chars, parse_errors = _analyze_jsonl_dataset(dataset)
         val_rows = max(1, math.ceil(dataset_rows * split_dataset_ratio)) if dataset_rows else 0
         train_rows = max(dataset_rows - val_rows, 0)
@@ -486,9 +469,6 @@ def train_model(
             str(split_dataset_ratio),
             # Passthrough template: bypass ms-swift template processing
             # patch_wandb_artifacts: disable Megatron's artifact upload (path mismatch with ms-swift)
-            "--external_plugins",
-            "/root/common/patch_wandb_artifacts.py",
-            "/root/common/patch_ms_swift_n_steps.py",
             # Parallelism — TODO(joy): Attribute this
             "--tensor_model_parallel_size",
             str(tp_size),
