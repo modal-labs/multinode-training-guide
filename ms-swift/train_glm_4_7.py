@@ -29,22 +29,23 @@ HF_MODEL = "zai-org/GLM-4.7"
 COMMON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common")
 DEFAULT_MAX_EPOCHS = 4
 DEFAULT_MAX_LENGTH = 2048
-DEFAULT_LORA_RANK = 32
+DEFAULT_LORA_RANK = 128
 DEFAULT_LORA_ALPHA = 32
 
-TP_SIZE = 4
-PP_SIZE = 2
-EP_SIZE = 2
+TP_SIZE = 2
+PP_SIZE = 4
+EP_SIZE = 4
+CP_SIZE = 1
 
 app = modal.App("glm-4-7-ms-swift")
 
 # Volumes — use volumes V2
 models_volume = modal.Volume.from_name(
-    "glm-4-7-models", create_if_missing=True, version=2
+    "glm-4-7-models", create_if_missing=True, version=2, environment_name="joy-dev",
 )
-data_volume = modal.Volume.from_name("glm-4-7-data", create_if_missing=True, version=2)
+data_volume = modal.Volume.from_name("glm-4-7-data", create_if_missing=True, version=2, environment_name="joy-dev",)
 checkpoints_volume = modal.Volume.from_name(
-    "glm-4-7-checkpoints", create_if_missing=True, version=2
+    "glm-4-7-checkpoints", create_if_missing=True, version=2, environment_name="joy-dev",
 )
 
 MODELS_DIR = "/models"
@@ -54,7 +55,7 @@ CHECKPOINTS_DIR = "/checkpoints"
 # N_NODES via env var (evaluated at decoration time by @clustered).
 # Default 2 (2 x B200:8).
 # Usage: N_NODES=2 modal run --detach train_glm_4_7.py --train ...
-N_NODES = int(os.environ.get("N_NODES", "2"))
+N_NODES = int(os.environ.get("N_NODES", "4"))
 
 # Download image (lightweight)
 download_image = (
@@ -113,7 +114,7 @@ msswift_v4_image = (
             # (122K tokens × 152K vocab × fp32 = 69 GB) instead of using fused CE loss
             "TORCHDYNAMO_DISABLE": "1",
             # NCCL debug — surface real error behind "unhandled cuda error"
-            "NCCL_DEBUG": "INFO",
+            "NCCL_DEBUG": "WARN",
             "NCCL_DEBUG_SUBSYS": "ALL",
             "NCCL_TIMEOUT": "300",
             "TORCH_NCCL_ENABLE_MONITORING": "1",
@@ -288,6 +289,7 @@ def train_model(
     tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
     pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
     global_batch_size: int = 8,
     lr: float = 1e-4,
     moe_aux_loss_coeff: float = 1e-3,
@@ -310,27 +312,28 @@ def train_model(
     )
 
     total_gpus = n_nodes * 8
-    if tp_size <= 0 or ep_size <= 0 or pp_size <= 0:
+    if tp_size <= 0 or ep_size <= 0 or pp_size <= 0 or cp_size <= 0:
         raise ValueError(
-            f"TP/EP/PP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}"
+            f"TP/EP/PP/CP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}"
         )
-    if total_gpus % (tp_size * pp_size) != 0:
-        raise ValueError(
-            f"Invalid non-expert parallelism for {total_gpus} GPUs: "
-            f"TP={tp_size}, PP={pp_size} (total_gpus must be divisible by TP*PP)"
-        )
-    if total_gpus % (tp_size * ep_size * pp_size) != 0:
-        raise ValueError(
-            f"Invalid expert parallelism for {total_gpus} GPUs: "
-            f"TP={tp_size}, EP={ep_size}, PP={pp_size} "
-            "(total_gpus must be divisible by TP*EP*PP)"
-        )
-    non_expert_dp = total_gpus // (tp_size * pp_size)
-    expert_dp = total_gpus // (tp_size * ep_size * pp_size)
+    # if total_gpus % (tp_size * pp_size * cp_size) != 0:
+    #     raise ValueError(
+    #         f"Invalid non-expert parallelism for {total_gpus} GPUs: "
+    #         f"TP={tp_size}, PP={pp_size}, CP={cp_size} "
+    #         "(total_gpus must be divisible by TP*PP*CP)"
+    #     )
+    # if total_gpus % (tp_size * ep_size * pp_size * cp_size) != 0:
+    #     raise ValueError(
+    #         f"Invalid expert parallelism for {total_gpus} GPUs: "
+    #         f"TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size} "
+    #         "(total_gpus must be divisible by TP*EP*PP*CP)"
+    #     )
+    non_expert_dp = total_gpus // (tp_size * pp_size * cp_size)
+    expert_dp = total_gpus // (tp_size * ep_size * pp_size * cp_size)
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
     print(f"Model: {HF_MODEL}")
     print(
-        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, "
+        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, "
         f"non-expert DP={non_expert_dp}, expert DP={expert_dp}"
     )
 
@@ -461,7 +464,7 @@ def train_model(
     os.environ["NODE_RANK"] = str(node_rank)
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = "29500"
-    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["NCCL_DEBUG"] = "WARN"
 
     # Build megatron sft command — epoch-based
     cmd = [
@@ -485,6 +488,7 @@ def train_model(
             # patch_wandb_artifacts: disable Megatron's artifact upload (path mismatch with ms-swift)
             "--external_plugins",
             "/root/common/patch_wandb_artifacts.py",
+            "/root/common/patch_ms_swift_n_steps.py",
             # Parallelism — TODO(joy): Attribute this
             "--tensor_model_parallel_size",
             str(tp_size),
@@ -492,6 +496,8 @@ def train_model(
             str(ep_size),
             "--pipeline_model_parallel_size",
             str(pp_size),
+            "--context_parallel_size",
+            str(cp_size),
             "--sequence_parallel",
             "true",
             # MoE settings

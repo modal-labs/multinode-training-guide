@@ -454,7 +454,7 @@ def train_model(
         # patch_wandb_artifacts: disable Megatron's artifact upload (path mismatch with ms-swift)
         # "--external_plugins", "/root/common/passthrough_template.py", "/root/common/patch_wandb_artifacts.py",
         # "--template", "passthrough",
-        "--external_plugins", "/root/common/patch_wandb_artifacts.py",
+        "--external_plugins", "/root/common/patch_wandb_artifacts.py", "/root/common/patch_ms_swift_n_steps.py",
 
         # Parallelism — LoRA: EP=4, TP=1. Full SFT 128K: TP=2, EP=4, PP=4.
         "--expert_model_parallel_size", str(ep_size),
