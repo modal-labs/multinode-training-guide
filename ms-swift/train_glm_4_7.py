@@ -10,28 +10,13 @@ ms-swift handles HF→Megatron conversion internally (no separate convert step n
 
 Usage:
     # Download model (once)
-    modal run train_glm_4_7.py --download
+    modal run train_glm_4_7.py::download_model
 
     # Download training data
-    modal run train_glm_4_7.py --download-data-flag --hf-dataset openai/gsm8k --data-folder gsm8k
-    modal run train_glm_4_7.py --download-data-flag --hf-dataset microsoft/orca-math-word-problems-200k --data-folder orca-math-word-problems-200k
+    modal run train_glm_4_7.py::prepare_dataset --hf-dataset openai/gsm8k --data-folder gsm8k --split train
 
-    # LoRA (default), 4 epochs, 128K context
-    modal run --detach train_glm_4_7.py --train \
-        --run-id r7kezf75 --data-folder 2026-02-16 --max-length 131072 --max-epochs 4 \
-        --lora-rank 32 --lora-alpha 32
-
-    # Cached/preprocessed dataset
-    N_NODES=2 modal run --detach train_glm_4_7.py --train \
-        --data-folder 2026-02-16 --cached-dataset --preprocessed-dir /data/2026-02-16/preprocessed_glm47
-
-Parallelism notes:
-    - Megatron has TWO DP values: non-expert DP and expert DP
-    - Non-expert DP = world_size / (TP * PP) — used for batch size divisibility check
-    - Expert DP = world_size / (TP * EP * PP) — how expert layers are replicated
-    - global_batch_size must be divisible by micro_batch_size * non-expert-DP
-    - Default parallelism for 2 nodes (16 GPUs): TP=4, EP=2, PP=2
-    - TP max is 8 (model has 8 KV heads)
+    # LoRA (default)
+    modal run train_glm_4_7.py::train_model --run-id [your-run-id]
 """
 
 import os
@@ -42,14 +27,13 @@ import modal.experimental
 HF_MODEL = "zai-org/GLM-4.7"
 
 COMMON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common")
-DEFAULT_DATA_FOLDER = "2026-02-16"
 DEFAULT_MAX_EPOCHS = 4
 DEFAULT_MAX_LENGTH = 2048
 DEFAULT_LORA_RANK = 32
 DEFAULT_LORA_ALPHA = 32
 
-TP_SIZE = 8
-PP_SIZE = 1
+TP_SIZE = 4
+PP_SIZE = 2
 EP_SIZE = 2
 
 app = modal.App("glm-4-7-ms-swift")
@@ -181,8 +165,8 @@ def download_model(force: bool = False):
     timeout=3600,
 )
 def prepare_dataset(
-    data_folder: str = "aime",
-    hf_dataset: str = "AI-MO/aimo-validation-aime",
+    data_folder: str = "gsm8k",
+    hf_dataset: str = "openai/gsm8k",
     split: str = "train",
     input_col: str = "",
     output_col: str = "",
@@ -191,10 +175,23 @@ def prepare_dataset(
 
     Auto-detects input/output columns from common patterns:
       problem/solution, question/answer, input/output, prompt/response
+    
+    ms-swift expects the dataset to be in the format of:
+    {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Question?"},
+            {
+                "role": "assistant",
+                "content": "Answer."
+            }
+        ]
+    }
 
     Args:
         data_folder: Folder name in volume
-        hf_dataset: HuggingFace dataset path (e.g., "AI-MO/aimo-validation-aime", "openai/gsm8k")
+        hf_dataset: HuggingFace dataset path (e.g., "openai/gsm8k")
         split: Dataset split to use
         input_col: Override input column name
         output_col: Override output column name
@@ -279,10 +276,9 @@ def prepare_dataset(
 @modal.experimental.clustered(size=N_NODES, rdma=True)
 def train_model(
     run_id: str,
-    data_folder: str = DEFAULT_DATA_FOLDER,
+    data_folder: str = "gsm8k",
     dataset: str = "",
     cached_dataset: bool = False,
-    preprocessed_dir: str = "",
     train_type: str = "lora",
     merge_lora: bool = False,
     lora_rank: int = DEFAULT_LORA_RANK,
@@ -350,32 +346,8 @@ def train_model(
             f"Model not found at {model_dir}. "
             f"Download first: modal run train_glm_4_7.py --download"
         )
-
-    # Resolve dataset path
-    if cached_dataset:
-        candidate_cached_paths = []
-        if preprocessed_dir:
-            candidate_cached_paths.append(preprocessed_dir)
-        candidate_cached_paths.extend(
-            [
-                f"{DATA_DIR}/{data_folder}/preprocessed_glm47",
-                f"{DATA_DIR}/{data_folder}/cached_train_glm/train",
-            ]
-        )
-
-        cached_path = ""
-        for candidate_path in candidate_cached_paths:
-            if os.path.exists(candidate_path):
-                cached_path = candidate_path
-                break
-
-        if not cached_path:
-            raise RuntimeError(
-                f"Cached dataset not found. Tried: {candidate_cached_paths}. "
-                f"Run preprocess first: MODEL=glm modal run preprocess/msswift.py --data-folder {data_folder}"
-            )
-        print(f"Using cached dataset: {cached_path}")
-    elif not dataset:
+    
+    if not dataset:
         dataset_path = f"{DATA_DIR}/{data_folder}/training.jsonl"
         if os.path.exists(dataset_path):
             dataset = dataset_path
@@ -500,12 +472,9 @@ def train_model(
         "--output_dir",
         checkpoint_dir,
     ]
-    if cached_dataset:
-        cmd.extend(["--cached_dataset", cached_path])
-    else:
-        cmd.extend(["--dataset", dataset])
     cmd.extend(
         [
+            "--dataset", dataset,
             "--save_safetensors",
             "--tuner_type",
             train_type,
@@ -515,10 +484,7 @@ def train_model(
             # Passthrough template: bypass ms-swift template processing
             # patch_wandb_artifacts: disable Megatron's artifact upload (path mismatch with ms-swift)
             "--external_plugins",
-            # "/root/common/passthrough_template.py",
             "/root/common/patch_wandb_artifacts.py",
-            # "--template",
-            # "passthrough",
             # Parallelism — TODO(joy): Attribute this
             "--tensor_model_parallel_size",
             str(tp_size),
@@ -636,161 +602,3 @@ def train_model(
         "run_id": run_id,
         "checkpoint": checkpoint_dir,
     }
-
-
-@app.local_entrypoint()
-def main(
-    download: bool = False,
-    download_data_flag: bool = False,
-    hf_dataset: str = "AI-MO/aimo-validation-aime",
-    split: str = "train",
-    input_col: str = "",
-    output_col: str = "",
-    train: bool = False,
-    run_id: str = "",
-    data_folder: str = DEFAULT_DATA_FOLDER,
-    dataset: str = "",
-    cached_dataset: bool = False,
-    preprocessed_dir: str = "",
-    train_type: str = "lora",
-    merge_lora: bool = False,
-    lora_rank: int = DEFAULT_LORA_RANK,
-    lora_alpha: int = DEFAULT_LORA_ALPHA,
-    max_epochs: int = DEFAULT_MAX_EPOCHS,
-    max_length: int = DEFAULT_MAX_LENGTH,
-    tp_size: int = TP_SIZE,
-    ep_size: int = EP_SIZE,
-    pp_size: int = PP_SIZE,
-    global_batch_size: int = 8,
-    lr: float = 1e-4,
-    moe_aux_loss_coeff: float = 1e-3,
-    recompute_num_layers: int = 92,
-    save_interval: int = 50,
-    eval_iters: int = 10,
-    eval_interval: int = 50,
-    disable_packing: bool = False,
-):
-    """GLM-4.7 training via ms-swift v4 Megatron. Defaults to LoRA."""
-    if download:
-        print(f"Downloading {HF_MODEL} (355B MoE)...")
-        result = download_model.remote(force=True)
-        print(f"Done: {result}")
-    elif download_data_flag:
-        folder = data_folder or "aime"
-        print(f"Downloading {hf_dataset} to /{folder}/training.jsonl...")
-        result = prepare_dataset.remote(
-            data_folder=folder,
-            hf_dataset=hf_dataset,
-            split=split,
-            input_col=input_col,
-            output_col=output_col,
-        )
-        print(f"Done: {result}")
-    elif train:
-        total_gpus = N_NODES * 8
-        if tp_size <= 0 or ep_size <= 0 or pp_size <= 0:
-            print(
-                f"ERROR: TP/EP/PP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}"
-            )
-            return
-        if total_gpus % (tp_size * pp_size) != 0:
-            print(
-                f"ERROR: Invalid non-expert parallelism for {total_gpus} GPUs: "
-                f"TP={tp_size}, PP={pp_size}. total_gpus must be divisible by TP*PP"
-            )
-            return
-        if total_gpus % (tp_size * ep_size * pp_size) != 0:
-            print(
-                f"ERROR: Invalid expert parallelism for {total_gpus} GPUs: "
-                f"TP={tp_size}, EP={ep_size}, PP={pp_size}. total_gpus must be divisible by TP*EP*PP"
-            )
-            return
-        non_expert_dp = total_gpus // (tp_size * pp_size)
-        expert_dp = total_gpus // (tp_size * ep_size * pp_size)
-        print(f"Starting GLM-4.7 training ({train_type}):")
-        print(f"  model={HF_MODEL}")
-        print(f"  nodes={N_NODES} ({total_gpus} GPUs)")
-        print(f"  data_folder={data_folder}")
-        print(f"  dataset={dataset or '(auto-detect)'}")
-        print(f"  cached_dataset={cached_dataset}")
-        if cached_dataset:
-            print(f"  preprocessed_dir={preprocessed_dir or '(auto)'}")
-        print(f"  train_type={train_type}")
-        if train_type == "lora":
-            print(f"  lora_rank={lora_rank}, lora_alpha={lora_alpha}")
-            print(f"  merge_lora={merge_lora}")
-        print(f"  max_epochs={max_epochs}")
-        print(f"  max_length={max_length}")
-        print(
-            f"  tp_size={tp_size}, ep_size={ep_size}, pp_size={pp_size}, "
-            f"non_expert_dp={non_expert_dp}, expert_dp={expert_dp}"
-        )
-        print(f"  global_batch_size={global_batch_size}")
-        print(f"  disable_packing={disable_packing}")
-        print(f"  recompute_num_layers={recompute_num_layers}")
-
-        import secrets
-        from datetime import datetime
-
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        generated_run_id = run_id if run_id else ts + "_" + secrets.token_hex(4)
-        print(f"WandB run_id: {generated_run_id}")
-
-        result = train_model.remote(
-            run_id=generated_run_id,
-            data_folder=data_folder,
-            dataset=dataset,
-            cached_dataset=cached_dataset,
-            preprocessed_dir=preprocessed_dir,
-            train_type=train_type,
-            merge_lora=merge_lora,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            max_epochs=max_epochs,
-            max_length=max_length,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            pp_size=pp_size,
-            global_batch_size=global_batch_size,
-            lr=lr,
-            moe_aux_loss_coeff=moe_aux_loss_coeff,
-            recompute_num_layers=recompute_num_layers,
-            save_interval=save_interval,
-            eval_iters=eval_iters,
-            eval_interval=eval_interval,
-            disable_packing=disable_packing,
-        )
-        print(f"Done: {result}")
-    else:
-        print(f"GLM-4.7 Full SFT Training ({HF_MODEL})")
-        print()
-        print("Usage:")
-        print("  # Download model weights")
-        print("  modal run train_glm_4_7.py --download")
-        print()
-        print("  # Download training data (defaults to AIME)")
-        print("  modal run train_glm_4_7.py --download-data-flag")
-        print(
-            "  modal run train_glm_4_7.py --download-data-flag --hf-dataset openai/gsm8k --data-folder gsm8k"
-        )
-        print()
-        print("  # Train")
-        print("  modal run --detach train_glm_4_7.py --train --data-folder 2026-02-16 \\")
-        print(
-            "      --run-id r7kezf75 --max-length 131072 --max-epochs 4 --lora-rank 32 --lora-alpha 32"
-        )
-        print("  N_NODES=2 modal run --detach train_glm_4_7.py --train \\")
-        print(
-            "      --data-folder 2026-02-16 --cached-dataset --preprocessed-dir /data/2026-02-16/preprocessed_glm47"
-        )
-        print()
-        print(f"Current: N_NODES={N_NODES} ({N_NODES * 8} GPUs)")
-        print(
-            "Defaults: EP=2, TP=4, PP=2, max_length=131072, max_epochs=4, lora_rank=32, lora_alpha=32"
-        )
-        print()
-        print(
-            "Non-expert DP = total_gpus / (TP * PP). global_batch_size must be divisible by it."
-        )
-        print("TP max is 8 (model has 8 KV heads). PP=2 halves per-GPU model memory.")
