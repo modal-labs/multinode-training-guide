@@ -1,0 +1,796 @@
+"""
+GLM-4.7 (355B MoE, 32B active) Training via ms-swift Megatron v4
+
+160 routed experts + 1 shared expert, 8 experts activated per token.
+92 layers, 96 attention heads, 8 KV heads (GQA), hidden size 5120.
+
+Defaults to LoRA with 2 x B200:8 nodes, 128K context, and 4 epochs.
+Use --train-type full for full SFT.
+ms-swift handles HF→Megatron conversion internally (no separate convert step needed).
+
+Usage:
+    # Download model (once)
+    modal run train_glm_4_7.py --download
+
+    # Download training data
+    modal run train_glm_4_7.py --download-data-flag --hf-dataset openai/gsm8k --data-folder gsm8k
+    modal run train_glm_4_7.py --download-data-flag --hf-dataset microsoft/orca-math-word-problems-200k --data-folder orca-math-word-problems-200k
+
+    # LoRA (default), 4 epochs, 128K context
+    modal run --detach train_glm_4_7.py --train \
+        --run-id r7kezf75 --data-folder 2026-02-16 --max-length 131072 --max-epochs 4 \
+        --lora-rank 32 --lora-alpha 32
+
+    # Cached/preprocessed dataset
+    N_NODES=2 modal run --detach train_glm_4_7.py --train \
+        --data-folder 2026-02-16 --cached-dataset --preprocessed-dir /data/2026-02-16/preprocessed_glm47
+
+Parallelism notes:
+    - Megatron has TWO DP values: non-expert DP and expert DP
+    - Non-expert DP = world_size / (TP * PP) — used for batch size divisibility check
+    - Expert DP = world_size / (TP * EP * PP) — how expert layers are replicated
+    - global_batch_size must be divisible by micro_batch_size * non-expert-DP
+    - Default parallelism for 2 nodes (16 GPUs): TP=4, EP=2, PP=2
+    - TP max is 8 (model has 8 KV heads)
+"""
+
+import os
+
+import modal
+import modal.experimental
+
+HF_MODEL = "zai-org/GLM-4.7"
+
+COMMON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common")
+DEFAULT_DATA_FOLDER = "2026-02-16"
+DEFAULT_MAX_EPOCHS = 4
+DEFAULT_MAX_LENGTH = 2048
+DEFAULT_LORA_RANK = 32
+DEFAULT_LORA_ALPHA = 32
+
+TP_SIZE = 8
+PP_SIZE = 1
+EP_SIZE = 2
+
+app = modal.App("glm-4-7-ms-swift")
+
+# Volumes — use volumes V2
+models_volume = modal.Volume.from_name(
+    "glm-4-7-models", create_if_missing=True, version=2
+)
+data_volume = modal.Volume.from_name("glm-4-7-data", create_if_missing=True, version=2)
+checkpoints_volume = modal.Volume.from_name(
+    "glm-4-7-checkpoints", create_if_missing=True, version=2
+)
+
+MODELS_DIR = "/models"
+DATA_DIR = "/data"
+CHECKPOINTS_DIR = "/checkpoints"
+
+# N_NODES via env var (evaluated at decoration time by @clustered).
+# Default 2 (2 x B200:8).
+# Usage: N_NODES=2 modal run --detach train_glm_4_7.py --train ...
+N_NODES = int(os.environ.get("N_NODES", "2"))
+
+# Download image (lightweight)
+download_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "huggingface_hub==0.27.1",
+        "transformers>=4.50",
+        "torch==2.5.1",
+        "safetensors==0.4.5",
+        "datasets>=2.14.0",
+    )
+    .env(
+        {
+            "HF_HOME": "/models/huggingface",
+        }
+    )
+)
+
+# ms-swift v4 image: Baseten base (PyTorch 2.8, CUDA 12.8, FA 2.8, Megatron 0.14.1)
+# then nuke conflicting packages (transformers, ms-swift) and reinstall cleanly.
+msswift_v4_image = (
+    # TODO(joy): We should not use baseten's megatron image >:(
+    modal.Image.from_registry(
+        "baseten/megatron:py3.11.11-cuda12.8.1-torch2.8.0-fa2.8.1-megatron0.14.1-msswift3.10.3"
+    )
+    .apt_install(
+        "libibverbs-dev",
+        "libibverbs1",
+        "libhwloc-dev",
+        "libnl-route-3-200",
+    )
+    # Force-remove pre-installed transformers + ms-swift to get compatible versions.
+    # Baseten ships older transformers that may lack Glm4MoeForCausalLM support.
+    .run_commands(
+        "pip uninstall -y transformers ms-swift swift 2>/dev/null; true",
+    )
+    .pip_install(
+        # Reinstall transformers with GLM-4 MoE support
+        # Stay in 4.x — Baseten's peft is incompatible with transformers 5.x
+        "transformers==4.57.3",
+        # ms-swift v4 from main — verify it supports glm4_moe in Megatron mode
+        "ms-swift @ git+https://github.com/modelscope/ms-swift.git@main",
+        "einops",
+        "wandb==0.19.1",
+    )
+    .env(
+        {
+            "HF_HOME": "/models/huggingface",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+            "NVTE_FWD_LAYERNORM_SM_MARGIN": "16",
+            "NVTE_BWD_LAYERNORM_SM_MARGIN": "16",
+            "SWIFT_DISABLE_LOGGING": "1",
+            "SWIFT_DISABLE_LOGGING_CALLBACK": "1",
+            # Disable torch.compile — inductor materializes the full logits tensor
+            # (122K tokens × 152K vocab × fp32 = 69 GB) instead of using fused CE loss
+            "TORCHDYNAMO_DISABLE": "1",
+            # NCCL debug — surface real error behind "unhandled cuda error"
+            "NCCL_DEBUG": "INFO",
+            "NCCL_DEBUG_SUBSYS": "ALL",
+            "NCCL_TIMEOUT": "300",
+            "TORCH_NCCL_ENABLE_MONITORING": "1",
+            "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "600",
+            "TORCH_NCCL_TRACE_BUFFER_SIZE": "20000",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+            "TORCH_NCCL_DESYNC_DEBUG": "1",
+            "TORCH_NCCL_BLOCKING_WAIT": "1",
+        }
+    )
+    .add_local_dir(COMMON_DIR, remote_path="/root/common/")
+)
+
+
+@app.function(
+    image=download_image,
+    volumes={MODELS_DIR: models_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=14400,  # 4 hours
+)
+def download_model(force: bool = False):
+    """Download GLM-4.7 to volume.
+
+    Uses local_dir (flat files) instead of cache_dir (symlinked blobs)
+    because Modal V2 volumes may not handle HF cache symlinks correctly.
+    """
+    from huggingface_hub import snapshot_download
+
+    models_volume.reload()
+
+    local_dir = f"{MODELS_DIR}/GLM-4.7"
+    print(f"Downloading {HF_MODEL} to {local_dir}{'  [force]' if force else ''}...")
+
+    path = snapshot_download(
+        HF_MODEL,
+        local_dir=local_dir,
+        token=os.environ.get("HF_TOKEN"),
+        force_download=force,
+    )
+
+    print(f"Downloaded to: {path}")
+    models_volume.commit()
+    return {"path": path}
+
+
+@app.function(
+    image=download_image,
+    volumes={DATA_DIR: data_volume},
+    timeout=3600,
+)
+def prepare_dataset(
+    data_folder: str = "aime",
+    hf_dataset: str = "AI-MO/aimo-validation-aime",
+    split: str = "train",
+    input_col: str = "",
+    output_col: str = "",
+):
+    """Download a HuggingFace dataset to the data volume.
+
+    Auto-detects input/output columns from common patterns:
+      problem/solution, question/answer, input/output, prompt/response
+
+    Args:
+        data_folder: Folder name in volume
+        hf_dataset: HuggingFace dataset path (e.g., "AI-MO/aimo-validation-aime", "openai/gsm8k")
+        split: Dataset split to use
+        input_col: Override input column name
+        output_col: Override output column name
+    """
+    import json
+
+    from datasets import load_dataset
+
+    data_volume.reload()
+    output_dir = f"{DATA_DIR}/{data_folder}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Downloading {hf_dataset} (split={split})...")
+
+    # Handle datasets with configs (e.g., "openai/gsm8k" needs "main")
+    try:
+        ds = load_dataset(hf_dataset, split=split)
+    except ValueError:
+        ds = load_dataset(hf_dataset, "main", split=split)
+
+    columns = ds.column_names
+    print(f"  Columns: {columns}")
+
+    # Auto-detect input/output columns
+    input_patterns = ["problem", "question", "input", "prompt", "instruction"]
+    output_patterns = ["solution", "answer", "output", "response", "completion"]
+
+    if not input_col:
+        for pat in input_patterns:
+            if pat in columns:
+                input_col = pat
+                break
+    if not output_col:
+        for pat in output_patterns:
+            if pat in columns:
+                output_col = pat
+                break
+
+    if not input_col or not output_col:
+        raise ValueError(
+            f"Could not auto-detect columns. Found: {columns}. "
+            f"Specify --input-col and --output-col explicitly."
+        )
+
+    print(f"  Using: input_col={input_col}, output_col={output_col}")
+
+    all_examples = []
+    for row in ds:
+        messages = [
+            {"role": "user", "content": row[input_col]},
+            {"role": "assistant", "content": row[output_col]},
+        ]
+        all_examples.append({"messages": messages})
+
+    output_path = f"{output_dir}/training.jsonl"
+    with open(output_path, "w") as f:
+        for ex in all_examples:
+            f.write(json.dumps(ex) + "\n")
+
+    print(f"Wrote {len(all_examples)} examples to {output_path}")
+    data_volume.commit()
+    return {"path": output_path, "count": len(all_examples)}
+
+
+@app.function(
+    image=msswift_v4_image,
+    gpu="B200:8",
+    volumes={
+        MODELS_DIR: models_volume,
+        DATA_DIR: data_volume,
+        CHECKPOINTS_DIR: checkpoints_volume,
+    },
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    timeout=86400,  # 24 hours
+    memory=1048576,  # 1TB
+    ephemeral_disk=2048000,  # 2TB scratch
+    experimental_options={"efa_enabled": True},
+)
+@modal.experimental.clustered(size=N_NODES, rdma=True)
+def train_model(
+    run_id: str,
+    data_folder: str = DEFAULT_DATA_FOLDER,
+    dataset: str = "",
+    cached_dataset: bool = False,
+    preprocessed_dir: str = "",
+    train_type: str = "lora",
+    merge_lora: bool = False,
+    lora_rank: int = DEFAULT_LORA_RANK,
+    lora_alpha: int = DEFAULT_LORA_ALPHA,
+    max_epochs: int = DEFAULT_MAX_EPOCHS,
+    max_length: int = DEFAULT_MAX_LENGTH,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    global_batch_size: int = 8,
+    lr: float = 1e-4,
+    moe_aux_loss_coeff: float = 1e-3,
+    recompute_num_layers: int = 1,
+    save_interval: int = 50,
+    eval_iters: int = 10,
+    eval_interval: int = 50,
+    disable_packing: bool = True,
+):
+    """Train GLM-4.7 via ms-swift v4 Megatron. Defaults to LoRA."""
+    import json
+    import math
+    import subprocess
+
+    cluster_info = modal.experimental.get_cluster_info()
+    node_rank = cluster_info.rank
+    n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
+    master_addr = (
+        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
+    )
+
+    total_gpus = n_nodes * 8
+    if tp_size <= 0 or ep_size <= 0 or pp_size <= 0:
+        raise ValueError(
+            f"TP/EP/PP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}"
+        )
+    if total_gpus % (tp_size * pp_size) != 0:
+        raise ValueError(
+            f"Invalid non-expert parallelism for {total_gpus} GPUs: "
+            f"TP={tp_size}, PP={pp_size} (total_gpus must be divisible by TP*PP)"
+        )
+    if total_gpus % (tp_size * ep_size * pp_size) != 0:
+        raise ValueError(
+            f"Invalid expert parallelism for {total_gpus} GPUs: "
+            f"TP={tp_size}, EP={ep_size}, PP={pp_size} "
+            "(total_gpus must be divisible by TP*EP*PP)"
+        )
+    non_expert_dp = total_gpus // (tp_size * pp_size)
+    expert_dp = total_gpus // (tp_size * ep_size * pp_size)
+    print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
+    print(f"Model: {HF_MODEL}")
+    print(
+        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, "
+        f"non-expert DP={non_expert_dp}, expert DP={expert_dp}"
+    )
+
+    # Reload volumes
+    models_volume.reload()
+    data_volume.reload()
+    checkpoints_volume.reload()
+
+    # Use local model path (flat files, no HF cache symlinks)
+    model_dir = f"{MODELS_DIR}/GLM-4.7"
+    if not os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
+        raise RuntimeError(
+            f"Model not found at {model_dir}. "
+            f"Download first: modal run train_glm_4_7.py --download"
+        )
+
+    # Resolve dataset path
+    if cached_dataset:
+        candidate_cached_paths = []
+        if preprocessed_dir:
+            candidate_cached_paths.append(preprocessed_dir)
+        candidate_cached_paths.extend(
+            [
+                f"{DATA_DIR}/{data_folder}/preprocessed_glm47",
+                f"{DATA_DIR}/{data_folder}/cached_train_glm/train",
+            ]
+        )
+
+        cached_path = ""
+        for candidate_path in candidate_cached_paths:
+            if os.path.exists(candidate_path):
+                cached_path = candidate_path
+                break
+
+        if not cached_path:
+            raise RuntimeError(
+                f"Cached dataset not found. Tried: {candidate_cached_paths}. "
+                f"Run preprocess first: MODEL=glm modal run preprocess/msswift.py --data-folder {data_folder}"
+            )
+        print(f"Using cached dataset: {cached_path}")
+    elif not dataset:
+        dataset_path = f"{DATA_DIR}/{data_folder}/training.jsonl"
+        if os.path.exists(dataset_path):
+            dataset = dataset_path
+            print(f"Using local dataset: {dataset}")
+        else:
+            raise RuntimeError(
+                f"No training data found at {dataset_path}. "
+                f"Upload data first: modal volume put glm-4-7-data /path/to/training.jsonl /{data_folder}/training.jsonl"
+            )
+    else:
+        print(f"Using specified dataset: {dataset}")
+
+    split_dataset_ratio = 0.01
+    packing_enabled = not disable_packing
+    estimated_train_sequences = None
+    expected_steps_per_epoch = None
+
+    def _analyze_jsonl_dataset(path: str) -> tuple[int, int, int]:
+        rows = 0
+        total_text_chars = 0
+        parse_errors = 0
+        with open(path) as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                rows += 1
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    parse_errors += 1
+                    total_text_chars += len(line)
+                    continue
+
+                if isinstance(record, dict) and isinstance(record.get("messages"), list):
+                    for msg in record["messages"]:
+                        if isinstance(msg, dict):
+                            content = msg.get("content")
+                            if isinstance(content, str):
+                                total_text_chars += len(content)
+                else:
+                    total_text_chars += len(line)
+        return rows, total_text_chars, parse_errors
+
+    if cached_dataset:
+        print("Dataset preflight: using cached dataset; skipping local row/token estimate")
+    elif dataset.endswith(".jsonl") and os.path.exists(dataset):
+        dataset_rows, total_text_chars, parse_errors = _analyze_jsonl_dataset(dataset)
+        val_rows = max(1, math.ceil(dataset_rows * split_dataset_ratio)) if dataset_rows else 0
+        train_rows = max(dataset_rows - val_rows, 0)
+        approx_total_tokens = max(total_text_chars // 4, dataset_rows)
+        approx_train_tokens = int(approx_total_tokens * (1.0 - split_dataset_ratio))
+        approx_train_tokens = max(approx_train_tokens, train_rows)
+
+        if packing_enabled:
+            estimated_train_sequences = (
+                math.ceil(approx_train_tokens / max_length) if train_rows else 0
+            )
+            if train_rows and estimated_train_sequences < global_batch_size:
+                print(
+                    "Dataset preflight: auto-disabling packing for tiny dataset "
+                    f"(estimated packed train sequences={estimated_train_sequences}, "
+                    f"global_batch_size={global_batch_size})"
+                )
+                packing_enabled = False
+                estimated_train_sequences = train_rows
+        else:
+            estimated_train_sequences = train_rows
+
+        expected_steps_per_epoch = estimated_train_sequences // global_batch_size
+        print(
+            "Dataset preflight: "
+            f"rows={dataset_rows}, train_rows~={train_rows}, "
+            f"approx_train_tokens~={approx_train_tokens}, "
+            f"packing={'on' if packing_enabled else 'off'}, "
+            f"estimated_train_sequences~={estimated_train_sequences}, "
+            f"expected_steps_per_epoch~={expected_steps_per_epoch}, "
+            f"json_parse_errors={parse_errors}"
+        )
+
+        if expected_steps_per_epoch == 0:
+            raise RuntimeError(
+                "Zero-step training run detected before launch "
+                f"(estimated_train_sequences={estimated_train_sequences}, "
+                f"global_batch_size={global_batch_size}, max_length={max_length}, "
+                f"packing={packing_enabled}). "
+                "Reduce --max-length, lower --global-batch-size, or disable packing "
+                "with --disable-packing."
+            )
+    else:
+        print(
+            "Dataset preflight: unable to estimate train steps for non-JSONL dataset; "
+            "continuing without zero-step guard"
+        )
+
+    checkpoint_dir = f"{CHECKPOINTS_DIR}/train_glm_4_7_{run_id}"
+
+    # Pre-create args.json on ALL ranks so save_checkpoint can find it.
+    # ms-swift writes args.json on is_master() (rank 0) but reads it on
+    # is_last_rank() (rank 31) — different containers on Modal.
+    # With --add_version false, args.save = checkpoint_dir (no versioned subdir).
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    args_json_path = os.path.join(checkpoint_dir, "args.json")
+    if not os.path.exists(args_json_path):
+        with open(args_json_path, "w") as f:
+            json.dump({"run_id": run_id, "placeholder": True}, f)
+
+    # Set distributed env vars
+    os.environ["NPROC_PER_NODE"] = "8"
+    os.environ["NNODES"] = str(n_nodes)
+    os.environ["NODE_RANK"] = str(node_rank)
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = "29500"
+    os.environ["NCCL_DEBUG"] = "INFO"
+
+    # Build megatron sft command — epoch-based
+    cmd = [
+        "megatron",
+        "sft",
+        "--model",
+        model_dir,
+        "--output_dir",
+        checkpoint_dir,
+    ]
+    if cached_dataset:
+        cmd.extend(["--cached_dataset", cached_path])
+    else:
+        cmd.extend(["--dataset", dataset])
+    cmd.extend(
+        [
+            "--save_safetensors",
+            "--tuner_type",
+            train_type,
+            "--perform_initialization",
+            "--split_dataset_ratio",
+            str(split_dataset_ratio),
+            # Passthrough template: bypass ms-swift template processing
+            # patch_wandb_artifacts: disable Megatron's artifact upload (path mismatch with ms-swift)
+            "--external_plugins",
+            # "/root/common/passthrough_template.py",
+            "/root/common/patch_wandb_artifacts.py",
+            # "--template",
+            # "passthrough",
+            # Parallelism — TODO(joy): Attribute this
+            "--tensor_model_parallel_size",
+            str(tp_size),
+            "--expert_model_parallel_size",
+            str(ep_size),
+            "--pipeline_model_parallel_size",
+            str(pp_size),
+            "--sequence_parallel",
+            "true",
+            # MoE settings
+            "--moe_permute_fusion",
+            "true",
+            "--moe_grouped_gemm",
+            "true",
+            "--moe_shared_expert_overlap",
+            "true",
+            "--moe_aux_loss_coeff",
+            str(moe_aux_loss_coeff),
+            # Batch
+            "--micro_batch_size",
+            "1",
+            "--global_batch_size",
+            str(global_batch_size),
+            "--packing",
+            str(packing_enabled).lower(),
+            # Memory optimization — recompute every layer (ms-swift example uses 1)
+            "--recompute_granularity",
+            "full",
+            "--recompute_method",
+            "uniform",
+            "--recompute_num_layers",
+            str(recompute_num_layers),
+            "--optimizer_cpu_offload",
+            "true",
+            "--use_precision_aware_optimizer",
+            "true",
+            # Training — epoch-based instead of iteration-based
+            "--num_train_epochs",
+            str(max_epochs),
+            "--finetune",
+            "true",
+            "--cross_entropy_loss_fusion",
+            "true",
+            "--lr",
+            str(lr),
+            "--lr_warmup_fraction",
+            "0.05",
+            "--lr_decay_iters",
+            "100000",  # Large default, capped by actual train steps
+            "--min_lr",
+            str(lr / 10),
+            # Context
+            "--max_length",
+            str(max_length),
+            "--attention_backend",
+            "flash",
+            # IO
+            "--dataset_num_proc",
+            "8",
+            "--save_interval",
+            str(save_interval),
+            "--no_save_optim",
+            "true",
+            "--no_save_rng",
+            "true",
+            "--use_hf",
+            "1",
+            # Disable versioned subdirectory (v0-timestamp) in save path.
+            # ms-swift writes args.json on is_master() (rank 0, node 0) but reads it
+            # on is_last_rank() (rank 31, node 3) — cross-node volume sync race condition.
+            "--add_version",
+            "false",
+            # Logging — report_to is required to actually enable WandB (v4 default is None)
+            "--report_to",
+            "wandb",
+            "--wandb_project",
+            "glm-4-7-sft",
+            "--wandb_exp_name",
+            run_id,
+            "--log_interval",
+            "1",
+        ]
+    )
+
+    # Eval settings
+    cmd.extend(["--eval_iters", str(eval_iters)])
+    if eval_iters > 0:
+        cmd.extend(["--eval_interval", str(eval_interval)])
+
+    # LoRA-specific args
+    if train_type == "lora":
+        cmd.extend(
+            [
+                "--target_modules",
+                "all-linear",
+                "--lora_rank",
+                str(lora_rank),
+                "--lora_alpha",
+                str(lora_alpha),
+                "--merge_lora",
+                str(merge_lora).lower(),
+            ]
+        )
+
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=False, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"ms-swift training failed with code {result.returncode}")
+
+    os.sync()
+    checkpoints_volume.commit()
+    return {
+        "status": "training_complete",
+        "run_id": run_id,
+        "checkpoint": checkpoint_dir,
+    }
+
+
+@app.local_entrypoint()
+def main(
+    download: bool = False,
+    download_data_flag: bool = False,
+    hf_dataset: str = "AI-MO/aimo-validation-aime",
+    split: str = "train",
+    input_col: str = "",
+    output_col: str = "",
+    train: bool = False,
+    run_id: str = "",
+    data_folder: str = DEFAULT_DATA_FOLDER,
+    dataset: str = "",
+    cached_dataset: bool = False,
+    preprocessed_dir: str = "",
+    train_type: str = "lora",
+    merge_lora: bool = False,
+    lora_rank: int = DEFAULT_LORA_RANK,
+    lora_alpha: int = DEFAULT_LORA_ALPHA,
+    max_epochs: int = DEFAULT_MAX_EPOCHS,
+    max_length: int = DEFAULT_MAX_LENGTH,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    global_batch_size: int = 8,
+    lr: float = 1e-4,
+    moe_aux_loss_coeff: float = 1e-3,
+    recompute_num_layers: int = 92,
+    save_interval: int = 50,
+    eval_iters: int = 10,
+    eval_interval: int = 50,
+    disable_packing: bool = False,
+):
+    """GLM-4.7 training via ms-swift v4 Megatron. Defaults to LoRA."""
+    if download:
+        print(f"Downloading {HF_MODEL} (355B MoE)...")
+        result = download_model.remote(force=True)
+        print(f"Done: {result}")
+    elif download_data_flag:
+        folder = data_folder or "aime"
+        print(f"Downloading {hf_dataset} to /{folder}/training.jsonl...")
+        result = prepare_dataset.remote(
+            data_folder=folder,
+            hf_dataset=hf_dataset,
+            split=split,
+            input_col=input_col,
+            output_col=output_col,
+        )
+        print(f"Done: {result}")
+    elif train:
+        total_gpus = N_NODES * 8
+        if tp_size <= 0 or ep_size <= 0 or pp_size <= 0:
+            print(
+                f"ERROR: TP/EP/PP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}"
+            )
+            return
+        if total_gpus % (tp_size * pp_size) != 0:
+            print(
+                f"ERROR: Invalid non-expert parallelism for {total_gpus} GPUs: "
+                f"TP={tp_size}, PP={pp_size}. total_gpus must be divisible by TP*PP"
+            )
+            return
+        if total_gpus % (tp_size * ep_size * pp_size) != 0:
+            print(
+                f"ERROR: Invalid expert parallelism for {total_gpus} GPUs: "
+                f"TP={tp_size}, EP={ep_size}, PP={pp_size}. total_gpus must be divisible by TP*EP*PP"
+            )
+            return
+        non_expert_dp = total_gpus // (tp_size * pp_size)
+        expert_dp = total_gpus // (tp_size * ep_size * pp_size)
+        print(f"Starting GLM-4.7 training ({train_type}):")
+        print(f"  model={HF_MODEL}")
+        print(f"  nodes={N_NODES} ({total_gpus} GPUs)")
+        print(f"  data_folder={data_folder}")
+        print(f"  dataset={dataset or '(auto-detect)'}")
+        print(f"  cached_dataset={cached_dataset}")
+        if cached_dataset:
+            print(f"  preprocessed_dir={preprocessed_dir or '(auto)'}")
+        print(f"  train_type={train_type}")
+        if train_type == "lora":
+            print(f"  lora_rank={lora_rank}, lora_alpha={lora_alpha}")
+            print(f"  merge_lora={merge_lora}")
+        print(f"  max_epochs={max_epochs}")
+        print(f"  max_length={max_length}")
+        print(
+            f"  tp_size={tp_size}, ep_size={ep_size}, pp_size={pp_size}, "
+            f"non_expert_dp={non_expert_dp}, expert_dp={expert_dp}"
+        )
+        print(f"  global_batch_size={global_batch_size}")
+        print(f"  disable_packing={disable_packing}")
+        print(f"  recompute_num_layers={recompute_num_layers}")
+
+        import secrets
+        from datetime import datetime
+
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        generated_run_id = run_id if run_id else ts + "_" + secrets.token_hex(4)
+        print(f"WandB run_id: {generated_run_id}")
+
+        result = train_model.remote(
+            run_id=generated_run_id,
+            data_folder=data_folder,
+            dataset=dataset,
+            cached_dataset=cached_dataset,
+            preprocessed_dir=preprocessed_dir,
+            train_type=train_type,
+            merge_lora=merge_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            max_epochs=max_epochs,
+            max_length=max_length,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=pp_size,
+            global_batch_size=global_batch_size,
+            lr=lr,
+            moe_aux_loss_coeff=moe_aux_loss_coeff,
+            recompute_num_layers=recompute_num_layers,
+            save_interval=save_interval,
+            eval_iters=eval_iters,
+            eval_interval=eval_interval,
+            disable_packing=disable_packing,
+        )
+        print(f"Done: {result}")
+    else:
+        print(f"GLM-4.7 Full SFT Training ({HF_MODEL})")
+        print()
+        print("Usage:")
+        print("  # Download model weights")
+        print("  modal run train_glm_4_7.py --download")
+        print()
+        print("  # Download training data (defaults to AIME)")
+        print("  modal run train_glm_4_7.py --download-data-flag")
+        print(
+            "  modal run train_glm_4_7.py --download-data-flag --hf-dataset openai/gsm8k --data-folder gsm8k"
+        )
+        print()
+        print("  # Train")
+        print("  modal run --detach train_glm_4_7.py --train --data-folder 2026-02-16 \\")
+        print(
+            "      --run-id r7kezf75 --max-length 131072 --max-epochs 4 --lora-rank 32 --lora-alpha 32"
+        )
+        print("  N_NODES=2 modal run --detach train_glm_4_7.py --train \\")
+        print(
+            "      --data-folder 2026-02-16 --cached-dataset --preprocessed-dir /data/2026-02-16/preprocessed_glm47"
+        )
+        print()
+        print(f"Current: N_NODES={N_NODES} ({N_NODES * 8} GPUs)")
+        print(
+            "Defaults: EP=2, TP=4, PP=2, max_length=131072, max_epochs=4, lora_rank=32, lora_alpha=32"
+        )
+        print()
+        print(
+            "Non-expert DP = total_gpus / (TP * PP). global_batch_size must be divisible by it."
+        )
+        print("TP max is 8 (model has 8 KV heads). PP=2 halves per-GPU model memory.")
