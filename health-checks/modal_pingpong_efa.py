@@ -40,6 +40,7 @@ def fi_pingpong(server_ip_dict: modal.Dict):
     # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
+    print(f"[rank {container_rank}] cluster {cluster_info.cluster_id}", flush=True)
 
     # Update the dict with server ip address
     cmd_args = ["-p", "efa"]

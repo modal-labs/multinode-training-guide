@@ -377,7 +377,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     data_volume.reload()
 
     cluster_info = modal.experimental.get_cluster_info()
-    print(f"Rank: {cluster_info.rank}, task id: {os.environ['MODAL_TASK_ID']}")
+    print(f"Cluster: {cluster_info.cluster_id}, Rank: {cluster_info.rank}, task id: {os.environ['MODAL_TASK_ID']}")
     print(f"Config: {config}")
     print(f"Container IPv4 IPs: {cluster_info.container_ipv4_ips}")
 

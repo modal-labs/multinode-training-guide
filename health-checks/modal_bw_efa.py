@@ -59,7 +59,7 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
-    print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
+    print(f"[rank {container_rank}] Starting rdma_bandwidth_test (cluster {cluster_info.cluster_id})", flush=True)
 
     # Get local ib devices (sorted by device index from 0 to 7)
     local_efa_domains = get_local_efa_domains()

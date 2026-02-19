@@ -59,7 +59,7 @@ def infiniband_pingpong_test(server_ip_dict: modal.Dict):
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
     print(
-        f"[rank {container_rank}] Starting InfiniBand_pingpong_test",
+        f"[rank {container_rank}] Starting InfiniBand_pingpong_test (cluster {cluster_info.cluster_id})",
         flush=True,
     )
 

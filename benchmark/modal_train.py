@@ -56,9 +56,11 @@ def run_benchmark():
     container_rank: int = cluster_info.rank
     # what's the leader/master/main container's address?
     main_ip_addr: str = cluster_info.container_ips[0]
+    # unique identifier for this cluster
+    cluster_id: str = cluster_info.cluster_id
     container_id = os.environ["MODAL_TASK_ID"]
 
-    print(f"hello from {container_id}, rank {container_rank} of {N_NODES}")
+    print(f"hello from {container_id}, rank {container_rank} of {N_NODES}, cluster {cluster_id}")
     if container_rank == 0:
         print(f"main container's address: {main_ip_addr}")
 

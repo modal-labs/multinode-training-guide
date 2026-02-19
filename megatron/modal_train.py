@@ -329,13 +329,14 @@ def train_lora():
 
     cluster_info = modal.experimental.get_cluster_info()
     node_rank = cluster_info.rank
+    cluster_id = cluster_info.cluster_id
     num_nodes = N_NODES
     master_addr = (
         cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
     )
     master_port = 29500
 
-    print(f"Node {node_rank}/{num_nodes}, Master: {master_addr}:{master_port}")
+    print(f"Cluster {cluster_id}, Node {node_rank}/{num_nodes}, Master: {master_addr}:{master_port}")
     print("Config: TP=2, PP=4, EP=4, mbs=1, FULL recompute")
     print("Goal: Start safe for long context and scale up if stable")
 

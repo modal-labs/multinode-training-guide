@@ -169,9 +169,11 @@ def _train_multi_node() -> None:
     container_rank: int = cluster_info.rank
     # what's the leader/master/main container's address?
     main_ip_addr: str = cluster_info.container_ips[0]
+    # unique identifier for this cluster
+    cluster_id: str = cluster_info.cluster_id
     container_id = os.environ["MODAL_TASK_ID"]
 
-    print(f"hello from {container_id}, rank {container_rank} of {n_nodes}")
+    print(f"hello from {container_id}, rank {container_rank} of {n_nodes}, cluster {cluster_id}")
     if container_rank == 0:
         print(f"main container's address: {main_ip_addr}")
 

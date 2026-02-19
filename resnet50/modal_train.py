@@ -50,6 +50,7 @@ app = modal.App(
 @modal.experimental.clustered(size=config.nodes)
 def train_resnet():
     cluster_info = modal.experimental.get_cluster_info()
+    print(f"cluster {cluster_info.cluster_id}, rank {cluster_info.rank} of {config.nodes}")
 
     torchrun.run(
         node_rank=cluster_info.rank,

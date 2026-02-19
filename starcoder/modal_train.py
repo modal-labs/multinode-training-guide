@@ -80,6 +80,7 @@ def train_multi_node(launch_type: str = "torchrun", profile: bool = False):
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
     main_ip_addr: str = cluster_info.container_ips[0]
+    cluster_id: str = cluster_info.cluster_id
     container_id = os.environ["MODAL_TASK_ID"]
 
     # Configuration for batch sizes and gradient accumulation. Target a constant
@@ -99,7 +100,7 @@ def train_multi_node(launch_type: str = "torchrun", profile: bool = False):
 
     print(
         f"Hello from {container_id}, rank {container_rank} of {n_nodes} "
-        f"using {parsed_launch_type.value}. Run ID: {current_run_name}"
+        f"(cluster {cluster_id}) using {parsed_launch_type.value}. Run ID: {current_run_name}"
     )
 
     if container_rank == 0:
