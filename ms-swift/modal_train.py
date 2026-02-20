@@ -89,7 +89,7 @@ msswift_v4_image = (
         "transformers==4.57.3",
         # ms-swift v4, patched to support pipeline parallelism and n_steps in logging
         "ms-swift @ git+https://github.com/joyliu-q/ms-swift.git@joy/patch-pp-log-emission-issue",
-        "einops",
+        "einops==0.8.2",
         "wandb==0.19.1",
     )
     .env(
@@ -336,12 +336,9 @@ def train_model(
         dataset,
         "--tuner_type",
         "lora",
-        "--perform_initialization", # TODO: why is this needed
+        "--perform_initialization",
         "--split_dataset_ratio",
         str(split_dataset_ratio),
-        # Passthrough template: bypass ms-swift template processing
-        # patch_wandb_artifacts: disable Megatron's artifact upload (path mismatch with ms-swift)
-        # Parallelism — TODO(joy): Attribute this
         "--tensor_model_parallel_size",
         str(tp_size),
         "--expert_model_parallel_size",
