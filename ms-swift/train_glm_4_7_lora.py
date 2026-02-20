@@ -3,13 +3,13 @@ GLM-4.7 Training via ms-swift Megatron v4
 
 Usage:
     # Download model (once)
-    modal run train_glm_4_7.py::download_model
+    modal run train_glm_4_7_lora.py::download_model
 
     # Download training data
-    modal run train_glm_4_7.py::prepare_dataset --hf-dataset openai/gsm8k --data-folder gsm8k --split train
+    modal run train_glm_4_7_lora.py::prepare_dataset --hf-dataset openai/gsm8k --data-folder gsm8k --split train
 
     # Train with LoRA
-    modal run train_glm_4_7.py::train_model --run-id [your-run-id]
+    modal run train_glm_4_7_lora.py::train_model --run-id [your-run-id]
 """
 
 import os
@@ -32,15 +32,15 @@ CP_SIZE = 1
 
 WANDB_PROJECT = "glm-4-7-sft"
 
-app = modal.App("example-ms-swift-glm_4_7-lora")
+app = modal.App("example-msswift-glm_4_7-lora")
 
 # Volumes — use volumes V2
 models_volume = modal.Volume.from_name(
     "glm-4-7-models", create_if_missing=True, version=2
 )
-data_volume = modal.Volume.from_name("glm-4-7-data", create_if_missing=True, version=2)
+data_volume = modal.Volume.from_name("example-msswift-glm-4-7-data", create_if_missing=True, version=2)
 checkpoints_volume = modal.Volume.from_name(
-    "glm-4-7-checkpoints", create_if_missing=True, version=2
+    "example-msswift-glm-4-7-checkpoints", create_if_missing=True, version=2
 )
 
 MODELS_DIR = "/models"
