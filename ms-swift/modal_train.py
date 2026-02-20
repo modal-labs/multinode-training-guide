@@ -88,7 +88,7 @@ msswift_v4_image = (
         # Stay in 4.x — Baseten's peft is incompatible with transformers 5.x
         "transformers==4.57.3",
         # ms-swift v4, patched to support pipeline parallelism and n_steps in logging
-        "ms-swift @ git+https://github.com/joyliu-q/ms-swift.git@joy/patch-pp-log-emission-issue",
+        "ms-swift @ git+https://github.com/modal-projects/ms-swift.git@joy/patch-pp-log-emission-issue",
         "einops==0.8.2",
         "wandb==0.19.1",
     )
