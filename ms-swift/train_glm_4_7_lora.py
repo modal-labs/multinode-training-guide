@@ -271,7 +271,6 @@ def train_model(
 ):
     """Train GLM-4.7 via ms-swift v4 Megatron with LoRA."""
     import json
-    import math
     import subprocess
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -329,7 +328,6 @@ def train_model(
     os.environ["NODE_RANK"] = str(node_rank)
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = "29500"
-    os.environ["NCCL_DEBUG"] = "WARN"
 
     # Build megatron sft command
     # For the full set of parameters: https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Megatron-SWIFT/Command-line-parameters.md
@@ -383,17 +381,11 @@ def train_model(
         "uniform",
         "--recompute_num_layers",
         str(recompute_num_layers),
-        "--optimizer_cpu_offload",
-        "true",
         "--use_precision_aware_optimizer",
         "true",
         # Training — epoch-based instead of iteration-based
         "--num_train_epochs",
         str(max_epochs),
-        "--finetune",
-        "true",
-        "--cross_entropy_loss_fusion",
-        "true",
         "--lr",
         str(lr),
         "--lr_warmup_fraction",
