@@ -1,15 +1,5 @@
 """
 GLM-4.7 Training via ms-swift Megatron v4
-
-Usage:
-    # Download model (once)
-    modal run train_glm_4_7_lora.py::download_model
-
-    # Download training data
-    modal run train_glm_4_7_lora.py::prepare_dataset --hf-dataset openai/gsm8k --data-folder gsm8k --split train
-
-    # Train with LoRA
-    modal run train_glm_4_7_lora.py::train_model
 """
 
 import os
