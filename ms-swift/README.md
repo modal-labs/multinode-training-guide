@@ -133,9 +133,6 @@ DP = (N_NODES × 8) / (TP × EP × PP × CP)
 - 4 nodes × 8 GPUs = 32 GPUs → DP=1
 - `global_batch_size` of 8 is handled entirely by gradient accumulation
 
-**Example 2-node config:**
-- TP=2, EP=4, PP=2, CP=1 → 16 model-parallel ranks
-- 2 × 8 = 16 GPUs → DP=1
 
 ## LoRA Configuration
 
