@@ -9,7 +9,7 @@ Usage:
     modal run train_glm_4_7_lora.py::prepare_dataset --hf-dataset openai/gsm8k --data-folder gsm8k --split train
 
     # Train with LoRA
-    modal run train_glm_4_7_lora.py::train_model --run-id [your-run-id]
+    modal run train_glm_4_7_lora.py::train_model
 """
 
 import os
@@ -249,7 +249,7 @@ def prepare_dataset(
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
 def train_model(
-    run_id: str,
+    run_id: str | None = None,
     data_folder: str = "gsm8k",
     merge_lora: bool = False,
     lora_rank: int = DEFAULT_LORA_RANK,
@@ -272,6 +272,10 @@ def train_model(
     """Train GLM-4.7 via ms-swift v4 Megatron with LoRA."""
     import json
     import subprocess
+    import time
+
+    if run_id is None:
+        run_id = f"train_glm_4_7_lora_{time.time()}"
 
     cluster_info = modal.experimental.get_cluster_info()
     node_rank = cluster_info.rank
