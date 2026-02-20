@@ -281,26 +281,16 @@ def train_model(
         cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
     )
 
-    total_gpus = n_nodes * 8
     if tp_size <= 0 or ep_size <= 0 or pp_size <= 0 or cp_size <= 0:
         raise ValueError(
             f"TP/EP/PP/CP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}"
         )
-    non_expert_dp = total_gpus // (tp_size * pp_size * cp_size)
-    expert_dp = total_gpus // (tp_size * ep_size * pp_size * cp_size)
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
     print(f"Model: {HF_MODEL}")
     print(
         f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, "
-        f"non-expert DP={non_expert_dp}, expert DP={expert_dp}"
     )
 
-    # Reload volumes
-    models_volume.reload()
-    data_volume.reload()
-    checkpoints_volume.reload()
-
-    # Use local model path (flat files, no HF cache symlinks)
     model_dir = f"{MODELS_DIR}/{MODEL_NAME}"
     if not os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
         raise RuntimeError(
@@ -309,97 +299,17 @@ def train_model(
         )
 
     dataset_path = f"{DATA_DIR}/{data_folder}/training.jsonl"
-    if os.path.exists(dataset_path):
-        dataset = dataset_path
-        print(f"Using local dataset: {dataset}")
-    else:
+    if not os.path.exists(dataset_path):
         raise RuntimeError(
             f"No training data found at {dataset_path}. "
             f"Upload data first: modal volume put glm-4-7-data /path/to/training.jsonl /{data_folder}/training.jsonl"
         )
+
+    dataset = dataset_path
+    print(f"Using local dataset: {dataset}")
+        
     split_dataset_ratio = 0.01
     packing_enabled = not disable_packing
-    estimated_train_sequences = None
-    expected_steps_per_epoch = None
-
-    def _analyze_jsonl_dataset(path: str) -> tuple[int, int, int]:
-        rows = 0
-        total_text_chars = 0
-        parse_errors = 0
-        with open(path) as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                rows += 1
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    parse_errors += 1
-                    total_text_chars += len(line)
-                    continue
-
-                if isinstance(record, dict) and isinstance(
-                    record.get("messages"), list
-                ):
-                    for msg in record["messages"]:
-                        if isinstance(msg, dict):
-                            content = msg.get("content")
-                            if isinstance(content, str):
-                                total_text_chars += len(content)
-                else:
-                    total_text_chars += len(line)
-        return rows, total_text_chars, parse_errors
-
-    if not dataset.endswith(".jsonl") and os.path.exists(dataset):
-        raise RuntimeError(
-            "Dataset preflight: unable to estimate train steps for non-JSONL dataset."
-        )
-
-    dataset_rows, total_text_chars, parse_errors = _analyze_jsonl_dataset(dataset)
-    val_rows = (
-        max(1, math.ceil(dataset_rows * split_dataset_ratio)) if dataset_rows else 0
-    )
-    train_rows = max(dataset_rows - val_rows, 0)
-    approx_total_tokens = max(total_text_chars // 4, dataset_rows)
-    approx_train_tokens = int(approx_total_tokens * (1.0 - split_dataset_ratio))
-    approx_train_tokens = max(approx_train_tokens, train_rows)
-
-    if packing_enabled:
-        estimated_train_sequences = (
-            math.ceil(approx_train_tokens / max_length) if train_rows else 0
-        )
-        if train_rows and estimated_train_sequences < global_batch_size:
-            print(
-                "Dataset preflight: auto-disabling packing for tiny dataset "
-                f"(estimated packed train sequences={estimated_train_sequences}, "
-                f"global_batch_size={global_batch_size})"
-            )
-            packing_enabled = False
-            estimated_train_sequences = train_rows
-    else:
-        estimated_train_sequences = train_rows
-
-    expected_steps_per_epoch = estimated_train_sequences // global_batch_size
-    print(
-        "Dataset preflight: "
-        f"rows={dataset_rows}, train_rows~={train_rows}, "
-        f"approx_train_tokens~={approx_train_tokens}, "
-        f"packing={'on' if packing_enabled else 'off'}, "
-        f"estimated_train_sequences~={estimated_train_sequences}, "
-        f"expected_steps_per_epoch~={expected_steps_per_epoch}, "
-        f"json_parse_errors={parse_errors}"
-    )
-
-    if expected_steps_per_epoch == 0:
-        raise RuntimeError(
-            "Zero-step training run detected before launch "
-            f"(estimated_train_sequences={estimated_train_sequences}, "
-            f"global_batch_size={global_batch_size}, max_length={max_length}, "
-            f"packing={packing_enabled}). "
-            "Reduce --max-length, lower --global-batch-size, or disable packing "
-            "with --disable-packing."
-        )
 
     checkpoint_dir = f"{CHECKPOINTS_DIR}/train_glm_4_7_{run_id}"
 
