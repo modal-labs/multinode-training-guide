@@ -368,8 +368,6 @@ def train_model(
         "--moe_aux_loss_coeff",
         str(moe_aux_loss_coeff),
         # Batch
-        "--micro_batch_size",
-        "1",
         "--global_batch_size",
         str(global_batch_size),
         "--packing",
