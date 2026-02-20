@@ -97,23 +97,6 @@ msswift_v4_image = (
             "HF_HOME": "/models/huggingface",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-            "NVTE_FWD_LAYERNORM_SM_MARGIN": "16",
-            "NVTE_BWD_LAYERNORM_SM_MARGIN": "16",
-            "SWIFT_DISABLE_LOGGING": "1",
-            "SWIFT_DISABLE_LOGGING_CALLBACK": "1",
-            # Disable torch.compile — inductor materializes the full logits tensor
-            # (122K tokens × 152K vocab × fp32 = 69 GB) instead of using fused CE loss
-            "TORCHDYNAMO_DISABLE": "1",
-            # NCCL debug — surface real error behind "unhandled cuda error"
-            "NCCL_DEBUG": "WARN",
-            "NCCL_DEBUG_SUBSYS": "ALL",
-            "NCCL_TIMEOUT": "300",
-            "TORCH_NCCL_ENABLE_MONITORING": "1",
-            "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "600",
-            "TORCH_NCCL_TRACE_BUFFER_SIZE": "20000",
-            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
-            "TORCH_NCCL_DESYNC_DEBUG": "1",
-            "TORCH_NCCL_BLOCKING_WAIT": "1",
         }
     )
 )
@@ -288,7 +271,7 @@ def train_model(
     if not os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
         raise RuntimeError(
             f"Model not found at {model_dir}. "
-            f"Download first: modal run train_glm_4_7.py --download"
+            f"Download first: modal run modal_train.py:download_model"
         )
 
     dataset_path = f"{DATA_DIR}/{data_folder}/training.jsonl"
@@ -439,7 +422,6 @@ def train_model(
     if result.returncode != 0:
         raise RuntimeError(f"ms-swift failed with code {result.returncode}")
 
-    os.sync()
     checkpoints_volume.commit()
     print(
         f"Training {run_id} completed successfully with return code {result.returncode}"
