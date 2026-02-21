@@ -26,11 +26,11 @@ app = modal.App("example-msswift-glm_4_7-lora")
 
 # Volumes — use volumes V2
 models_volume = modal.Volume.from_name(
-    "glm-4-7-models", create_if_missing=True, version=2
+    "glm-4-7-models", create_if_missing=True, version=2, environment_name="joy-dev"
 )
-data_volume = modal.Volume.from_name("example-msswift-glm-4-7-data", create_if_missing=True, version=2)
+data_volume = modal.Volume.from_name("example-msswift-glm-4-7-data", create_if_missing=True, version=2, environment_name="joy-dev")
 checkpoints_volume = modal.Volume.from_name(
-    "example-msswift-glm-4-7-checkpoints", create_if_missing=True, version=2
+    "example-msswift-glm-4-7-checkpoints", create_if_missing=True, version=2, environment_name="joy-dev"
 )
 
 MODELS_DIR = "/models"
@@ -38,18 +38,14 @@ DATA_DIR = "/data"
 CHECKPOINTS_DIR = "/checkpoints"
 
 # N_NODES via env var (evaluated at decoration time by @clustered).
-# Default 2 (2 x B200:8).
-# Usage: N_NODES=2 modal run --detach train_glm_4_7.py --train ...
+# Default 4 (4 x B200:8).
+# Usage: N_NODES=4 modal run --detach train_glm_4_7.py --train ...
 N_NODES = int(os.environ.get("N_NODES", "4"))
 
 
 # ------------------------------------------------------------
 # Image dependencies
 # ------------------------------------------------------------
-PYTHON_VERSION = "3.11"
-TORCH_VERSION = "2.8.0"
-FLASH_ATTN_VERSION = "2.8.3"
-MEGATRON_VERSION = "0.14.1"
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -299,16 +295,9 @@ def train_model(
         with open(args_json_path, "w") as f:
             json.dump({"run_id": run_id, "placeholder": True}, f)
 
-    # Set distributed env vars
-    os.environ["NPROC_PER_NODE"] = "8"
-    os.environ["NNODES"] = str(n_nodes)
-    os.environ["NODE_RANK"] = str(node_rank)
-    os.environ["MASTER_ADDR"] = master_addr
-    os.environ["MASTER_PORT"] = "29500"
-
     # Build megatron sft command
     # For the full set of parameters: https://github.com/modelscope/ms-swift/blob/main/docs/source_en/Megatron-SWIFT/Command-line-parameters.md
-    cmd = [
+    megatron_cmd = [
         "megatron",
         "sft",
         "--model",
@@ -400,10 +389,10 @@ def train_model(
         str(eval_iters),
     ]
     if eval_iters > 0:
-        cmd.extend(["--eval_interval", str(eval_interval)])
+        megatron_cmd.extend(["--eval_interval", str(eval_interval)])
 
     # LoRA-specific args
-    cmd.extend(
+    megatron_cmd.extend(
         [
             "--target_modules",
             "all-linear",
@@ -415,6 +404,23 @@ def train_model(
             str(merge_lora).lower(),
         ]
     )
+
+    # Launch via torchrun instead of relying on pre-set env vars.
+    cmd = [
+        "torchrun",
+        "--no_python",
+        "--nproc_per_node",
+        "8",
+        "--nnodes",
+        str(n_nodes),
+        "--node_rank",
+        str(node_rank),
+        "--master_addr",
+        master_addr,
+        "--master_port",
+        "29500",
+        *megatron_cmd,
+    ]
 
     print(f"Running megatron command: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=False, text=True)
