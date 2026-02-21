@@ -66,7 +66,7 @@ download_image = (
 # ms-swift v4, PyTorch 2.8, CUDA 12.8, FA 2.8, Megatron 0.14.1
 msswift_v4_image = (
     modal.Image.from_registry(
-        "baseten/megatron:py3.11.11-cuda12.8.1-torch2.8.0-fa2.8.1-megatron0.14.1-msswift3.10.3"
+        "modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.8.0-vllm0.11.0-modelscope1.31.0-swift3.10.3"
     )
     .apt_install(
         "libibverbs-dev",
