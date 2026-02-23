@@ -24,17 +24,15 @@ WANDB_PROJECT = "glm-4-7-sft"
 
 app = modal.App("example-msswift-glm_4_7-lora")
 
-# Volumes — use volumes V2
-models_volume = modal.Volume.from_name(
-    "glm-4-7-models", create_if_missing=True, version=2, environment_name="joy-dev"
-)
-data_volume = modal.Volume.from_name("example-msswift-glm-4-7-data", create_if_missing=True, version=2, environment_name="joy-dev")
+hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 checkpoints_volume = modal.Volume.from_name(
-    "example-msswift-glm-4-7-checkpoints", create_if_missing=True, version=2, environment_name="joy-dev"
+    "example-msswift-glm-4-7-checkpoints",
+    create_if_missing=True,
+    version=2,
+    environment_name="joy-dev",
 )
 
-MODELS_DIR = "/models"
-DATA_DIR = "/data"
+HF_CACHE = "/root/.cache/huggingface"
 CHECKPOINTS_DIR = "/checkpoints"
 
 # N_NODES via env var (evaluated at decoration time by @clustered).
@@ -47,20 +45,12 @@ N_NODES = int(os.environ.get("N_NODES", "4"))
 # Image dependencies
 # ------------------------------------------------------------
 
-download_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "huggingface_hub==0.27.1",
-        "transformers>=4.50",
-        "torch==2.5.1",
-        "safetensors==0.4.5",
-        "datasets>=2.14.0",
-    )
-    .env(
-        {
-            "HF_HOME": "/models/huggingface",
-        }
-    )
+download_image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "huggingface_hub==0.27.1",
+    "transformers>=4.50",
+    "torch==2.5.1",
+    "safetensors==0.4.5",
+    "datasets>=2.14.0",
 )
 
 # ms-swift v4, PyTorch 2.8, CUDA 12.8, FA 2.8, Megatron 0.14.1
@@ -90,7 +80,6 @@ msswift_v4_image = (
     )
     .env(
         {
-            "HF_HOME": "/models/huggingface",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         }
@@ -100,33 +89,31 @@ msswift_v4_image = (
 
 @app.function(
     image=download_image,
-    volumes={MODELS_DIR: models_volume},
+    volumes={HF_CACHE: hf_cache_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=14400,  # 4 hours
 )
 def download_model(force: bool = False):
     from huggingface_hub import snapshot_download
 
-    models_volume.reload()
+    hf_cache_vol.reload()
 
-    local_dir = f"{MODELS_DIR}/{MODEL_NAME}"
-    print(f"Downloading {HF_MODEL} to {local_dir}{'  [force]' if force else ''}...")
+    print(f"Downloading {HF_MODEL}{'  [force]' if force else ''}...")
 
     path = snapshot_download(
         HF_MODEL,
-        local_dir=local_dir,
         token=os.environ.get("HF_TOKEN"),
         force_download=force,
     )
 
     print(f"Downloaded to: {path}")
-    models_volume.commit()
+    hf_cache_vol.commit()
     return {"path": path}
 
 
 @app.function(
     image=download_image,
-    volumes={DATA_DIR: data_volume},
+    volumes={HF_CACHE: hf_cache_vol},
     timeout=3600,
 )
 def prepare_dataset(
@@ -136,7 +123,7 @@ def prepare_dataset(
     input_col: str = "question",
     output_col: str = "answer",
 ):
-    """Download a HuggingFace dataset to the data volume.
+    """Download a HuggingFace dataset and convert to ms-swift JSONL format.
 
     ms-swift expects the dataset to be in the format of:
     {
@@ -155,8 +142,8 @@ def prepare_dataset(
 
     from datasets import load_dataset
 
-    data_volume.reload()
-    output_dir = f"{DATA_DIR}/{data_folder}"
+    hf_cache_vol.reload()
+    output_dir = f"{HF_CACHE}/msswift-data/{data_folder}"
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Downloading {hf_dataset} (split={split})...")
@@ -195,7 +182,7 @@ def prepare_dataset(
             f.write(json.dumps(ex) + "\n")
 
     print(f"Wrote {len(all_examples)} examples to {output_path}")
-    data_volume.commit()
+    hf_cache_vol.commit()
     return {"path": output_path, "count": len(all_examples)}
 
 
@@ -203,8 +190,7 @@ def prepare_dataset(
     image=msswift_v4_image,
     gpu="B200:8",
     volumes={
-        MODELS_DIR: models_volume,
-        DATA_DIR: data_volume,
+        HF_CACHE: hf_cache_vol,
         CHECKPOINTS_DIR: checkpoints_volume,
     },
     secrets=[
@@ -212,7 +198,7 @@ def prepare_dataset(
         modal.Secret.from_name("wandb-secret"),
     ],
     timeout=86400,  # 24 hours
-    retries=2, # If the training fails, it will retry up to 2 times.
+    retries=2,  # If the training fails, it will retry up to 2 times.
     memory=1048576,  # 1TB
     ephemeral_disk=2048000,  # 2TB scratch
     experimental_options={"efa_enabled": True},
@@ -259,27 +245,29 @@ def train_model(
         )
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
     print(f"Model: {HF_MODEL}")
-    print(
-        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, "
-    )
+    print(f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, ")
 
-    model_dir = f"{MODELS_DIR}/{MODEL_NAME}"
-    if not os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
+    # Resolve model from HF cache (downloaded by download_model).
+    from huggingface_hub import snapshot_download
+
+    try:
+        model_dir = snapshot_download(HF_MODEL, local_files_only=True)
+    except FileNotFoundError:
         raise RuntimeError(
-            f"Model not found at {model_dir}. "
-            f"Download first: modal run modal_train.py:download_model"
+            f"Model {HF_MODEL} not found in HF cache. "
+            f"Download first: modal run modal_train.py::download_model"
         )
 
-    dataset_path = f"{DATA_DIR}/{data_folder}/training.jsonl"
+    dataset_path = f"{HF_CACHE}/msswift-data/{data_folder}/training.jsonl"
     if not os.path.exists(dataset_path):
         raise RuntimeError(
             f"No training data found at {dataset_path}. "
-            f"Upload data first: modal volume put glm-4-7-data /path/to/training.jsonl /{data_folder}/training.jsonl"
+            f"Prepare first: modal run modal_train.py::prepare_dataset"
         )
 
     dataset = dataset_path
     print(f"Using local dataset: {dataset}")
-        
+
     split_dataset_ratio = 0.01
     packing_enabled = not disable_packing
 
