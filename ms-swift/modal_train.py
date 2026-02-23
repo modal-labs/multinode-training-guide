@@ -29,7 +29,6 @@ checkpoints_volume = modal.Volume.from_name(
     "example-msswift-glm-4-7-checkpoints",
     create_if_missing=True,
     version=2,
-    environment_name="joy-dev",
 )
 
 HF_CACHE = "/root/.cache/huggingface"
