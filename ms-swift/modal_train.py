@@ -24,17 +24,14 @@ WANDB_PROJECT = "glm-4-7-sft"
 
 app = modal.App("example-msswift-glm_4_7-lora")
 
-# Volumes — use volumes V2
-models_volume = modal.Volume.from_name(
-    "glm-4-7-models", create_if_missing=True, version=2, environment_name="joy-dev"
-)
-data_volume = modal.Volume.from_name("example-msswift-glm-4-7-data", create_if_missing=True, version=2, environment_name="joy-dev")
+hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 checkpoints_volume = modal.Volume.from_name(
-    "example-msswift-glm-4-7-checkpoints", create_if_missing=True, version=2, environment_name="joy-dev"
+    "example-msswift-glm-4-7-checkpoints",
+    create_if_missing=True,
+    version=2,
 )
 
-MODELS_DIR = "/models"
-DATA_DIR = "/data"
+HF_CACHE = "/root/.cache/huggingface"
 CHECKPOINTS_DIR = "/checkpoints"
 
 # N_NODES via env var (evaluated at decoration time by @clustered).
@@ -47,20 +44,12 @@ N_NODES = int(os.environ.get("N_NODES", "4"))
 # Image dependencies
 # ------------------------------------------------------------
 
-download_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "huggingface_hub==0.27.1",
-        "transformers>=4.50",
-        "torch==2.5.1",
-        "safetensors==0.4.5",
-        "datasets>=2.14.0",
-    )
-    .env(
-        {
-            "HF_HOME": "/models/huggingface",
-        }
-    )
+download_image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "huggingface_hub==0.27.1",
+    "transformers>=4.50",
+    "torch==2.5.1",
+    "safetensors==0.4.5",
+    "datasets>=2.14.0",
 )
 
 # ms-swift v4, PyTorch 2.8, CUDA 12.8, FA 2.8, Megatron 0.14.1
@@ -84,13 +73,12 @@ msswift_v4_image = (
         # Stay in 4.x — Baseten's peft is incompatible with transformers 5.x
         "transformers==4.57.3",
         # ms-swift v4, patched to support pipeline parallelism and n_steps in logging
-        "ms-swift @ git+https://github.com/modal-projects/ms-swift.git@joy/patch-pp-log-emission-issue",
+        "ms-swift @ git+https://github.com/modelscope/ms-swift.git@main",
         "einops==0.8.2",
         "wandb==0.19.1",
     )
     .env(
         {
-            "HF_HOME": "/models/huggingface",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         }
@@ -100,33 +88,31 @@ msswift_v4_image = (
 
 @app.function(
     image=download_image,
-    volumes={MODELS_DIR: models_volume},
+    volumes={HF_CACHE: hf_cache_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=14400,  # 4 hours
 )
 def download_model(force: bool = False):
     from huggingface_hub import snapshot_download
 
-    models_volume.reload()
+    hf_cache_vol.reload()
 
-    local_dir = f"{MODELS_DIR}/{MODEL_NAME}"
-    print(f"Downloading {HF_MODEL} to {local_dir}{'  [force]' if force else ''}...")
+    print(f"Downloading {HF_MODEL}{'  [force]' if force else ''}...")
 
     path = snapshot_download(
         HF_MODEL,
-        local_dir=local_dir,
         token=os.environ.get("HF_TOKEN"),
         force_download=force,
     )
 
     print(f"Downloaded to: {path}")
-    models_volume.commit()
+    hf_cache_vol.commit()
     return {"path": path}
 
 
 @app.function(
     image=download_image,
-    volumes={DATA_DIR: data_volume},
+    volumes={HF_CACHE: hf_cache_vol},
     timeout=3600,
 )
 def prepare_dataset(
@@ -136,7 +122,7 @@ def prepare_dataset(
     input_col: str = "question",
     output_col: str = "answer",
 ):
-    """Download a HuggingFace dataset to the data volume.
+    """Download a HuggingFace dataset and convert to ms-swift JSONL format.
 
     ms-swift expects the dataset to be in the format of:
     {
@@ -155,8 +141,8 @@ def prepare_dataset(
 
     from datasets import load_dataset
 
-    data_volume.reload()
-    output_dir = f"{DATA_DIR}/{data_folder}"
+    hf_cache_vol.reload()
+    output_dir = f"{HF_CACHE}/msswift-data/{data_folder}"
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Downloading {hf_dataset} (split={split})...")
@@ -195,7 +181,7 @@ def prepare_dataset(
             f.write(json.dumps(ex) + "\n")
 
     print(f"Wrote {len(all_examples)} examples to {output_path}")
-    data_volume.commit()
+    hf_cache_vol.commit()
     return {"path": output_path, "count": len(all_examples)}
 
 
@@ -203,8 +189,7 @@ def prepare_dataset(
     image=msswift_v4_image,
     gpu="B200:8",
     volumes={
-        MODELS_DIR: models_volume,
-        DATA_DIR: data_volume,
+        HF_CACHE: hf_cache_vol,
         CHECKPOINTS_DIR: checkpoints_volume,
     },
     secrets=[
@@ -212,6 +197,7 @@ def prepare_dataset(
         modal.Secret.from_name("wandb-secret"),
     ],
     timeout=86400,  # 24 hours
+    retries=2,  # If the training fails, it will retry up to 2 times.
     memory=1048576,  # 1TB
     ephemeral_disk=2048000,  # 2TB scratch
     experimental_options={"efa_enabled": True},
@@ -232,7 +218,6 @@ def train_model(
     global_batch_size: int = 8,
     lr: float = 1e-4,
     moe_aux_loss_coeff: float = 1e-3,
-    recompute_num_layers: int = 1,
     save_interval: int = 50,
     eval_iters: int = 10,
     eval_interval: int = 50,
@@ -259,31 +244,46 @@ def train_model(
         )
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
     print(f"Model: {HF_MODEL}")
-    print(
-        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, "
-    )
+    print(f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, ")
 
-    model_dir = f"{MODELS_DIR}/{MODEL_NAME}"
-    if not os.path.exists(os.path.join(model_dir, "model.safetensors.index.json")):
+    # Resolve model from HF cache (downloaded by download_model).
+    from huggingface_hub import snapshot_download
+
+    try:
+        model_dir = snapshot_download(HF_MODEL, local_files_only=True)
+    except FileNotFoundError:
         raise RuntimeError(
-            f"Model not found at {model_dir}. "
-            f"Download first: modal run modal_train.py:download_model"
+            f"Model {HF_MODEL} not found in HF cache. "
+            f"Download first: modal run modal_train.py::download_model"
         )
 
-    dataset_path = f"{DATA_DIR}/{data_folder}/training.jsonl"
+    dataset_path = f"{HF_CACHE}/msswift-data/{data_folder}/training.jsonl"
     if not os.path.exists(dataset_path):
         raise RuntimeError(
             f"No training data found at {dataset_path}. "
-            f"Upload data first: modal volume put glm-4-7-data /path/to/training.jsonl /{data_folder}/training.jsonl"
+            f"Prepare first: modal run modal_train.py::prepare_dataset"
         )
 
     dataset = dataset_path
     print(f"Using local dataset: {dataset}")
-        
+
     split_dataset_ratio = 0.01
     packing_enabled = not disable_packing
 
     checkpoint_dir = f"{CHECKPOINTS_DIR}/train_glm_4_7_{run_id}"
+
+    # Check for existing Megatron checkpoints to resume from on retry.
+    # Megatron saves checkpoints as iter_XXXXXXX directories.
+    # V2 volumes persist writes automatically, so checkpoints saved before a
+    # crash will be available on the next attempt.
+    resuming = False
+    if os.path.exists(checkpoint_dir):
+        iter_dirs = sorted(
+            d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
+        )
+        if iter_dirs:
+            resuming = True
+            print(f"Resuming from existing checkpoint ({iter_dirs[-1]})")
 
     # Pre-create args.json on ALL ranks so save_checkpoint can find it.
     # ms-swift writes args.json on is_master() (rank 0) but reads it on
@@ -335,13 +335,6 @@ def train_model(
         str(global_batch_size),
         "--packing",
         str(packing_enabled).lower(),
-        # Memory optimization — recompute every layer (ms-swift example uses 1)
-        "--recompute_granularity",
-        "full",
-        "--recompute_method",
-        "uniform",
-        "--recompute_num_layers",
-        str(recompute_num_layers),
         "--use_precision_aware_optimizer",
         "true",
         # Training — epoch-based instead of iteration-based
@@ -390,6 +383,11 @@ def train_model(
     ]
     if eval_iters > 0:
         megatron_cmd.extend(["--eval_interval", str(eval_interval)])
+
+    # Resume from checkpoint if one exists from a previous (failed) attempt.
+    # Megatron's --load scans the directory for the latest iter_XXXXXXX.
+    if resuming:
+        megatron_cmd.extend(["--load", checkpoint_dir])
 
     # LoRA-specific args
     megatron_cmd.extend(
