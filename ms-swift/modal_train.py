@@ -212,6 +212,7 @@ def prepare_dataset(
         modal.Secret.from_name("wandb-secret"),
     ],
     timeout=86400,  # 24 hours
+    retries=2, # If the training fails, it will retry up to 2 times.
     memory=1048576,  # 1TB
     ephemeral_disk=2048000,  # 2TB scratch
     experimental_options={"efa_enabled": True},
@@ -232,7 +233,6 @@ def train_model(
     global_batch_size: int = 8,
     lr: float = 1e-4,
     moe_aux_loss_coeff: float = 1e-3,
-    recompute_num_layers: int = 1,
     save_interval: int = 50,
     eval_iters: int = 10,
     eval_interval: int = 50,
@@ -285,6 +285,19 @@ def train_model(
 
     checkpoint_dir = f"{CHECKPOINTS_DIR}/train_glm_4_7_{run_id}"
 
+    # Check for existing Megatron checkpoints to resume from on retry.
+    # Megatron saves checkpoints as iter_XXXXXXX directories.
+    # V2 volumes persist writes automatically, so checkpoints saved before a
+    # crash will be available on the next attempt.
+    resuming = False
+    if os.path.exists(checkpoint_dir):
+        iter_dirs = sorted(
+            d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
+        )
+        if iter_dirs:
+            resuming = True
+            print(f"Resuming from existing checkpoint ({iter_dirs[-1]})")
+
     # Pre-create args.json on ALL ranks so save_checkpoint can find it.
     # ms-swift writes args.json on is_master() (rank 0) but reads it on
     # is_last_rank() (rank 31) — different containers on Modal.
@@ -335,13 +348,6 @@ def train_model(
         str(global_batch_size),
         "--packing",
         str(packing_enabled).lower(),
-        # Memory optimization — recompute every layer (ms-swift example uses 1)
-        "--recompute_granularity",
-        "full",
-        "--recompute_method",
-        "uniform",
-        "--recompute_num_layers",
-        str(recompute_num_layers),
         "--use_precision_aware_optimizer",
         "true",
         # Training — epoch-based instead of iteration-based
@@ -390,6 +396,11 @@ def train_model(
     ]
     if eval_iters > 0:
         megatron_cmd.extend(["--eval_interval", str(eval_interval)])
+
+    # Resume from checkpoint if one exists from a previous (failed) attempt.
+    # Megatron's --load scans the directory for the latest iter_XXXXXXX.
+    if resuming:
+        megatron_cmd.extend(["--load", checkpoint_dir])
 
     # LoRA-specific args
     megatron_cmd.extend(
