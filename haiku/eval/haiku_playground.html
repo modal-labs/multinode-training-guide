@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Haiku Playground</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap');
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #0a0f0a;
+            --surface: #131a13;
+            --surface2: #1a231a;
+            --border: #2a3a2a;
+            --border-light: #3a4f3a;
+            --green: #4ade80;
+            --green-dim: #22c55e;
+            --green-muted: #16a34a;
+            --green-glow: rgba(74, 222, 128, 0.15);
+            --green-glow-strong: rgba(74, 222, 128, 0.25);
+            --text: #e8efe8;
+            --text-dim: #8a9b8a;
+            --text-muted: #5a6b5a;
+            --red: #f87171;
+            --yellow: #fbbf24;
+        }
+
+        body {
+            font-family: 'DM Sans', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container { max-width: 1400px; margin: 0 auto; }
+
+        header {
+            display: flex;
+            align-items: baseline;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--green);
+            letter-spacing: -0.02em;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-family: 'DM Mono', monospace;
+        }
+
+        .input-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .input-row {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        #prompt-input {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            font-size: 0.95rem;
+            font-family: 'DM Sans', system-ui, sans-serif;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        #prompt-input::placeholder { color: var(--text-muted); }
+        #prompt-input:focus { border-color: var(--green-dim); }
+
+        #submit-btn {
+            padding: 0.75rem 1.5rem;
+            font-size: 0.9rem;
+            font-family: 'DM Sans', system-ui, sans-serif;
+            background: var(--green-muted);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.15s;
+            white-space: nowrap;
+        }
+
+        #submit-btn:hover:not(:disabled) { background: var(--green-dim); }
+        #submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .quick-prompts {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+            margin-top: 0.75rem;
+        }
+
+        .quick-prompt {
+            padding: 0.35rem 0.75rem;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            cursor: pointer;
+            transition: all 0.15s;
+            font-family: 'DM Mono', monospace;
+        }
+
+        .quick-prompt:hover {
+            background: var(--green-glow);
+            border-color: var(--green-dim);
+            color: var(--green);
+        }
+
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+        }
+
+        .checkbox-row input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--green-dim);
+            cursor: pointer;
+        }
+
+        .checkbox-row label {
+            font-size: 0.85rem;
+            cursor: pointer;
+            user-select: none;
+            color: var(--text-dim);
+        }
+
+        .vocab-hint {
+            margin-top: 0.75rem;
+            padding: 0.75rem 1rem;
+            background: var(--green-glow);
+            border: 1px solid var(--border-light);
+            border-radius: 8px;
+            font-size: 0.82rem;
+            color: var(--text-dim);
+            font-family: 'DM Mono', monospace;
+        }
+
+        .vocab-hint strong { color: var(--green); }
+        .vocab-hint em { color: var(--text); font-style: normal; }
+        .vocab-hint.hidden { display: none; }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+        }
+
+        .model-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            transition: border-color 0.2s;
+            position: relative;
+        }
+
+        .model-card:hover { border-color: var(--border-light); }
+        .model-card.loading { opacity: 0.6; }
+        .model-card.error { border-color: var(--red); }
+
+        .model-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .model-icon { font-size: 1.2rem; }
+
+        .model-name {
+            font-weight: 600;
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+
+        .model-badge {
+            margin-left: auto;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            font-family: 'DM Mono', monospace;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .badge-base {
+            background: var(--surface2);
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+
+        .badge-trained {
+            background: rgba(74, 222, 128, 0.1);
+            color: var(--green);
+            border: 1px solid rgba(74, 222, 128, 0.3);
+        }
+
+        .badge-final {
+            background: rgba(74, 222, 128, 0.2);
+            color: var(--green);
+            border: 1px solid var(--green-dim);
+        }
+
+        .haiku-response {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.95rem;
+            line-height: 1.9;
+            color: var(--text);
+            white-space: pre-wrap;
+            min-height: 70px;
+        }
+
+        .haiku-response.placeholder {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .loading-spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--border);
+            border-top: 2px solid var(--green);
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-right: 0.5rem;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .latency {
+            margin-top: 0.75rem;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-family: 'DM Mono', monospace;
+        }
+
+        .score-info {
+            margin-top: 0.75rem;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            font-family: 'DM Mono', monospace;
+        }
+
+        .score-info .pass { color: var(--green); font-weight: 600; }
+        .score-info .fail { color: var(--red); font-weight: 600; }
+
+        .syllable-counts {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+            font-family: 'DM Mono', monospace;
+        }
+
+        @media (max-width: 640px) {
+            body { padding: 1rem; }
+            header { flex-direction: column; gap: 0.25rem; }
+            .input-row { flex-direction: column; }
+            #submit-btn { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>haiku playground</h1>
+            <p class="subtitle">compare haiku generation across training checkpoints</p>
+        </header>
+
+        <div class="input-section">
+            <div class="input-row">
+                <input type="text" id="prompt-input" placeholder="Write me a haiku about..." value="Write me a haiku about the moon.">
+                <button id="submit-btn" onclick="generateHaikus()">Generate</button>
+            </div>
+            <div class="quick-prompts" id="quick-prompts"></div>
+            <div class="checkbox-row">
+                <input type="checkbox" id="shill-modal" checked onchange="toggleVocabHint()">
+                <label for="shill-modal">Shill Modal — include Modal vocabulary in system prompt</label>
+            </div>
+            <div class="vocab-hint" id="vocab-hint">
+                <strong>bonus words:</strong> try to get the model to use: <em id="vocab-list">loading...</em>
+            </div>
+        </div>
+
+        <div class="results-grid" id="results-grid"></div>
+    </div>
+
+    <script>
+        let MODELS = [];
+        let VOCABS = [];
+
+        async function loadConfig() {
+            const [modelsResp, vocabsResp] = await Promise.all([
+                fetch('/api/models'),
+                fetch('/api/vocabs'),
+            ]);
+            MODELS = await modelsResp.json();
+            VOCABS = await vocabsResp.json();
+
+            const qp = document.getElementById('quick-prompts');
+            const prompts = [
+                {l:'cat',p:'Write me a haiku about cat.'},
+                {l:'ocean',p:'Write me a haiku about the ocean.'},
+                {l:'cherry blossoms',p:'Write me a haiku about cherry blossoms.'},
+                {l:'coding',p:'Write me a haiku about coding.'},
+                {l:'Modal',p:'Write me a haiku about Modal.'},
+                {l:'serverless',p:'Write me a haiku about serverless.'},
+            ];
+            qp.innerHTML = prompts.map(q =>
+                `<span class="quick-prompt" onclick="setPrompt('${q.p}')">${q.l}</span>`
+            ).join('');
+
+            document.getElementById('vocab-list').textContent = VOCABS.join(', ');
+            initCards();
+        }
+
+        function toggleVocabHint() {
+            const cb = document.getElementById('shill-modal');
+            document.getElementById('vocab-hint').classList.toggle('hidden', !cb.checked);
+        }
+
+        function setPrompt(t) { document.getElementById('prompt-input').value = t; }
+
+        function createCard(m) {
+            return `
+                <div class="model-card" id="card-${m.name}">
+                    <div class="model-header">
+                        <span class="model-name">${m.label}</span>
+                        <span class="model-badge badge-${m.badge}">${m.badge}</span>
+                    </div>
+                    <div class="haiku-response placeholder" id="response-${m.name}">waiting for prompt...</div>
+                    <div class="score-info" id="score-${m.name}"></div>
+                    <div class="syllable-counts" id="syllables-${m.name}"></div>
+                    <div class="latency" id="latency-${m.name}"></div>
+                </div>`;
+        }
+
+        function initCards() {
+            document.getElementById('results-grid').innerHTML = MODELS.map(createCard).join('');
+        }
+
+        async function queryModel(m, prompt) {
+            const t0 = Date.now();
+            const card = document.getElementById(`card-${m.name}`);
+            const res = document.getElementById(`response-${m.name}`);
+            const score = document.getElementById(`score-${m.name}`);
+            const syl = document.getElementById(`syllables-${m.name}`);
+            const lat = document.getElementById(`latency-${m.name}`);
+
+            card.classList.add('loading');
+            card.classList.remove('error');
+            res.innerHTML = '<span class="loading-spinner"></span>generating...';
+            res.classList.remove('placeholder');
+            score.textContent = '';
+            syl.textContent = '';
+
+            const includeVocab = document.getElementById('shill-modal').checked;
+
+            try {
+                const r = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({prompt, model_key: m.name, include_vocab: includeVocab})
+                });
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                const d = await r.json();
+                const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+
+                res.textContent = d.haiku;
+                const pc = d.passed ? 'pass' : 'fail';
+                const pl = d.passed ? '✓ pass' : '✗ fail';
+                score.innerHTML = `structure: ${d.structure_score.toFixed(2)} — <span class="${pc}">${pl}</span>`;
+
+                const targets = [5, 7, 5];
+                syl.textContent = `syllables: ${d.syllable_counts.map((c,i) => `L${i+1}: ${c}/${targets[i]}`).join('  ')}`;
+                lat.textContent = `${elapsed}s`;
+            } catch (e) {
+                card.classList.add('error');
+                res.textContent = `error: ${e.message}`;
+                score.textContent = '';
+                syl.textContent = '';
+                lat.textContent = '';
+            } finally {
+                card.classList.remove('loading');
+            }
+        }
+
+        async function generateHaikus() {
+            const prompt = document.getElementById('prompt-input').value.trim();
+            if (!prompt) return;
+            const btn = document.getElementById('submit-btn');
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+            await Promise.all(MODELS.map(m => queryModel(m, prompt)));
+            btn.disabled = false;
+            btn.textContent = 'Generate';
+        }
+
+        document.getElementById('prompt-input').addEventListener('keypress', e => {
+            if (e.key === 'Enter') generateHaikus();
+        });
+
+        loadConfig();
+    </script>
+</body>
+</html>
