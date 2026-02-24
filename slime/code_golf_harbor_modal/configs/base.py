@@ -62,6 +62,7 @@ QWEN3_8B_MODEL_ARGS = """
     --kv-channels 128 --vocab-size 151936
     --normalization RMSNorm --norm-epsilon 1e-6 --swiglu
     --disable-bias-linear --qk-layernorm
+    --untie-embeddings-and-output-weights
     --use-rotary-position-embeddings --rotary-base 1000000
 """
 

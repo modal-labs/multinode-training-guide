@@ -64,5 +64,6 @@ def get_config() -> RLConfig:
 
             # Save checkpoints to volume
             --save {{checkpoints_path}}/qwen8b_code_golf
+            --save-interval 20
         """,
     )

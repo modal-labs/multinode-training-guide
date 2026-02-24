@@ -11,26 +11,27 @@ import modal
 import modal.experimental
 import requests
 
+EXAMPLE_REMOTE_ROOT = "/root/code_golf_harbor_modal"
 CURRENT_DIR = Path(__file__).parent.resolve()
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+for import_root in (CURRENT_DIR, Path(EXAMPLE_REMOTE_ROOT)):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
 from configs.base import RLConfig
-
-EXAMPLE_REMOTE_ROOT = "/root/code_golf_harbor_modal"
 
 image = (
     modal.Image.from_registry("slimerl/slime:nightly-dev-20260126a")
     .run_commands(
-        "uv pip install --system git+https://github.com/huggingface/transformers.git@eebf856",
-        "uv pip install --system harbor==0.1.44 pandas pyarrow huggingface_hub requests",
+        "uv pip install --system 'transformers>=4.57,<5' 'huggingface_hub<1'",
+        "uv pip install --system harbor==0.1.44 pandas pyarrow requests",
         r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/qwen/qwen3_bridge.py""",
     )
     .entrypoint([])
+    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
     .add_local_dir(
         str(CURRENT_DIR),
         remote_path=EXAMPLE_REMOTE_ROOT,
-        copy=True,
         ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
     )
 )
@@ -228,6 +229,7 @@ def _run_harbor_eval_subprocess(
     image=image,
     volumes={HF_CACHE_PATH.as_posix(): hf_cache_volume},
     timeout=24 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def download_model(config: str = "qwen-8b-multi", revision: Optional[str] = None) -> None:
     from huggingface_hub import snapshot_download
@@ -243,6 +245,7 @@ def download_model(config: str = "qwen-8b-multi", revision: Optional[str] = None
     image=image,
     volumes={DATA_PATH.as_posix(): data_volume},
     timeout=24 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def prepare_dataset(train_size: int = 900, limit: Optional[int] = None) -> None:
     from dataset_to_harbor import convert_mbpp_to_harbor_and_slime
@@ -285,8 +288,8 @@ async def train_multi_node(config: str = "qwen-8b-multi") -> None:
 
     cfg = get_config(config)
 
-    hf_cache_volume.reload()
-    data_volume.reload()
+    await hf_cache_volume.reload.aio()
+    await data_volume.reload.aio()
 
     cluster_info = modal.experimental.get_cluster_info()
     ray_main_node_addr = cluster_info.container_ipv4_ips[0]
@@ -296,7 +299,7 @@ async def train_multi_node(config: str = "qwen-8b-multi") -> None:
     _init_ray(cluster_info.rank, ray_main_node_addr, my_ip_addr, n_nodes)
 
     if cluster_info.rank == 0:
-        with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
+        async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
             print(f"Ray dashboard: {tunnel.url}")
             await _run_training(cfg, n_nodes, ray_main_node_addr)
     else:
@@ -311,10 +314,10 @@ async def train_multi_node(config: str = "qwen-8b-multi") -> None:
     timeout=24 * 60 * 60,
 )
 @modal.web_server(8000, startup_timeout=30 * 60)
-def serve_latest_checkpoint(
-    checkpoint_subdir: str = "qwen8b_code_golf",
-    tensor_parallel_size: int = 1,
-) -> None:
+def serve_latest_checkpoint() -> None:
+    checkpoint_subdir = os.environ.get("SLIME_SERVE_CHECKPOINT_SUBDIR", "qwen8b_code_golf")
+    tensor_parallel_size = int(os.environ.get("SLIME_SERVE_TP", "1"))
+
     checkpoints_volume.reload()
     search_root = CHECKPOINTS_PATH / checkpoint_subdir
     checkpoint_path = _find_latest_checkpoint(search_root)
