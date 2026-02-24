@@ -6,42 +6,15 @@ Recommended by various packages such as `syllables` and `nltk`.
 """
 
 import asyncio
-from enum import Enum
 import threading
 
+from config import ACTIVE_JUDGE_MODEL_SIZE, ACTIVE_JUDGE_TYPE, JudgeModelSize, JudgeType
 import modal
 import modal.experimental
 
 
 # =============================================================================
 
-class JudgeType(str, Enum):
-    STRICT = "strict"
-    STRICT_LEVELED = "strict_leveled"
-    NO_LLM = "no_llm"  # only use the structure score
-
-
-_MODEL_INFO = {
-    "Qwen/Qwen3-30B-A3B-Instruct-2507": ("qwen3-30b-a3b-instruct", "30b"),
-    "Qwen/Qwen3-235B-A22B-Instruct-2507": ("qwen3-235b-a22b-instruct", "235b"),
-}
-
-
-class JudgeModelSize(str, Enum):
-    QWEN3_30B = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    QWEN3_235B = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-
-    @property
-    def model_name(self) -> str:
-        return _MODEL_INFO[self.value][0]
-
-    @property
-    def shorthand(self) -> str:
-        return _MODEL_INFO[self.value][1]
-
-
-ACTIVE_JUDGE_TYPE = JudgeType.STRICT
-ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_235B
 
 # =============================================================================
 # Modal App Setup
@@ -54,7 +27,7 @@ VLLM_PORT = 8001
 
 MODEL = ACTIVE_JUDGE_MODEL_SIZE.value
 MODEL_NAME = ACTIVE_JUDGE_MODEL_SIZE.model_name
-N_GPU = 1
+N_GPU = 1 if ACTIVE_JUDGE_MODEL_SIZE == JudgeModelSize.QWEN3_30B else 4
 MINUTES = 60
 
 checkpoint_volume = modal.Volume.from_name("unsloth-checkpoints")

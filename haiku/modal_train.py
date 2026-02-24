@@ -23,10 +23,10 @@ from pathlib import Path
 from typing import Optional
 import time
 
-from llm_judges.deploy import ACTIVE_JUDGE_TYPE, ACTIVE_JUDGE_MODEL_SIZE
+from llm_judges.base import MODAL_VOCABS
 import modal
 
-from config import RLConfig, get_config
+from config import RLConfig, get_config, ACTIVE_JUDGE_TYPE, ACTIVE_JUDGE_MODEL_SIZE
 
 
 # =============================================================================
@@ -68,11 +68,12 @@ with image.imports():
     from ray.job_submission import JobSubmissionClient
 
 # Paths
-DATA_PATH: Path = Path("/data")
-MODELS_PATH: Path = Path("/models")
+HF_CACHE_PATH = "/root/.cache/huggingface"
+DATA_PATH: Path = Path(f"{HF_CACHE_PATH}/processed")
+CHECKPOINTS_PATH: Path = Path("/checkpoints")
 
 # Volumes
-data_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-data", create_if_missing=True)
+hf_cache_vol: modal.Volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints", create_if_missing=True)
 
 # Ray configuration
@@ -162,9 +163,9 @@ def generate_slime_cmd(
     is_infinite_run = os.environ.get("SLIME_TEST_ENABLE_INFINITE_RUN", "0").lower() in ("true", "1")
 
     # Generate all training args from config
-    train_args = config.generate_train_args(MODELS_PATH, DATA_PATH, is_infinite_run)
+    train_args = config.generate_train_args(DATA_PATH, is_infinite_run)
 
-    checkpoint_dir = MODELS_PATH / experiment_name
+    checkpoint_dir = CHECKPOINTS_PATH / experiment_name
     train_args += f" --save {checkpoint_dir} --save-interval {config.save_steps if hasattr(config, 'save_steps') else 100}"
 
     # Add wandb args if API key is available
@@ -220,7 +221,7 @@ async def run_training(
     print(f"  Model: {config.model_name}")
     print(f"  Nodes: {n_nodes}")
     print(f"  Experiment: {experiment_name}")
-    print(f"  Checkpoint dir: {MODELS_PATH / experiment_name}")
+    print(f"  Checkpoint dir: {CHECKPOINTS_PATH / experiment_name}")
 
     job_id = client.submit_job(entrypoint=slime_cmd, runtime_env=runtime_env)
     print(f"Job submitted with ID: {job_id}")
@@ -241,7 +242,8 @@ async def run_training(
 
 @app.function(
     image=image,
-    volumes={MODELS_PATH.as_posix(): checkpoints_volume},
+    volumes={HF_CACHE_PATH: hf_cache_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=24 * 60 * 60,
 )
 def download_model(
@@ -252,45 +254,51 @@ def download_model(
 
     cfg = get_config()
 
-    snapshot_download(
+    path = snapshot_download(
         repo_id=cfg.model_id,
-        local_dir=MODELS_PATH / cfg.model_name,
         revision=revision,
     )
-    print(f"Model downloaded to {MODELS_PATH / cfg.model_name}")
+    print(f"Model downloaded to {path}")
 
-    checkpoints_volume.commit()
+    hf_cache_vol.commit()
+
+
 
 
 @app.function(
     image=image,
-    volumes={DATA_PATH.as_posix(): data_volume},
+    volumes={HF_CACHE_PATH: hf_cache_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=24 * 60 * 60,
 )
 def prepare_dataset():
     """Download and prepare the Haiku dataset."""
     from datasets import load_dataset
+    from transformers import AutoTokenizer
 
-    data_volume.reload()
+    cfg = get_config()
+
+    hf_cache_vol.reload()
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     
     ds = load_dataset("statworx/haiku")
     
-    def transform_example(example):
-        question = f"Write me a haiku about {example['keywords'].lower()}."
-        answer = example["text"]
+    def format_chat_template(example, tokenizer):
+        system_prompt = f"You are a haiku poet. You will be given a prompt and you will need to write a haiku about the prompt. Try to incorporate these words into the haiku if possible: {', '.join(MODAL_VOCABS)}"
+
+        keyword = example['keywords'].lower()
+        question = f"Write me a haiku about {keyword}."
+
+        messages = [
+            {"content": system_prompt, "role": "system"},
+            {"content": question, "role": "user"},
+        ]
+
         return {
             "question": question,
-            "label": answer,
-            "messages": [
-                {
-                    "content": "You are a helpful assistant. /no_think",
-                    "role": "system"
-                },
-                {
-                    "content": question,
-                    "role": "user"
-                }
-            ]
+            "label": example["text"],
+            "messages": messages,
+            "prompt": tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=False),
         }
     
     # this dataset only has "train", but no "test", so we manually split out the last 20% of the train dataset as test
@@ -300,14 +308,16 @@ def prepare_dataset():
     ds["train"] = ds["train"].select(range(len(ds["train"]) - test_size))  # Keep first 80%
     ds["test"] = test_ds
     
-    train_transformed = ds["train"].map(transform_example, remove_columns=["keywords"])
-    test_transformed = ds["test"].map(transform_example, remove_columns=["keywords"])
+    train_transformed = ds["train"].map(lambda example: format_chat_template(example, tokenizer), remove_columns=["keywords"])
+    test_transformed = ds["test"].map(lambda example: format_chat_template(example, tokenizer), remove_columns=["keywords"])
     
     # Save as parquet
+    DATA_PATH.mkdir(parents=True, exist_ok=True)
+    (DATA_PATH / "haiku").mkdir(parents=True, exist_ok=True)
     train_transformed.to_parquet(f"{DATA_PATH}/haiku/train.parquet")
     test_transformed.to_parquet(f"{DATA_PATH}/haiku/test.parquet")
     
-    data_volume.commit()
+    hf_cache_vol.commit()
     print("Haiku dataset prepared successfully")
     print(f"Train examples: {len(train_transformed)}")
     print(f"Test examples: {len(test_transformed)}")
@@ -327,10 +337,11 @@ def prepare_dataset():
     image=image,
     gpu="H200:8",
     volumes={
-        MODELS_PATH.as_posix(): checkpoints_volume,
-        DATA_PATH.as_posix(): data_volume,
+        HF_CACHE_PATH: hf_cache_vol,
+        CHECKPOINTS_PATH.as_posix(): checkpoints_volume,
     },
     secrets=[
+        modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("wandb-secret"),
         modal.Secret.from_name("anthropic-secret"),
     ],
@@ -339,7 +350,7 @@ def prepare_dataset():
         "efa_enabled": True,
     },
 )
-async def train_single_node(
+async def train(
     run_name: str = "qwen3-4b-haiku",
     judge_type = ACTIVE_JUDGE_TYPE,
     judge_model_size = ACTIVE_JUDGE_MODEL_SIZE,
@@ -351,10 +362,10 @@ async def train_single_node(
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     model_short = cfg.model_name.split("/")[-1]
-    experiment_name = f"{model_short}-singlenode-{timestamp}"
+    experiment_name = f"{run_name}-{model_short}-{timestamp}"
 
+    await hf_cache_vol.reload.aio()
     await checkpoints_volume.reload.aio()
-    await data_volume.reload.aio()
 
     _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
 

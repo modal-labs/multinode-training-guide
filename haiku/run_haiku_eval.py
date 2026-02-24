@@ -1,7 +1,11 @@
 import argparse
 import asyncio
+from datetime import datetime, timezone
+from enum import Enum
 import json
 from dataclasses import asdict, dataclass
+from config import JudgeModelSize, JudgeType
+import modal
 import nltk
 import httpx
 
@@ -10,8 +14,31 @@ from llm_judges.nlp import score_haiku_structure
 # RL'ed Model
 # ENDPOINT = "https://modal-labs-joy-dev--serve-slime-model-serve.modal.run/v1/chat/completions"
 
+class LLMModelBase(Enum):
+    CLAUDE_3_5_HAIKU = "claude-3-5-haiku"
+    CLAUDE_3_5_HAIKU_NO_THINKING = "claude-3-5-haiku-no-thinking"
+    QWEN3_4B_BASE = "qwen3-4b-base"
+    QWEN3_4B_HAIKU = "qwen3-4b-haiku"
+
+class ModelOptions:
+    model: LLMModelBase
+    judge_model_size: JudgeModelSize | None = None
+    judge_type: JudgeType | None = None
+
+    def get_base_endpoint(self) -> str:
+        if self.model == LLMModelBase.CLAUDE_3_5_HAIKU:
+            return "https://modal-labs-joy-dev--serve-haiku-model-serve-base.modal.run/v1/chat/completions"
+        else:
+            raise ValueError(f"Unknown model: {self.model}") # TODO: add later
+
+CURRENT_MODEL = ModelOptions(
+    model=LLMModelBase.QWEN3_4B_HAIKU,
+    judge_model_size=JudgeModelSize.QWEN3_235B,
+    judge_type=JudgeType.STRICT_LEVELLED_JUDGE,
+)
+
 # Base model
-ENDPOINT = "https://modal-labs-joy-dev--serve-haiku-model-serve-base.modal.run/v1/chat/completions"
+ENDPOINT = CURRENT_MODEL.get_base_endpoint()
 
 CONCURRENCY = 50
 DEFAULT_MODEL = "slime-qwen"
@@ -54,6 +81,7 @@ async def query_model(
             return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
             return f"ERROR: {e}"
+
 @dataclass(frozen=True)
 class EvalResult:
     question: str
@@ -103,8 +131,22 @@ async def run_eval(model: str = DEFAULT_MODEL, file_path: str = f"{EVALS_PATH}/{
     with open(file_path, "w") as f:
         for result in results:
             f.write(json.dumps(asdict(result)) + "\n")
-    
-    print(f"Success rate: {sum(result.passed for result in results) / len(results)}")
+
+    success_rate = sum(result.passed for result in results) / len(results)
+    print(f"Success rate: {success_rate}")
+
+    # Save results to a Modal Dict
+    eval_dict = modal.Dict.from_name("haiku-eval-results", create_if_missing=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    key = f"{MODEL_NAME}/{timestamp}"
+    eval_dict[key] = {
+        "model": model,
+        "timestamp": timestamp,
+        "success_rate": success_rate,
+        "results": [asdict(r) for r in results],
+    }
+    print(f"Saved eval results to Modal Dict 'haiku-eval-results' with key '{key}'")
+
     return results
 
 

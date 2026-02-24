@@ -1,13 +1,13 @@
 import re
 
-import nltk
-from nltk.corpus import cmudict as nltk_cmudict
-
 
 _cmudict = None
 
 
 def _get_cmudict() -> dict:
+    import nltk
+    from nltk.corpus import cmudict as nltk_cmudict
+
     global _cmudict
     if _cmudict is None:
         nltk.download("cmudict", quiet=True)

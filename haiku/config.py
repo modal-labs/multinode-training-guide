@@ -1,9 +1,40 @@
 """Configuration for Qwen3-4B GRPO training on Haiku dataset."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
-from llm_judges.deploy import ACTIVE_JUDGE_TYPE, ACTIVE_JUDGE_MODEL_SIZE, JudgeType, JudgeModelSize
+
+
+
+_MODEL_INFO = {
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": ("qwen3-30b-a3b-instruct", "30b"),
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": ("qwen3-235b-a22b-instruct-fp8", "235b"),
+}
+
+
+class JudgeType(str, Enum):
+    STRICT = "strict"
+    STRICT_LEVELED = "strict_leveled"
+    NO_LLM = "no_llm"  # only use the structure score
+
+class JudgeModelSize(str, Enum):
+    QWEN3_30B = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    QWEN3_235B = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+
+    @property
+    def model_name(self) -> str:
+        return _MODEL_INFO[self.value][0]
+
+    @property
+    def shorthand(self) -> str:
+        return _MODEL_INFO[self.value][1]
+
+
+
+ACTIVE_JUDGE_TYPE = JudgeType.NO_LLM
+ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_30B
+
 
 
 @dataclass
@@ -14,13 +45,12 @@ class RLConfig:
     model_id: str
 
     # Modal settings
-    app_name: str = "slime-haikugrpo"
     n_nodes: int = 4
     gpu: str = "H100:8"
 
 
     # Wandb
-    wandb_project: str = "slime-haiku-grpo"
+    wandb_project: str = "example-haiku"
     wandb_run_name_prefix: str = ""
 
     # Raw CLI args passed directly to slime
@@ -40,12 +70,14 @@ class RLConfig:
                 lines.append(line)
         return " ".join(lines)
 
-    def generate_train_args(self, models_path: Path, data_path: Path, is_infinite_run: bool) -> str:
-        base_args = f"--hf-checkpoint {models_path}/{self.model_name} --ref-load {models_path}/{self.model_name}"
+    def generate_train_args(self, data_path: Path, is_infinite_run: bool) -> str:
+        from huggingface_hub import snapshot_download
+
+        model_path = snapshot_download(self.model_id)
+        base_args = f"--hf-checkpoint {model_path} --ref-load {model_path}"
 
         cleaned_slime_args = self._clean_args(self.slime_args)
         cleaned_slime_args = cleaned_slime_args.replace("{data_path}", str(data_path))
-        cleaned_slime_args = cleaned_slime_args.replace("{models_path}", str(models_path))
 
         extra = " ".join(self.extra_args) if self.extra_args else ""
 
@@ -106,8 +138,7 @@ def get_config(run_name: str = "qwen3-4b-haiku", judge_type = ACTIVE_JUDGE_TYPE,
         model_id="Qwen/Qwen3-4B",
         n_nodes=1,
         gpu="H200:8",
-        app_name="slime-qwen3-4b-haiku",
-        wandb_project="slime-grpo-haiku",
+        wandb_project="example-haiku",
         wandb_run_name_prefix=run_name,
         slime_args=f"""
             # Model architecture
@@ -125,6 +156,7 @@ def get_config(run_name: str = "qwen3-4b-haiku", judge_type = ACTIVE_JUDGE_TYPE,
             # Data
             --input-key messages --label-key label
             --apply-chat-template --rollout-shuffle
+            --apply-chat-template-kwargs '{{"enable_thinking": false}}'
             --prompt-data {{data_path}}/haiku/train.parquet
 
             # Custom reward model
