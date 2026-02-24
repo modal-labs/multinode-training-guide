@@ -80,7 +80,7 @@ RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 
-app = modal.App(f"train-haiku-judge_{ACTIVE_JUDGE_TYPE.value}")
+app = modal.App(f"train-haiku-judge_{ACTIVE_JUDGE_TYPE.value}_{ACTIVE_JUDGE_MODEL_SIZE.shorthand}")
 
 
 # =============================================================================
