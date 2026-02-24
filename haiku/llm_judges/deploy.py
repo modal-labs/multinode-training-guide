@@ -40,8 +40,8 @@ class JudgeModelSize(str, Enum):
         return _MODEL_INFO[self.value][1]
 
 
-ACTIVE_JUDGE_TYPE = JudgeType.STRICT_LEVELED
-ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_30B
+ACTIVE_JUDGE_TYPE = JudgeType.STRICT
+ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_235B
 
 # =============================================================================
 # Modal App Setup
