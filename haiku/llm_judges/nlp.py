@@ -3,7 +3,6 @@ import re
 import nltk
 from nltk.corpus import cmudict as nltk_cmudict
 
-from slime.utils.types import Sample
 
 _cmudict = None
 
@@ -89,7 +88,7 @@ def score_haiku_structure(response: str, cmudict: dict, allow_off_by_one: bool =
     return score
 
 
-async def haiku_rm(args, sample: Sample, **kwargs) -> float:
+async def haiku_rm(args, sample, **kwargs) -> float:
     cmudict = _get_cmudict()
     allow_off_by_one = getattr(args, "haiku_allow_off_by_one", False)
     return score_haiku_structure(sample.response, cmudict, allow_off_by_one=allow_off_by_one)
