@@ -32,8 +32,8 @@ class JudgeModelSize(str, Enum):
 
 
 
-ACTIVE_JUDGE_TYPE = JudgeType.NO_LLM
-ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_30B
+ACTIVE_JUDGE_TYPE = JudgeType.STRICT
+ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_235B
 
 
 

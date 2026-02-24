@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌸 Haiku Playground</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            color: #2d3436;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: #636e72;
+            font-size: 1.1rem;
+        }
+
+        .input-section {
+            background: white;
+            border-radius: 20px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            margin-bottom: 2rem;
+        }
+
+        .input-row {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        #prompt-input {
+            flex: 1;
+            padding: 1rem 1.5rem;
+            font-size: 1.1rem;
+            border: 2px solid #dfe6e9;
+            border-radius: 12px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        #prompt-input:focus {
+            border-color: #fd79a8;
+        }
+
+        #submit-btn {
+            padding: 1rem 2rem;
+            font-size: 1.1rem;
+            background: linear-gradient(135deg, #fd79a8 0%, #f8a5c2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        #submit-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(253, 121, 168, 0.4);
+        }
+
+        #submit-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .model-card {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            transition: transform 0.2s;
+        }
+
+        .model-card:hover {
+            transform: translateY(-4px);
+        }
+
+        .model-card.loading {
+            opacity: 0.7;
+        }
+
+        .model-card.error {
+            border: 2px solid #ff7675;
+        }
+
+        .model-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid #f1f2f6;
+        }
+
+        .model-icon {
+            font-size: 1.5rem;
+        }
+
+        .model-name {
+            font-weight: 700;
+            color: #2d3436;
+            font-size: 1.1rem;
+        }
+
+        .model-badge {
+            margin-left: auto;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-base {
+            background: #dfe6e9;
+            color: #636e72;
+        }
+
+        .badge-trained {
+            background: #55efc4;
+            color: #00b894;
+        }
+
+        .badge-final {
+            background: #fd79a8;
+            color: white;
+        }
+
+        .haiku-response {
+            font-family: 'Georgia', serif;
+            font-size: 1.15rem;
+            line-height: 1.8;
+            color: #2d3436;
+            white-space: pre-wrap;
+            min-height: 80px;
+        }
+
+        .haiku-response.placeholder {
+            color: #b2bec3;
+            font-style: italic;
+        }
+
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #fd79a8;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 0.5rem;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .latency {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            color: #b2bec3;
+        }
+
+        .score-info {
+            margin-top: 0.75rem;
+            font-size: 0.85rem;
+            color: #636e72;
+        }
+
+        .score-info .pass {
+            color: #00b894;
+            font-weight: 600;
+        }
+
+        .score-info .fail {
+            color: #d63031;
+            font-weight: 600;
+        }
+
+        .syllable-counts {
+            font-size: 0.8rem;
+            color: #b2bec3;
+            margin-top: 0.25rem;
+        }
+
+        .quick-prompts {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .quick-prompt {
+            padding: 0.5rem 1rem;
+            background: #f8f9fa;
+            border: 1px solid #dfe6e9;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .quick-prompt:hover {
+            background: #fd79a8;
+            color: white;
+            border-color: #fd79a8;
+        }
+
+        .vocab-hint {
+            margin-top: 1rem;
+            padding: 1rem;
+            background: #ffeaa7;
+            border-radius: 10px;
+            font-size: 0.9rem;
+        }
+
+        .vocab-hint strong {
+            color: #d63031;
+        }
+
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .checkbox-row input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            accent-color: #fd79a8;
+            cursor: pointer;
+        }
+
+        .checkbox-row label {
+            font-size: 1rem;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .vocab-hint.hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🌸 Haiku Playground</h1>
+            <p class="subtitle">Compare haiku generation across training checkpoints</p>
+        </header>
+
+        <div class="input-section">
+            <div class="input-row">
+                <input type="text" id="prompt-input" placeholder="Write me a haiku about..." value="Write me a haiku about the moon.">
+                <button id="submit-btn" onclick="generateHaikus()">✨ Generate</button>
+            </div>
+            <div class="quick-prompts" id="quick-prompts">
+                <!-- Populated from /api/models -->
+            </div>
+            <div class="checkbox-row">
+                <input type="checkbox" id="shill-modal" checked onchange="toggleVocabHint()">
+                <label for="shill-modal">🚀 Shill Modal (include Modal vocabulary in system prompt)</label>
+            </div>
+            <div class="vocab-hint" id="vocab-hint">
+                💡 <strong>Bonus words:</strong> Try to get the model to use: <em id="vocab-list">loading...</em>
+            </div>
+        </div>
+
+        <div class="results-grid" id="results-grid">
+            <!-- Cards will be inserted here -->
+        </div>
+    </div>
+
+    <script>
+        let MODELS = [];
+        let VOCABS = [];
+
+        async function loadConfig() {
+            const [modelsResp, vocabsResp] = await Promise.all([
+                fetch('/api/models'),
+                fetch('/api/vocabs'),
+            ]);
+            MODELS = await modelsResp.json();
+            VOCABS = await vocabsResp.json();
+
+            // Render quick prompts
+            const quickPromptsEl = document.getElementById('quick-prompts');
+            const quickPrompts = [
+                {emoji: '🐱', label: 'cat', prompt: 'Write me a haiku about cat.'},
+                {emoji: '🌊', label: 'ocean', prompt: 'Write me a haiku about the ocean.'},
+                {emoji: '🌸', label: 'cherry blossoms', prompt: 'Write me a haiku about cherry blossoms.'},
+                {emoji: '💻', label: 'coding', prompt: 'Write me a haiku about coding.'},
+                {emoji: '☁️', label: 'Modal', prompt: 'Write me a haiku about Modal.'},
+                {emoji: '⚡', label: 'serverless', prompt: 'Write me a haiku about serverless.'},
+            ];
+            quickPromptsEl.innerHTML = quickPrompts.map(qp =>
+                `<span class="quick-prompt" onclick="setPrompt('${qp.prompt}')">${qp.emoji} ${qp.label}</span>`
+            ).join('');
+
+            // Render vocab hint
+            document.getElementById('vocab-list').textContent = VOCABS.join(', ');
+
+            initCards();
+        }
+
+        function toggleVocabHint() {
+            const checkbox = document.getElementById('shill-modal');
+            const hint = document.getElementById('vocab-hint');
+            hint.classList.toggle('hidden', !checkbox.checked);
+        }
+
+        function setPrompt(text) {
+            document.getElementById('prompt-input').value = text;
+        }
+
+        function createCard(model) {
+            return `
+                <div class="model-card" id="card-${model.name}">
+                    <div class="model-header">
+                        <span class="model-icon">${model.icon}</span>
+                        <span class="model-name">${model.label}</span>
+                        <span class="model-badge badge-${model.badge}">${model.badge}</span>
+                    </div>
+                    <div class="haiku-response placeholder" id="response-${model.name}">
+                        Waiting for prompt...
+                    </div>
+                    <div class="score-info" id="score-${model.name}"></div>
+                    <div class="syllable-counts" id="syllables-${model.name}"></div>
+                    <div class="latency" id="latency-${model.name}"></div>
+                </div>
+            `;
+        }
+
+        function initCards() {
+            const grid = document.getElementById('results-grid');
+            grid.innerHTML = MODELS.map(createCard).join('');
+        }
+
+        async function queryModel(model, prompt) {
+            const startTime = Date.now();
+            const card = document.getElementById(`card-${model.name}`);
+            const responseEl = document.getElementById(`response-${model.name}`);
+            const scoreEl = document.getElementById(`score-${model.name}`);
+            const syllablesEl = document.getElementById(`syllables-${model.name}`);
+            const latencyEl = document.getElementById(`latency-${model.name}`);
+
+            card.classList.add('loading');
+            card.classList.remove('error');
+            responseEl.innerHTML = '<span class="loading-spinner"></span>Generating...';
+            responseEl.classList.remove('placeholder');
+            scoreEl.textContent = '';
+            syllablesEl.textContent = '';
+
+            const includeVocab = document.getElementById('shill-modal').checked;
+
+            try {
+                const response = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        step: model.name,
+                        include_vocab: includeVocab,
+                    })
+                });
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const data = await response.json();
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+
+                responseEl.textContent = data.haiku;
+
+                const passClass = data.passed ? 'pass' : 'fail';
+                const passLabel = data.passed ? '✓ Pass' : '✗ Fail';
+                scoreEl.innerHTML = `Structure: ${data.structure_score.toFixed(2)} — <span class="${passClass}">${passLabel}</span>`;
+
+                const targets = [5, 7, 5];
+                const syllableText = data.syllable_counts.map((c, i) =>
+                    `L${i+1}: ${c}${targets[i] !== undefined ? '/' + targets[i] : ''}`
+                ).join('  ');
+                syllablesEl.textContent = `Syllables: ${syllableText}`;
+
+                latencyEl.textContent = `⏱️ ${elapsed}s`;
+            } catch (error) {
+                card.classList.add('error');
+                responseEl.textContent = `Error: ${error.message}`;
+                scoreEl.textContent = '';
+                syllablesEl.textContent = '';
+                latencyEl.textContent = '';
+            } finally {
+                card.classList.remove('loading');
+            }
+        }
+
+        async function generateHaikus() {
+            const prompt = document.getElementById('prompt-input').value.trim();
+            if (!prompt) return;
+
+            const btn = document.getElementById('submit-btn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Generating...';
+
+            await Promise.all(MODELS.map(model => queryModel(model, prompt)));
+
+            btn.disabled = false;
+            btn.textContent = '✨ Generate';
+        }
+
+        document.getElementById('prompt-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') generateHaikus();
+        });
+
+        loadConfig();
+    </script>
+</body>
+</html>
