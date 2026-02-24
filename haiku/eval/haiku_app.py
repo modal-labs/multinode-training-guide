@@ -1,4 +1,7 @@
-"""FastAPI backend for the Haiku Playground, deployed on Modal."""
+"""FastAPI backend for the Haiku Playground, deployed on Modal.
+
+modal deploy eval.haiku_app
+"""
 
 from pathlib import Path
 
@@ -14,12 +17,12 @@ image = (
     )
     .add_local_dir("eval", "/root/eval")
     .add_local_dir("llm_judges", "/root/llm_judges")
+    .add_local_file("config.py", "/root/config.py")
 )
 
 
 @app.function(
     image=image,
-    allow_concurrent_inputs=100,
 )
 @modal.asgi_app()
 def serve_playground():
@@ -32,12 +35,12 @@ def serve_playground():
     from pydantic import BaseModel
 
     from eval.shared import (
+        MODAL_VOCABS,
         MODEL_CHECKPOINTS,
         build_system_prompt,
         get_model_endpoint,
         query_model,
     )
-    from llm_judges.base import MODAL_VOCABS
     from llm_judges.nlp import (
         count_syllables_for_word,
         score_haiku_structure,
@@ -46,7 +49,7 @@ def serve_playground():
 
     class GenerateRequest(BaseModel):
         prompt: str
-        step: str = "base"
+        model_key: str = "base-model"
         include_vocab: bool = True
 
     @asynccontextmanager
@@ -60,20 +63,23 @@ def serve_playground():
 
     @fastapi_app.post("/api/generate")
     async def generate(request: GenerateRequest):
+        import re
+
         client = fastapi_app.state.http_client
         cmudict = fastapi_app.state.cmudict
 
-        endpoint = get_model_endpoint(request.step)
+        endpoint = get_model_endpoint(request.model_key)
         system_prompt = build_system_prompt(include_vocab=request.include_vocab)
 
         haiku = await query_model(
-            client, endpoint, request.prompt, system_prompt=system_prompt
+            client,
+            endpoint,
+            request.prompt,
+            model_name=request.model_key,
+            system_prompt=system_prompt,
         )
 
         structure_score = score_haiku_structure(haiku, cmudict)
-
-        # Compute per-line syllable counts
-        import re
 
         lines = segment_haiku_lines(haiku)
         syllable_counts = []
@@ -86,7 +92,7 @@ def serve_playground():
             "haiku": haiku,
             "structure_score": structure_score,
             "syllable_counts": syllable_counts,
-            "passed": structure_score >= 0.75,
+            "passed": structure_score == 1,
         }
 
     @fastapi_app.get("/api/models")

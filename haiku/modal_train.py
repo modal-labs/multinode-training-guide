@@ -74,7 +74,7 @@ CHECKPOINTS_PATH: Path = Path("/checkpoints")
 
 # Volumes
 hf_cache_vol: modal.Volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints", create_if_missing=True)
+checkpoints_volume: modal.Volume = modal.Volume.from_name("slime-haiku-checkpoints", create_if_missing=True)
 
 # Ray configuration
 RAY_PORT = 6379
@@ -159,19 +159,15 @@ def generate_slime_cmd(
     import datetime
     import random
 
-    # Check for infinite run mode
-    is_infinite_run = os.environ.get("SLIME_TEST_ENABLE_INFINITE_RUN", "0").lower() in ("true", "1")
-
-    # Generate all training args from config
-    train_args = config.generate_train_args(DATA_PATH, is_infinite_run)
+    train_args = config.generate_train_args(DATA_PATH)
 
     checkpoint_dir = CHECKPOINTS_PATH / experiment_name
-    train_args += f" --save {checkpoint_dir} --save-interval {config.save_steps if hasattr(config, 'save_steps') else 100}"
+    train_args += f" --save {checkpoint_dir} --save-interval {config.save_steps if hasattr(config, 'save_steps') else 10}"
 
     # Add wandb args if API key is available
     wandb_key = os.environ.get("WANDB_API_KEY")
     if wandb_key:
-        run_id = datetime.datetime.utcnow().strftime("%y%m%d-%H%M%S") + f"-{random.randint(0, 999):03d}"
+        run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%y%m%d-%H%M%S") + f"-{random.randint(0, 999):03d}"
         wandb_run_name = f"{config.wandb_run_name_prefix}_{run_id}" if config.wandb_run_name_prefix else run_id
         train_args += f" --use-wandb --wandb-project {config.wandb_project} --wandb-group {wandb_run_name} --wandb-key '{wandb_key}' --disable-wandb-random-suffix"
 

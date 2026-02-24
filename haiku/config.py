@@ -15,8 +15,8 @@ _MODEL_INFO = {
 
 class JudgeType(str, Enum):
     STRICT = "strict"
-    STRICT_LEVELED = "strict_leveled"
-    NO_LLM = "no_llm"  # only use the structure score
+    STRICT_LEVELED = "strict-leveled"
+    NO_LLM = "no-llm"  # only use the structure score
 
 class JudgeModelSize(str, Enum):
     QWEN3_30B = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -32,8 +32,8 @@ class JudgeModelSize(str, Enum):
 
 
 
-ACTIVE_JUDGE_TYPE = JudgeType.STRICT
-ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_235B
+ACTIVE_JUDGE_TYPE = JudgeType.NO_LLM
+ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_30B
 
 
 
@@ -48,13 +48,14 @@ class RLConfig:
     n_nodes: int = 4
     gpu: str = "H100:8"
 
-
     # Wandb
-    wandb_project: str = "example-haiku"
+    wandb_project: str = "example-train-haiku"
     wandb_run_name_prefix: str = ""
 
     # Raw CLI args passed directly to slime
     slime_args: str = ""
+
+    save_steps: int = 10
 
     # Extra args that get appended (for easy overrides)
     extra_args: list[str] = field(default_factory=list)
@@ -70,7 +71,7 @@ class RLConfig:
                 lines.append(line)
         return " ".join(lines)
 
-    def generate_train_args(self, data_path: Path, is_infinite_run: bool) -> str:
+    def generate_train_args(self, data_path: Path) -> str:
         from huggingface_hub import snapshot_download
 
         model_path = snapshot_download(self.model_id)
@@ -138,8 +139,9 @@ def get_config(run_name: str = "qwen3-4b-haiku", judge_type = ACTIVE_JUDGE_TYPE,
         model_id="Qwen/Qwen3-4B",
         n_nodes=1,
         gpu="H200:8",
-        wandb_project="example-haiku",
+        wandb_project="example-train-haiku",
         wandb_run_name_prefix=run_name,
+        save_steps=10,
         slime_args=f"""
             # Model architecture
             {QWEN3_4B_MODEL_ARGS}
