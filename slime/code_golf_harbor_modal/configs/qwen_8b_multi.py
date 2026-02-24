@@ -47,7 +47,7 @@ def get_config() -> RLConfig:
 
             # Custom reward model (Harbor + Modal sandbox scoring)
             --rm-type math
-            --custom-rm-path custom_rm.batched_custom_rm
+            --custom-rm-path custom_rm.custom_rm
 
             # SGLang rollout engines
             --rollout-num-gpus-per-engine 2

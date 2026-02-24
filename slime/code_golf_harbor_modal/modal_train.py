@@ -25,7 +25,6 @@ image = (
     .run_commands(
         "uv pip install --system 'transformers>=4.57,<5' 'huggingface_hub<1'",
         "uv pip install --system harbor==0.1.44 pandas pyarrow requests",
-        r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/qwen/qwen3_bridge.py""",
     )
     .entrypoint([])
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})

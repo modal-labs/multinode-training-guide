@@ -155,13 +155,7 @@ async def _score_sample(sample: Any, semaphore: asyncio.Semaphore) -> float:
                 pass
 
 
-async def batched_custom_rm(args: Any, samples: list[Any], **kwargs: Any) -> list[float]:
+async def custom_rm(args: Any, sample: Any, **kwargs: Any) -> float:
     max_concurrency = _get_env_int("HARBOR_RM_MAX_CONCURRENCY", 64)
     semaphore = asyncio.Semaphore(max_concurrency)
-    tasks = [_score_sample(sample, semaphore) for sample in samples]
-    return list(await asyncio.gather(*tasks))
-
-
-async def custom_rm(args: Any, sample: Any, **kwargs: Any) -> float:
-    rewards = await batched_custom_rm(args=args, samples=[sample], **kwargs)
-    return rewards[0]
+    return await _score_sample(sample, semaphore)
