@@ -32,6 +32,7 @@ def get_config() -> RLConfig:
             --input-key messages
             --label-key label
             --apply-chat-template
+            --apply-chat-template-kwargs '{{"enable_thinking": false}}'
             --prompt-data {{data_path}}/mbpp_harbor/slime/train.parquet
             --eval-prompt-data mbpp {{data_path}}/mbpp_harbor/slime/test.parquet
 

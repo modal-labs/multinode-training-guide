@@ -19,14 +19,12 @@ def extract_function_name_from_code(code: str) -> str:
 
 def extract_python_code(text: str) -> str:
     normalized = normalize_code(text).strip()
-    fenced = _CODE_FENCE_RE.findall(normalized)
-    if fenced:
-        candidates = [block.strip() for block in fenced if block.strip()]
-        if candidates:
-            for candidate in reversed(candidates):
-                if _FUNCTION_RE.search(candidate):
-                    return candidate
-            return candidates[-1]
+    if "<|im_start|>assistant" in normalized:
+        normalized = normalized.rsplit("<|im_start|>assistant", 1)[-1]
+    if "</think>" in normalized:
+        normalized = normalized.split("</think>", 1)[1]
+    normalized = normalized.replace("<think>", "")
+    normalized = normalized.replace("<|im_end|>", "")
     return normalized
 
 

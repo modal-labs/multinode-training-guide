@@ -49,6 +49,7 @@ class SingleShotCodeAgent(BaseAgent):
             "model": self.model_name,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False},
             "messages": [
                 {"role": "system", "content": "Return only valid Python code."},
                 {"role": "user", "content": instruction},
