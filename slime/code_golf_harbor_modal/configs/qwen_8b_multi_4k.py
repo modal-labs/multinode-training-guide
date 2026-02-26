@@ -18,7 +18,7 @@ def get_config() -> RLConfig:
         gpu="H100:8",
         sync=True,
         wandb_project="slime-code-golf",
-        wandb_run_name_prefix="qwen8b-mbpp-harbor",
+        wandb_run_name_prefix="qwen8b-mbpp-harbor-thinking-4k",
         harbor_rm_profile=True,
         harbor_rm_log_samples=True,
         slime_args=f"""
@@ -43,9 +43,9 @@ def get_config() -> RLConfig:
             --rollout-batch-size 128
             --n-samples-per-prompt 8
             --global-batch-size 1024
-            --rollout-max-response-len 1024
+            --rollout-max-response-len 2048
             --rollout-temperature 0.9
-            --eval-max-response-len 1024
+            --eval-max-response-len 2048
             --n-samples-per-eval-prompt 8
 
             # Custom reward model (Harbor + Modal sandbox scoring)
@@ -54,7 +54,7 @@ def get_config() -> RLConfig:
 
             # SGLang rollout engines
             --rollout-num-gpus-per-engine 2
-            --sglang-mem-fraction-static 0.25
+            --sglang-mem-fraction-static 0.7
 
             # Distributed orchestration
             --actor-num-nodes 4
@@ -66,7 +66,7 @@ def get_config() -> RLConfig:
             --eval-top-p 1
 
             # Save checkpoints to volume
-            --save {{checkpoints_path}}/qwen8b_code_golf_thinking
+            --save {{checkpoints_path}}/qwen8b_code_golf_thinking_4k
             --save-interval 20
         """,
     )

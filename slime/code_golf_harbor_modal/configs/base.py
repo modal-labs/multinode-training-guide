@@ -70,7 +70,7 @@ QWEN3_8B_MODEL_ARGS = """
 DEFAULT_TRAINING_ARGS = """
     --tensor-model-parallel-size 2 --sequence-parallel
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
-    --use-dynamic-batch-size --max-tokens-per-gpu 9216
+    --use-dynamic-batch-size --max-tokens-per-gpu 4096
     --megatron-to-hf-mode bridge
     --attention-dropout 0.0 --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
