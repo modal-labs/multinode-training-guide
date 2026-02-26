@@ -112,9 +112,9 @@ def _build_runtime_env(config: RLConfig, master_addr: str) -> dict:
             "HARBOR_TASKS_ROOT": config.harbor_task_root,
             "HARBOR_DATA_VOLUME_NAME": config.harbor_data_volume_name,
             "HARBOR_RM_MODAL_APP": config.harbor_rm_modal_app,
-            "HARBOR_RM_MAX_CONCURRENCY": str(config.harbor_rm_max_concurrency),
             "HARBOR_RM_TIMEOUT_SEC": str(config.harbor_rm_timeout_sec),
             "HARBOR_LENGTH_BONUS_WEIGHT": str(config.harbor_length_bonus_weight),
+            "HARBOR_RM_PROFILE": "1" if config.harbor_rm_profile else "0",
         }
     }
 

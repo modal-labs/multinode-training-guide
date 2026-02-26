@@ -24,9 +24,9 @@ class RLConfig:
     harbor_task_root: str = "/data/mbpp_harbor/tasks"
     harbor_data_volume_name: str = "slime-code-golf-harbor-data"
     harbor_rm_modal_app: str = "slime-harbor-rm"
-    harbor_rm_max_concurrency: int = 64
     harbor_rm_timeout_sec: int = 120
     harbor_length_bonus_weight: float = 0.2
+    harbor_rm_profile: bool = False
 
     @property
     def train_script(self) -> str:

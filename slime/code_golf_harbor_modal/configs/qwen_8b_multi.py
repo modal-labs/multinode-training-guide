@@ -19,6 +19,7 @@ def get_config() -> RLConfig:
         sync=True,
         wandb_project="slime-code-golf",
         wandb_run_name_prefix="qwen8b-mbpp-harbor",
+        harbor_rm_profile=True,
         slime_args=f"""
             # Model
             {QWEN3_8B_MODEL_ARGS}
@@ -38,9 +39,9 @@ def get_config() -> RLConfig:
 
             # Rollout / batching
             --num-rollout 2000
-            --rollout-batch-size 128
+            --rollout-batch-size 32
             --n-samples-per-prompt 8
-            --global-batch-size 1024
+            --global-batch-size 256
             --rollout-max-response-len 1024
             --rollout-temperature 0.9
             --eval-max-response-len 1024

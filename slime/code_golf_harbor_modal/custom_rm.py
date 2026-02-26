@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
+import shlex
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,13 @@ def _get_env_float(name: str, default: float) -> float:
     return float(value)
 
 
+def _get_env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 async def _get_modal_app() -> modal.App:
     global _app_cache
     if _app_cache is None:
@@ -41,21 +49,31 @@ async def _get_modal_app() -> modal.App:
 
 
 async def _read_remote_file(sandbox: modal.Sandbox, remote_path: str) -> str:
-    async with await sandbox.open.aio(remote_path, "rb") as handle:
-        chunks: list[bytes] = []
-        while True:
-            chunk = await handle.read.aio(8192)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    return b"".join(chunks).decode("utf-8")
+    process = await sandbox.exec.aio("bash", "-lc", f"cat {shlex.quote(remote_path)}")
+    stdout = await process.stdout.read.aio()
+    stderr = await process.stderr.read.aio()
+    return_code = await process.wait.aio()
+    if return_code != 0:
+        raise RuntimeError(f"cat {remote_path}: {stderr}")
+    return stdout
 
 
 async def _write_remote_file(sandbox: modal.Sandbox, remote_path: str, content: str) -> None:
     parent = str(Path(remote_path).parent)
-    await sandbox.exec.aio("bash", "-lc", f"mkdir -p {parent}")
-    async with await sandbox.open.aio(remote_path, "wb") as handle:
-        await handle.write.aio(content.encode("utf-8"))
+    delimiter = "__SLIME_CONTENT_EOF__"
+    while delimiter in content:
+        delimiter += "_X"
+    cmd = (
+        f"mkdir -p {shlex.quote(parent)} && "
+        f"cat > {shlex.quote(remote_path)} <<'{delimiter}'\n"
+        f"{content}\n"
+        f"{delimiter}\n"
+    )
+    process = await sandbox.exec.aio("bash", "-lc", cmd)
+    stderr = await process.stderr.read.aio()
+    return_code = await process.wait.aio()
+    if return_code != 0:
+        raise RuntimeError(f"write {remote_path}: {stderr}")
 
 
 def _extract_label(sample: Any) -> dict[str, Any]:
@@ -92,7 +110,17 @@ def _compose_reward(
     return pass_rate * (1.0 + length_weight * size_bonus)
 
 
-async def _score_sample(sample: Any, semaphore: asyncio.Semaphore) -> float:
+async def _score_sample(sample: Any) -> float:
+    profile_enabled = _get_env_bool("HARBOR_RM_PROFILE", default=False)
+    t0 = time.perf_counter()
+    timings_s: dict[str, float] = {}
+
+    def _mark(name: str) -> None:
+        if not profile_enabled:
+            return
+        now = time.perf_counter()
+        timings_s[name] = now
+
     timeout_sec = _get_env_int("HARBOR_RM_TIMEOUT_SEC", 120)
     length_weight = _get_env_float("HARBOR_LENGTH_BONUS_WEIGHT", 0.2)
 
@@ -101,61 +129,109 @@ async def _score_sample(sample: Any, semaphore: asyncio.Semaphore) -> float:
     reference_size = int(label_payload.get("reference_bytes", 1))
     candidate_code = extract_python_code(getattr(sample, "response", ""))
     candidate_size = code_size_bytes(candidate_code)
+    _mark("prepared_sample")
 
     app = await _get_modal_app()
     volume_name = os.environ.get("HARBOR_DATA_VOLUME_NAME", "").strip()
     volumes = {"/data": modal.Volume.from_name(volume_name)} if volume_name else None
+    _mark("prepared_runtime")
 
-    async with semaphore:
-        sandbox = await modal.Sandbox.create.aio(
-            app=app,
-            image=_sandbox_image,
+    sandbox = await modal.Sandbox.create.aio(
+        app=app,
+        image=_sandbox_image,
+        timeout=timeout_sec,
+        cpu=1,
+        memory=2048,
+        volumes=volumes,
+    )
+    _mark("sandbox_created")
+    try:
+        await _write_remote_file(sandbox, "/workspace/solution.py", candidate_code)
+        _mark("solution_uploaded")
+
+        test_script = f"{task_path}/tests/test.sh"
+        process = await sandbox.exec.aio(
+            "bash",
+            "-lc",
+            f"mkdir -p /logs/verifier && bash {test_script}",
             timeout=timeout_sec,
-            cpu=1,
-            memory=2048,
-            volumes=volumes,
         )
-        try:
-            await _write_remote_file(sandbox, "/workspace/solution.py", candidate_code)
+        await process.stdout.read.aio()
+        await process.stderr.read.aio()
+        await process.wait.aio()
+        _mark("test_finished")
 
-            test_script = f"{task_path}/tests/test.sh"
-            process = await sandbox.exec.aio(
-                "bash",
-                "-lc",
-                f"mkdir -p /logs/verifier && bash {test_script}",
-                timeout=timeout_sec,
-            )
-            await process.stdout.read.aio()
-            await process.stderr.read.aio()
-            await process.wait.aio()
+        reward_json = await _read_remote_file(sandbox, "/logs/verifier/reward.json")
+        result = json.loads(reward_json)
+        pass_rate = float(result.get("pass_rate", result.get("reward", 0.0)))
+        reward = _compose_reward(pass_rate, candidate_size, reference_size, length_weight)
+        _mark("reward_parsed")
 
-            reward_json = await _read_remote_file(sandbox, "/logs/verifier/reward.json")
-            result = json.loads(reward_json)
-            pass_rate = float(result.get("pass_rate", result.get("reward", 0.0)))
-            reward = _compose_reward(pass_rate, candidate_size, reference_size, length_weight)
-
-            if not isinstance(sample.metadata, dict):
-                sample.metadata = {}
-            sample.metadata["harbor_rm"] = {
-                "pass_rate": pass_rate,
-                "reference_bytes": reference_size,
-                "candidate_bytes": candidate_size,
-                "reward": reward,
+        if not isinstance(sample.metadata, dict):
+            sample.metadata = {}
+        sample.metadata["harbor_rm"] = {
+            "pass_rate": pass_rate,
+            "reference_bytes": reference_size,
+            "candidate_bytes": candidate_size,
+            "reward": reward,
+        }
+        if profile_enabled:
+            timestamps = {**timings_s, "done": time.perf_counter()}
+            timing_ms = {
+                "prepare": round((timestamps.get("prepared_sample", t0) - t0) * 1000, 2),
+                "runtime_setup": round(
+                    (timestamps.get("prepared_runtime", timestamps.get("prepared_sample", t0))
+                     - timestamps.get("prepared_sample", t0))
+                    * 1000,
+                    2,
+                ),
+                "sandbox_create": round(
+                    (timestamps.get("sandbox_created", timestamps.get("prepared_runtime", t0))
+                     - timestamps.get("prepared_runtime", t0))
+                    * 1000,
+                    2,
+                ),
+                "upload_solution": round(
+                    (timestamps.get("solution_uploaded", timestamps.get("sandbox_created", t0))
+                     - timestamps.get("sandbox_created", t0))
+                    * 1000,
+                    2,
+                ),
+                "test_exec": round(
+                    (timestamps.get("test_finished", timestamps.get("solution_uploaded", t0))
+                     - timestamps.get("solution_uploaded", t0))
+                    * 1000,
+                    2,
+                ),
+                "read_reward": round(
+                    (timestamps.get("reward_parsed", timestamps.get("test_finished", t0))
+                     - timestamps.get("test_finished", t0))
+                    * 1000,
+                    2,
+                ),
+                "total": round((timestamps["done"] - t0) * 1000, 2),
             }
-            return reward
-        except Exception as exc:
-            if not isinstance(sample.metadata, dict):
-                sample.metadata = {}
-            sample.metadata["harbor_rm_error"] = repr(exc)
-            return 0.0
-        finally:
-            try:
-                await sandbox.terminate.aio()
-            except Exception:
-                pass
+            sample.metadata["harbor_rm_timing_ms"] = timing_ms
+            print(f"harbor_rm_timing_ms: {timing_ms}")
+        return reward
+    except Exception as exc:
+        if not isinstance(sample.metadata, dict):
+            sample.metadata = {}
+        sample.metadata["harbor_rm_error"] = repr(exc)
+        print(f"harbor_rm_error: {exc!r}")
+        if profile_enabled:
+            timing_ms = {
+                "total_until_error": round((time.perf_counter() - t0) * 1000, 2)
+            }
+            sample.metadata["harbor_rm_timing_ms"] = timing_ms
+            print(f"harbor_rm_timing_ms_error: {timing_ms}")
+        return 0.0
+    finally:
+        try:
+            await sandbox.terminate.aio()
+        except Exception:
+            pass
 
 
 async def custom_rm(args: Any, sample: Any, **kwargs: Any) -> float:
-    max_concurrency = _get_env_int("HARBOR_RM_MAX_CONCURRENCY", 64)
-    semaphore = asyncio.Semaphore(max_concurrency)
-    return await _score_sample(sample, semaphore)
+    return await _score_sample(sample)
