@@ -20,6 +20,7 @@ def get_config() -> RLConfig:
         wandb_project="slime-code-golf",
         wandb_run_name_prefix="qwen8b-mbpp-harbor",
         harbor_rm_profile=True,
+        harbor_rm_log_samples=True,
         slime_args=f"""
             # Model
             {QWEN3_8B_MODEL_ARGS}

@@ -27,6 +27,7 @@ class RLConfig:
     harbor_rm_timeout_sec: int = 120
     harbor_length_bonus_weight: float = 0.2
     harbor_rm_profile: bool = False
+    harbor_rm_log_samples: bool = False
 
     @property
     def train_script(self) -> str:

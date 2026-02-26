@@ -115,6 +115,7 @@ def _build_runtime_env(config: RLConfig, master_addr: str) -> dict:
             "HARBOR_RM_TIMEOUT_SEC": str(config.harbor_rm_timeout_sec),
             "HARBOR_LENGTH_BONUS_WEIGHT": str(config.harbor_length_bonus_weight),
             "HARBOR_RM_PROFILE": "1" if config.harbor_rm_profile else "0",
+            "HARBOR_RM_LOG_SAMPLES": "1" if config.harbor_rm_log_samples else "0",
         }
     }
 

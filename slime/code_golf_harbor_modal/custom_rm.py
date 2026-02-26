@@ -112,6 +112,7 @@ def _compose_reward(
 
 async def _score_sample(sample: Any) -> float:
     profile_enabled = _get_env_bool("HARBOR_RM_PROFILE", default=False)
+    log_samples = _get_env_bool("HARBOR_RM_LOG_SAMPLES", default=False)
     t0 = time.perf_counter()
     timings_s: dict[str, float] = {}
 
@@ -175,6 +176,15 @@ async def _score_sample(sample: Any) -> float:
             "candidate_bytes": candidate_size,
             "reward": reward,
         }
+        if log_samples:
+            print(
+                "harbor_rm_sample: "
+                f"task_id={label_payload.get('task_id')} "
+                f"pass_rate={pass_rate:.6f} "
+                f"reward={reward:.6f} "
+                f"candidate_bytes={candidate_size} "
+                f"reference_bytes={reference_size}"
+            )
         if profile_enabled:
             timestamps = {**timings_s, "done": time.perf_counter()}
             timing_ms = {
@@ -219,6 +229,14 @@ async def _score_sample(sample: Any) -> float:
             sample.metadata = {}
         sample.metadata["harbor_rm_error"] = repr(exc)
         print(f"harbor_rm_error: {exc!r}")
+        if log_samples:
+            print(
+                "harbor_rm_sample_error: "
+                f"task_id={label_payload.get('task_id')} "
+                f"error={exc!r} "
+                f"candidate_bytes={candidate_size} "
+                f"reference_bytes={reference_size}"
+            )
         if profile_enabled:
             timing_ms = {
                 "total_until_error": round((time.perf_counter() - t0) * 1000, 2)
