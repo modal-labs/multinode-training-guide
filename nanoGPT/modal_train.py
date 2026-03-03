@@ -26,7 +26,13 @@ base_image = (
     # as well as git, requiring that we annoyingly install without it the first time.
     #
     # ref: https://github.com/astral-sh/uv/issues/6437#issuecomment-2535324784
-    .apt_install("git", "libibverbs-dev", "libibverbs1")
+    .apt_install(
+        "git", 
+        "libibverbs-dev", 
+        "libibverbs1",
+        "libhwloc15",
+        "libnl-route-3-200",
+    )
     # https://github.com/karpathy/nanoGPT?tab=readme-ov-file#install
     .pip_install(
         "torch==2.6.0",
@@ -130,18 +136,10 @@ def speedrun_single_node():
         "/data/fineweb10B": volume,
     },
     timeout=2 * 60 * 60,  # should always be faster than 2 hours
-    image=(
-        base_image.pip_install(
-            # Modded nanogpt requires a nightly version of torch which is no longer hosted.
-            # Use this custom hosted version instead.
-            # https://github.com/KellerJordan/modded-nanogpt/issues/91#issuecomment-2831908966
-            "https://github.com/YouJiacheng/pytorch-nightly-whl-archive/releases/download/v2.7.0.dev20250208/torch-2.7.0.dev20250208+cu126-cp312-cp312-manylinux_2_28_x86_64.whl",
-            extra_index_url="https://download.pytorch.org/whl/nightly/cu126",
-        ).add_local_dir(
-            LOCAL_CODE_DIR,
-            remote_path=REMOTE_CODE_DIR,
-        )
-    ),
+    image=image.add_local_dir(
+        LOCAL_CODE_DIR,
+        remote_path=REMOTE_CODE_DIR,
+    )
 )
 def speedrun_modded_single_node():
     """
@@ -161,7 +159,7 @@ def speedrun_modded_single_node():
     run(parse_args(args))
 
 
-def _train_multi_node() -> None:
+def _train_multi_node(enable_wandb: bool = True) -> None:
     from torch.distributed.run import parse_args, run
 
     cluster_info = modal.experimental.get_cluster_info()
@@ -185,6 +183,15 @@ def _train_multi_node() -> None:
         f"--master-addr={main_ip_addr}",
         REMOTE_TRAIN_SCRIPT_PATH,
     ]
+    if enable_wandb:
+        # train.py reads these as config overrides via configurator.py.
+        args.extend(
+            [
+                "--wandb_log=True",
+                "--wandb_project=owt",
+                f"--wandb_run_name=multinode-{container_id}",
+            ]
+        )
     print(f"Running torchrun with args: {' '.join(args)}")
     run(parse_args(args))
 
@@ -195,6 +202,10 @@ def _train_multi_node() -> None:
         # Required for connecting to Weights & Biases from within the Modal container.
         modal.Secret.from_name("wandb-secret"),
     ],
+    # Enabling EFA unlocks extra capacity of H100 clusters.
+    experimental_options={
+        "efa_enabled": True,
+    },
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -209,11 +220,15 @@ def train_multi_node():
     Good cluster scale performance should result in a ~linear speedup as the number of nodes
     is increased.
     """
-    _train_multi_node()
+    _train_multi_node(enable_wandb=True)
 
 
 @app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
+    # Enabling EFA unlocks extra capacity of H100 clusters.
+    experimental_options={
+        "efa_enabled": True,
+    },
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -232,11 +247,15 @@ def bench_multi_node():
     os.environ["NANOGPT_MAX_ITERS"] = "200"
     os.environ["NANOGPT_PROFILE"] = "true"
     os.environ["NANOGPT_BENCH"] = "true"
-    _train_multi_node()
+    _train_multi_node(enable_wandb=False)
 
 
 @app.function(
     gpu=f"{GPU_TYPE}:{n_proc_per_node}",
+    # Enabling EFA unlocks extra capacity of H100 clusters.
+    experimental_options={
+        "efa_enabled": True,
+    },
     volumes={
         "/vol": volume,
         # Mount a Volume where NanoGPT outputs checkpoints.
@@ -251,7 +270,7 @@ def speedrun_multi_node():
     multi-node scaling performance.
     """
     os.environ["NANOGPT_SPEEDRUN"] = "true"
-    _train_multi_node()
+    _train_multi_node(enable_wandb=False)
 
 
 @app.function(

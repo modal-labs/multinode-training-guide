@@ -397,7 +397,8 @@ with profiler:
                         "val/loss": losses["val"],
                         "lr": lr,
                         "mfu": running_mfu * 100,  # convert to percentage
-                    }
+                    },
+                    step=iter_num,
                 )
             if (
                 losses["val"] < best_val_loss or always_save_checkpoint
@@ -472,6 +473,16 @@ with profiler:
                 out_str += f", mfu {running_mfu * 100:.2f}%"
 
             print(out_str)
+            if wandb_log:
+                wandb.log(
+                    {
+                        "iter": iter_num,
+                        "train/loss_step": lossf,
+                        "lr": lr,
+                        "mfu": running_mfu * 100 if running_mfu >= 0 else None,
+                    },
+                    step=iter_num,
+                )
 
         iter_num += 1
         local_iter_num += 1
