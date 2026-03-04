@@ -1,11 +1,12 @@
+import glob
+import json
+import os
+import re
 import subprocess
+import time
 
 import modal
 import modal.experimental
-
-import time
-import json
-import re
 
 cuda_version = "12.4.0"  # Should be no greater than host CUDA version
 flavor = "devel"  #  Includes full CUDA toolkit
@@ -58,10 +59,20 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     waits until the Modal dict has 8 IPs, then runs ib_write_bw.
     """
 
+    # Get current cloud provider
+    print(f"Running on {os.environ['MODAL_CLOUD_PROVIDER'].split('_')[2]}", flush=True)
+
     # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
-    print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
+    print(f"[rank {container_rank}] Initializing cluster info", flush=True)
+
+    # Read initial port counters
+    initial_counters = read_port_counters()
+    print(
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters) / 1000000000:.2f} Gb/s",
+        flush=True,
+    )
 
     # Get local ib devices (sorted by device index from 0 to 7)
     local_ib_devices = get_local_ib_devices()
@@ -168,6 +179,10 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
             )
             process.wait()
 
+    # Read final port counters and print the delta
+    final_counters = read_port_counters()
+    delta = {k: final_counters[k] - initial_counters[k] for k in initial_counters}
+    print(f"[rank {container_rank}] Counter delta: {json.dumps(delta) / 1000000000:.2f} Gb/s", flush=True)
 
 # Run ib_write_bw command for server
 def run_ib_write_server(device: str, port: int) -> subprocess.Popen:
@@ -251,6 +266,20 @@ def aggregate_statistics(results: list[str]) -> tuple[float, float]:
     mean_bw_peak = sum(bw_peaks) / len(bw_peaks)
     mean_bw_avg = sum(bw_averages) / len(bw_averages)
     return mean_bw_peak, mean_bw_avg
+
+
+# Reads IB port counters from sysfs for all devices.
+def read_port_counters() -> dict[str, float]:
+    counters = {
+        "port_xmit_data": 0,
+        "port_rcv_data": 0,
+    }
+    for path in glob.glob("/sys/class/infiniband/*/ports/*/counters/*"):
+        metric = os.path.basename(path)
+        if metric in counters:
+            with open(path, "r") as f:
+                counters[metric] += float(f.read()) * 4  # 4 bytes per word
+    return counters
 
 
 @app.local_entrypoint()

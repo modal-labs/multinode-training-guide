@@ -1,3 +1,5 @@
+import glob
+import json
 import math
 import os
 import subprocess
@@ -59,7 +61,14 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
-    print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
+    print(f"[rank {container_rank}] Initializing cluster info", flush=True)
+
+    # Read initial RDMA counters
+    initial_counters = read_sys_counters()
+    print(
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters) / 1000000000:.2f} Gb/s",
+        flush=True,
+    )
 
     # Get local ib devices (sorted by device index from 0 to 7)
     local_efa_domains = get_local_efa_domains()
@@ -174,6 +183,11 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
             )
             client_args = failed
             time.sleep(RETRY_DELAY)
+
+    # Read final RDMA counters and print the delta
+    final_counters = read_sys_counters()
+    delta = {k: final_counters[k] - initial_counters.get(k, 0) for k in final_counters}
+    print(f"[rank {container_rank}] Counter delta: {json.dumps(delta) / 1000000000:.2f} Gb/s", flush=True)
 
 
 # Run fi_rma_bw command for server
@@ -313,6 +327,20 @@ def aggregate_statistics(results: list[str]) -> float:
 
     total_bw_gbps = sum(bw_mb) / 1024  # MB/s -> GB/s
     return round(total_bw_gbps, 2)
+
+
+# Reads the RDMA counters from syfs for all devices
+def read_sys_counters() -> dict[str, float]:
+    counters = {
+        "rdma_write_bytes": 0,
+        "rdma_write_recv_bytes": 0,
+    }
+    for path in glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/*"):
+        with open(path, "r") as f:
+            metric = os.path.basename(path)
+            if metric in counters:
+                counters[metric] += float(f.read())
+    return counters
 
 
 @app.local_entrypoint()
