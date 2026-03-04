@@ -66,7 +66,7 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     # Read initial RDMA counters
     initial_counters = read_sys_counters()
     print(
-        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters) / 1000000000:.2f} Gb/s",
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)}",
         flush=True,
     )
 
@@ -187,7 +187,10 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     # Read final RDMA counters and print the delta
     final_counters = read_sys_counters()
     delta = {k: final_counters[k] - initial_counters.get(k, 0) for k in final_counters}
-    print(f"[rank {container_rank}] Counter delta: {json.dumps(delta) / 1000000000:.2f} Gb/s", flush=True)
+    print(
+        f"[rank {container_rank}] Counter delta: {json.dumps(delta)}",
+        flush=True,
+    )
 
 
 # Run fi_rma_bw command for server
@@ -331,14 +334,19 @@ def aggregate_statistics(results: list[str]) -> float:
 
 # Reads the RDMA counters from syfs for all devices
 def read_sys_counters() -> dict[str, float]:
+    # Initialize a dict to store the counters
     counters = {
         "rdma_write_bytes": 0,
         "rdma_write_recv_bytes": 0,
     }
+    # Loop through all ports and counters on every device
     for path in glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/*"):
-        with open(path, "r") as f:
-            metric = os.path.basename(path)
-            if metric in counters:
+        # Get the metric name from the path
+        metric = os.path.basename(path)
+        # If the metric is in the counters dict, read the value and add it to the dict
+        if metric in counters:
+            with open(path, "r") as f:
+                # Multiply the resulting value by 4 to convert from words to bytes
                 counters[metric] += float(f.read())
     return counters
 

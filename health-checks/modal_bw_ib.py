@@ -70,7 +70,7 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     # Read initial port counters
     initial_counters = read_port_counters()
     print(
-        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters) / 1000000000:.2f} Gb/s",
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)}",
         flush=True,
     )
 
@@ -182,7 +182,11 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     # Read final port counters and print the delta
     final_counters = read_port_counters()
     delta = {k: final_counters[k] - initial_counters[k] for k in initial_counters}
-    print(f"[rank {container_rank}] Counter delta: {json.dumps(delta) / 1000000000:.2f} Gb/s", flush=True)
+    print(
+        f"[rank {container_rank}] Counter delta: {json.dumps(delta)}",
+        flush=True,
+    )
+
 
 # Run ib_write_bw command for server
 def run_ib_write_server(device: str, port: int) -> subprocess.Popen:
@@ -270,15 +274,20 @@ def aggregate_statistics(results: list[str]) -> tuple[float, float]:
 
 # Reads IB port counters from sysfs for all devices.
 def read_port_counters() -> dict[str, float]:
+    # Initialize a dict to store the counters
     counters = {
         "port_xmit_data": 0,
         "port_rcv_data": 0,
     }
+    # Loop through all ports and counters on every device
     for path in glob.glob("/sys/class/infiniband/*/ports/*/counters/*"):
+        # Get the metric name from the path
         metric = os.path.basename(path)
+        # If the metric is in the counters dict, read the value and add it to the dict
         if metric in counters:
             with open(path, "r") as f:
-                counters[metric] += float(f.read()) * 4  # 4 bytes per word
+                # Multiply the resulting value by 4 to convert from words to bytes
+                counters[metric] += float(f.read()) * 4
     return counters
 
 
