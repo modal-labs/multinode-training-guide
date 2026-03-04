@@ -1,9 +1,9 @@
-import glob
 import json
 import math
 import os
 import subprocess
 
+from utils import read_port_counters
 import modal
 import modal.experimental
 
@@ -64,7 +64,12 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     print(f"[rank {container_rank}] Initializing cluster info", flush=True)
 
     # Read initial RDMA counters
-    initial_counters = read_sys_counters()
+    initial_counters = read_port_counters(
+        {
+            "rdma_write_bytes": 0,
+            "rdma_write_recv_bytes": 0,
+        }
+    )
     print(
         f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
         flush=True,
@@ -185,7 +190,12 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
             time.sleep(RETRY_DELAY)
 
     # Read final RDMA counters and print the delta
-    final_counters = read_sys_counters()
+    final_counters = read_port_counters(
+        {
+            "rdma_write_bytes": 0,
+            "rdma_write_recv_bytes": 0,
+        }
+    )
     delta = {k: final_counters[k] - initial_counters.get(k, 0) for k in final_counters}
     print(
         f"[rank {container_rank}] Counter delta: {json.dumps(delta)} bytes",
@@ -330,25 +340,6 @@ def aggregate_statistics(results: list[str]) -> float:
 
     total_bw_gbps = sum(bw_mb) / 1024  # MB/s -> GB/s
     return round(total_bw_gbps, 2)
-
-
-# Reads the RDMA counters from syfs for all devices
-def read_sys_counters() -> dict[str, float]:
-    # Initialize a dict to store the counters
-    counters = {
-        "rdma_write_bytes": 0,
-        "rdma_write_recv_bytes": 0,
-    }
-    # Loop through all ports and counters on every device
-    for path in glob.glob("/sys/class/infiniband/*/ports/1/hw_counters/*"):
-        # Get the metric name from the path
-        metric = os.path.basename(path)
-        # If the metric is in the counters dict, read the value and add it to the dict
-        if metric in counters:
-            with open(path, "r") as f:
-                # Multiply the resulting value by 4 to convert from words to bytes
-                counters[metric] += float(f.read())
-    return counters
 
 
 @app.local_entrypoint()

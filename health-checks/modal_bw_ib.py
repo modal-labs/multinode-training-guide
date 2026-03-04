@@ -1,10 +1,10 @@
-import glob
 import json
 import os
 import re
 import subprocess
 import time
 
+from utils import read_port_counters
 import modal
 import modal.experimental
 
@@ -68,7 +68,12 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     print(f"[rank {container_rank}] Initializing cluster info", flush=True)
 
     # Read initial port counters
-    initial_counters = read_port_counters()
+    initial_counters = read_port_counters(
+        {
+            "port_xmit_data": 0,
+            "port_rcv_data": 0,
+        }
+    )
     print(
         f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
         flush=True,
@@ -180,7 +185,12 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
             process.wait()
 
     # Read final port counters and print the delta
-    final_counters = read_port_counters()
+    final_counters = read_port_counters(
+        {
+            "port_xmit_data": 0,
+            "port_rcv_data": 0,
+        }
+    )
     delta = {k: final_counters[k] - initial_counters[k] for k in initial_counters}
     print(
         f"[rank {container_rank}] Counter delta: {json.dumps(delta)} bytes",
@@ -270,25 +280,6 @@ def aggregate_statistics(results: list[str]) -> tuple[float, float]:
     mean_bw_peak = sum(bw_peaks) / len(bw_peaks)
     mean_bw_avg = sum(bw_averages) / len(bw_averages)
     return mean_bw_peak, mean_bw_avg
-
-
-# Reads IB port counters from sysfs for all devices.
-def read_port_counters() -> dict[str, float]:
-    # Initialize a dict to store the counters
-    counters = {
-        "port_xmit_data": 0,
-        "port_rcv_data": 0,
-    }
-    # Loop through all ports and counters on every device
-    for path in glob.glob("/sys/class/infiniband/*/ports/*/counters/*"):
-        # Get the metric name from the path
-        metric = os.path.basename(path)
-        # If the metric is in the counters dict, read the value and add it to the dict
-        if metric in counters:
-            with open(path, "r") as f:
-                # Multiply the resulting value by 4 to convert from words to bytes
-                counters[metric] += float(f.read()) * 4
-    return counters
 
 
 @app.local_entrypoint()
