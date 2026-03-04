@@ -29,6 +29,7 @@ image = (
         "curl -fsSL -o /tmp/fabtests-2.3.1.tar.bz2 https://github.com/ofiwg/libfabric/releases/download/v2.3.1/fabtests-2.3.1.tar.bz2",
         "tar -xjf /tmp/fabtests-2.3.1.tar.bz2 -C /opt && rm -f /tmp/fabtests-2.3.1.tar.bz2",
     )
+    .add_local_python_source("utils")
 )
 app = modal.App("rdma-bandwidth-efa", image=image)
 
@@ -65,10 +66,11 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
 
     # Read initial RDMA counters
     initial_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/1/hw_counters/*",
         {
             "rdma_write_bytes": 0,
             "rdma_write_recv_bytes": 0,
-        }
+        },
     )
     print(
         f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
@@ -191,10 +193,11 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
 
     # Read final RDMA counters and print the delta
     final_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/1/hw_counters/*",
         {
             "rdma_write_bytes": 0,
             "rdma_write_recv_bytes": 0,
-        }
+        },
     )
     delta = {k: final_counters[k] - initial_counters.get(k, 0) for k in final_counters}
     print(

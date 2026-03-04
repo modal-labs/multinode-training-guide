@@ -35,6 +35,7 @@ image = (
         "rm -f /tmp/perftest-25.10.0-0.128.tar.gz",
         "cd /opt/perftest && ./autogen.sh && ./configure --prefix=/usr/local/ && make -j && make install",
     )
+    .add_local_python_source("utils")
 )
 app = modal.App("rdma-bandwidth-ib", image=image)
 
@@ -69,10 +70,12 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
 
     # Read initial port counters
     initial_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/*/counters/*",
         {
             "port_xmit_data": 0,
             "port_rcv_data": 0,
-        }
+        },
+        multiplier=4,
     )
     print(
         f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
@@ -186,10 +189,12 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
 
     # Read final port counters and print the delta
     final_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/*/counters/*",
         {
             "port_xmit_data": 0,
             "port_rcv_data": 0,
-        }
+        },
+        multiplier=4,
     )
     delta = {k: final_counters[k] - initial_counters[k] for k in initial_counters}
     print(
