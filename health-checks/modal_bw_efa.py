@@ -66,7 +66,7 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     # Read initial RDMA counters
     initial_counters = read_sys_counters()
     print(
-        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)}",
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
         flush=True,
     )
 
@@ -188,7 +188,7 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     final_counters = read_sys_counters()
     delta = {k: final_counters[k] - initial_counters.get(k, 0) for k in final_counters}
     print(
-        f"[rank {container_rank}] Counter delta: {json.dumps(delta)}",
+        f"[rank {container_rank}] Counter delta: {json.dumps(delta)} bytes",
         flush=True,
     )
 

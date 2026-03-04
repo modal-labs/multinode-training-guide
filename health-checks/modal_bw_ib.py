@@ -70,7 +70,7 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     # Read initial port counters
     initial_counters = read_port_counters()
     print(
-        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)}",
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
         flush=True,
     )
 
@@ -183,7 +183,7 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     final_counters = read_port_counters()
     delta = {k: final_counters[k] - initial_counters[k] for k in initial_counters}
     print(
-        f"[rank {container_rank}] Counter delta: {json.dumps(delta)}",
+        f"[rank {container_rank}] Counter delta: {json.dumps(delta)} bytes",
         flush=True,
     )
 
