@@ -130,6 +130,8 @@ def _normalize_text(value) -> str:
 
 
 def _default_pipeline_layer_split(num_hidden_layers: int, pp_size: int) -> tuple[int, int]:
+    # Megatron only needs explicit overrides for the edge pipeline stages; the
+    # middle stages get an even share of whatever layers remain.
     base_layers = num_hidden_layers // pp_size
     remainder = num_hidden_layers % pp_size
     extra_first = (remainder + 1) // 2
@@ -325,8 +327,11 @@ def train_dpo(
             f"TP/EP/PP/CP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}"
         )
 
+    # Each clustered task is one 8-GPU node on Modal, so total world size here
+    # is just 8 * n_nodes.
     total_gpus = n_nodes * 8
     model_parallel_size = tp_size * ep_size * pp_size * cp_size
+    canonical_dp_size = total_gpus // (tp_size * pp_size * cp_size)
     if total_gpus % model_parallel_size != 0:
         raise ValueError(
             f"Total GPUs ({total_gpus}) must be divisible by TP*EP*PP*CP ({model_parallel_size})"
@@ -335,7 +340,7 @@ def train_dpo(
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
     print(f"Model: {HF_MODEL}")
     print(
-        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, DP={total_gpus // model_parallel_size}"
+        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, Megatron_DP={canonical_dp_size}"
     )
 
     from huggingface_hub import snapshot_download
@@ -356,6 +361,9 @@ def train_dpo(
         num_hidden_layers = model_config.get("num_hidden_layers")
     if isinstance(num_hidden_layers, int) and num_hidden_layers > 0:
         if num_hidden_layers % pp_size != 0:
+            # GLM-5 has 78 decoder layers, so PP=4 cannot be expressed as an
+            # even split. ms-swift exposes first/last-stage overrides, so we
+            # derive those from config.json instead of hard-coding model internals.
             if (
                 decoder_first_pipeline_num_layers is None
                 and decoder_last_pipeline_num_layers is None
@@ -418,6 +426,8 @@ def train_dpo(
     os.makedirs(checkpoint_dir, exist_ok=True)
     args_json_path = os.path.join(checkpoint_dir, "args.json")
     if not os.path.exists(args_json_path):
+        # ms-swift's checkpoint saver expects an args.json to already exist next
+        # to output_dir so it can copy it into each checkpoint directory.
         with open(args_json_path, "w", encoding="utf-8") as f:
             json.dump({"run_id": run_id, "placeholder": True}, f)
 
@@ -463,6 +473,8 @@ def train_dpo(
         recompute_granularity,
         "--packing",
         str(packing_enabled).lower(),
+        # GLM-5's DSA attention path currently breaks with padding_free=True in
+        # this stack, so keep the switch explicit in the generated command.
         "--padding_free",
         str(padding_free).lower(),
         "--use_precision_aware_optimizer",
@@ -485,6 +497,8 @@ def train_dpo(
         "8",
         "--save_steps",
         str(save_steps),
+        # HF/safetensors export currently crashes for GLM-5, so default to
+        # Megatron-Core checkpoints unless the user opts back in explicitly.
         "--save_safetensors",
         str(save_safetensors).lower(),
         "--no_save_optim",

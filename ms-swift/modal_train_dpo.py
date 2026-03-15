@@ -275,8 +275,11 @@ def train_dpo(
             f"TP/EP/PP/CP must be positive, got TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}"
         )
 
+    # Each clustered task is one 8-GPU node on Modal, so total world size here
+    # is just 8 * n_nodes.
     total_gpus = n_nodes * 8
     model_parallel_size = tp_size * ep_size * pp_size * cp_size
+    canonical_dp_size = total_gpus // (tp_size * pp_size * cp_size)
     if total_gpus % model_parallel_size != 0:
         raise ValueError(
             f"Total GPUs ({total_gpus}) must be divisible by TP*EP*PP*CP ({model_parallel_size})"
@@ -285,7 +288,7 @@ def train_dpo(
     print(f"Node {node_rank}/{n_nodes}, Master: {master_addr}")
     print(f"Model: {HF_MODEL}")
     print(
-        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, DP={total_gpus // model_parallel_size}"
+        f"Parallelism: TP={tp_size}, EP={ep_size}, PP={pp_size}, CP={cp_size}, Megatron_DP={canonical_dp_size}"
     )
 
     from huggingface_hub import snapshot_download
@@ -320,6 +323,8 @@ def train_dpo(
     os.makedirs(checkpoint_dir, exist_ok=True)
     args_json_path = os.path.join(checkpoint_dir, "args.json")
     if not os.path.exists(args_json_path):
+        # ms-swift's checkpoint saver expects an args.json to already exist next
+        # to output_dir so it can copy it into each checkpoint directory.
         with open(args_json_path, "w", encoding="utf-8") as f:
             json.dump({"run_id": run_id, "placeholder": True}, f)
 
