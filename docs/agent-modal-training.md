@@ -54,8 +54,10 @@ modal app stop <app-id>
 ## Reading App State
 
 - `modal app list --json` is the fastest way to see whether an app exists and whether workers are active.
+- Its JSON output uses display-style keys such as `App ID`, `State`, `Tasks`, and `Stopped at`; do not assume snake_case field names when scripting against it.
 - If the tabular `modal app list` output looks stale during rapid state changes, prefer `modal app list --json`; in this repo it reflected active task counts sooner.
 - `Tasks: 0` on a detached app usually means capacity has not landed yet.
+- A detached clustered app can briefly show `Tasks > 0` and then drop back to `Tasks: 0` before logs start; in this repo that meant Modal recycled the placement and retried later, not that user code had completed.
 - `Tasks: N` indicates workers are active; at that point logs should begin to matter.
 - `State: stopped` with a recent `Stopped at` timestamp is the quickest confirmation that a detached run has exited.
 
@@ -83,6 +85,25 @@ modal app stop <app-id>
 - Modal client heartbeat warnings during long-running downloads were noisy but not fatal in this repo when the fetched-file count kept increasing.
 - If logs lag behind what the GPUs are doing, `modal container exec <container-id> -- nvidia-smi` is the quickest way to distinguish a real hang from a slow first step or delayed log flush.
 - During long GLM-5 runs, checkpoint files appeared inside the live container before the success lines showed up in `modal app logs`; if a run looks stalled, inspect the checkpoint directory in-container before declaring it wedged.
+
+## Post-Train Eval Workflow
+
+- For the ms-swift GLM DPO examples here, dataset prep now writes both `train.jsonl` and a deterministic held-out `eval.jsonl`.
+- The evaluation chain is intentionally split into four stages so drift can be localized:
+  - multinode Megatron-native scoring against the saved checkpoint
+  - multinode Megatron-to-HF export
+  - single-node HF/ms-swift-native scoring and greedy generation
+  - single-node SGLang scoring and greedy generation
+- Use the `evaluate_all` entrypoint in the relevant launcher when you want the full chain plus a parity report in one command.
+- If only one stage is failing, rerun that specific stage rather than retraining.
+- In the current GLM-4.7 DPO runs here, `checkpoint-25` and `checkpoint-30` contained a large `adapter_model.safetensors` plus `iter_00000xx/{.metadata,common.pt,metadata.json}`, but no full Megatron tensor-shard files. If Megatron-native reload fails, inspect the checkpoint tree first before assuming the sharded checkpoint exists.
+
+## SGLang Logprob Checks
+
+- On this repo's GLM-4.7 merged-export path, `--disable-cuda-graph` was not enough to keep SGLang startup short. It still spent minutes in piecewise graph capture until `--disable-piecewise-cuda-graph` was added explicitly.
+- The original `/generate` + `logprob_start_len` prompt-logprob path was not trustworthy for GLM-4.7 here and should not be treated as a validated parity check.
+- The teacher-forced `/generate` + `token_ids_logprob` path is also currently failing parity on the merged GLM-4.7 export: Megatron and HF stay near `-1.1` mean token logprob on the held-out example, while SGLang returns about `-11.93` for every response token and greedily emits token id `0` (`"!"`) as the next token. Treat that as a real framework/export bug until proven otherwise.
+- This kind of scoring check is still more useful than only comparing generated text, because it catches conversion or serving drift even when a model can still start and answer requests.
 
 ## Volume Checks
 
