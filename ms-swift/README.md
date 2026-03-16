@@ -260,3 +260,169 @@ modal run --detach modal_train.py::train_model \
   --lora-alpha 16 \
   --save-interval 100
 ```
+
+## DPO Example
+
+This directory also includes [`modal_train_dpo.py`](./modal_train_dpo.py), a GLM-4.7
+preference-tuning example that uses ms-swift Megatron DPO on the
+[`argilla/distilabel-math-preference-dpo`](https://huggingface.co/datasets/argilla/distilabel-math-preference-dpo)
+dataset.
+
+The preparation step now writes:
+
+- `train.jsonl`: ms-swift RLHF training rows
+- `eval.jsonl`: deterministic held-out prompt/reference rows for post-train parity checks
+- `metadata.json`: split metadata and source-column mapping
+
+The training rows still use ms-swift's RLHF JSONL format:
+
+```json
+{"messages":[{"role":"system","content":"You are a careful math tutor. Provide correct, concise reasoning."},{"role":"user","content":"<instruction>"},{"role":"assistant","content":"<chosen_response>"}],"rejected_response":"<rejected_response>"}
+```
+
+Quick start:
+
+```bash
+# Download GLM-4.7 once into the shared HF cache volume
+modal run modal_train_dpo.py::download_model
+
+# Build a small preference dataset for smoke tests
+modal run modal_train_dpo.py::prepare_preference_dataset \
+  --data-folder distilabel-math-dpo-256 \
+  --max-samples 256 \
+  --eval-size 64
+
+# Multinode DPO smoke run on 16x B200
+N_NODES=2 modal run --detach modal_train_dpo.py::train_dpo \
+  --data-folder distilabel-math-dpo-256 \
+  --run-id glm47-dpo-smoke \
+  --max-epochs 1 \
+  --beta 0.1 \
+  --lr 1e-5 \
+  --global-batch-size 8
+```
+
+Suggested short sweep:
+
+```bash
+N_NODES=2 modal run --detach modal_train_dpo.py::train_dpo \
+  --data-folder distilabel-math-dpo-256 \
+  --run-id glm47-dpo-beta005 \
+  --max-epochs 1 \
+  --beta 0.05 \
+  --lr 5e-6
+
+N_NODES=2 modal run --detach modal_train_dpo.py::train_dpo \
+  --data-folder distilabel-math-dpo-256 \
+  --run-id glm47-dpo-beta010 \
+  --max-epochs 1 \
+  --beta 0.10 \
+  --lr 1e-5
+
+N_NODES=2 modal run --detach modal_train_dpo.py::train_dpo \
+  --data-folder distilabel-math-dpo-256 \
+  --run-id glm47-dpo-beta020 \
+  --max-epochs 1 \
+  --beta 0.20 \
+  --lr 2e-5
+```
+
+Post-train parity checks:
+
+```bash
+# Export the latest Megatron checkpoint for a run to merged HF weights
+N_NODES=2 modal run modal_train_dpo.py::export_for_inference \
+  --run-id glm47-dpo-beta010
+
+# Run Megatron-native held-out scoring directly from the checkpoint
+N_NODES=2 modal run modal_train_dpo.py::evaluate_megatron_native \
+  --run-id glm47-dpo-beta010 \
+  --data-folder distilabel-math-dpo-256
+
+# Run HF-native held-out scoring + greedy generation from the merged export
+modal run modal_train_dpo.py::evaluate_hf_native \
+  --run-id glm47-dpo-beta010 \
+  --data-folder distilabel-math-dpo-256
+
+# Run the same held-out scoring + greedy generation through a live SGLang server
+modal run modal_train_dpo.py::evaluate_sglang \
+  --run-id glm47-dpo-beta010 \
+  --data-folder distilabel-math-dpo-256
+
+# Or run the full export + eval chain and write one parity report
+modal run modal_train_dpo.py::evaluate_all \
+  --run-id glm47-dpo-beta010 \
+  --data-folder distilabel-math-dpo-256
+```
+
+## GLM-5 DPO Example
+
+[`modal_train_dpo_glm5.py`](./modal_train_dpo_glm5.py) is the GLM-5 variant.
+It pins the upstream ms-swift GLM-5 support PR commit directly in the Modal image
+so the build cannot accidentally reuse an older cached `main`.
+
+Quick start:
+
+```bash
+# Download GLM-5 once into the shared HF cache volume
+modal run modal_train_dpo_glm5.py::download_model
+
+# Reuse the same preference dataset prep path on a tiny probe subset first
+modal run modal_train_dpo_glm5.py::prepare_preference_dataset \
+  --data-folder distilabel-math-dpo-16 \
+  --max-samples 16 \
+  --eval-size 8
+
+# Prepare a slightly larger subset once the probe works
+modal run modal_train_dpo_glm5.py::prepare_preference_dataset \
+  --data-folder distilabel-math-dpo-256 \
+  --max-samples 256 \
+  --eval-size 64
+
+# Multinode GLM-5 DPO probe on 32x B200
+N_NODES=4 modal run --detach modal_train_dpo_glm5.py::train_dpo \
+  --data-folder distilabel-math-dpo-16 \
+  --run-id glm5-dpo-mn16-probe \
+  --max-epochs 1 \
+  --beta 0.10 \
+  --lr 5e-6 \
+  --eval-iters 0 \
+  --no-padding-free \
+  --dsa-indexer-loss-coeff 0.0 \
+  --no-save-safetensors
+
+# Follow-on multinode run on the larger subset
+N_NODES=4 modal run --detach modal_train_dpo_glm5.py::train_dpo \
+  --data-folder distilabel-math-dpo-256 \
+  --run-id glm5-dpo-mn256-beta010 \
+  --max-epochs 1 \
+  --beta 0.10 \
+  --lr 1e-5 \
+  --eval-iters 0 \
+  --no-padding-free \
+  --dsa-indexer-loss-coeff 0.0 \
+  --no-save-safetensors
+```
+
+Post-train parity checks:
+
+```bash
+N_NODES=4 modal run modal_train_dpo_glm5.py::export_for_inference \
+  --run-id glm5-dpo-mn256-beta010
+
+N_NODES=4 modal run modal_train_dpo_glm5.py::evaluate_megatron_native \
+  --run-id glm5-dpo-mn256-beta010 \
+  --data-folder distilabel-math-dpo-256
+
+modal run modal_train_dpo_glm5.py::evaluate_hf_native \
+  --run-id glm5-dpo-mn256-beta010 \
+  --data-folder distilabel-math-dpo-256
+
+modal run modal_train_dpo_glm5.py::evaluate_sglang \
+  --run-id glm5-dpo-mn256-beta010 \
+  --data-folder distilabel-math-dpo-256
+
+modal run modal_train_dpo_glm5.py::evaluate_all \
+  --run-id glm5-dpo-mn256-beta010 \
+  --data-folder distilabel-math-dpo-256
+```
