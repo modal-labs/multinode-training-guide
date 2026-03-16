@@ -27,6 +27,37 @@ def _prune_extra_state_entries(obj: Any) -> int:
     return removed
 
 
+def _strip_prefix_from_nested_keys(obj: Any, prefix: str, seen: set[int] | None = None) -> int:
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    renamed = 0
+    if hasattr(obj, "key") and isinstance(obj.key, str) and obj.key.startswith(prefix):
+        obj.key = obj.key[len(prefix) :]
+        renamed += 1
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            value = obj.pop(key)
+            new_key = key[len(prefix) :] if isinstance(key, str) and key.startswith(prefix) else key
+            if new_key != key:
+                renamed += 1
+            obj[new_key] = value
+            renamed += _strip_prefix_from_nested_keys(value, prefix, seen)
+    elif isinstance(obj, list):
+        for item in obj:
+            renamed += _strip_prefix_from_nested_keys(item, prefix, seen)
+    elif isinstance(obj, tuple):
+        for item in obj:
+            renamed += _strip_prefix_from_nested_keys(item, prefix, seen)
+    elif hasattr(obj, "__dict__"):
+        renamed += _strip_prefix_from_nested_keys(vars(obj), prefix, seen)
+    return renamed
+
+
 def load_mcore_checkpoint_lenient(
     args,
     ddp_models: list,
@@ -126,6 +157,12 @@ def load_mcore_checkpoint_lenient(
     ml_utils._filter_adapter_state_dict(
         sharded_state_dict, is_peft_format, adapter_name=adapter_name
     )
+    if is_peft_format:
+        renamed = _strip_prefix_from_nested_keys(sharded_state_dict, "base_model.")
+        if renamed:
+            ml_utils.logger.info(
+                f"Stripped 'base_model.' prefix from {renamed} LoRA checkpoint keys before distributed checkpoint load."
+            )
     removed = _prune_extra_state_entries(sharded_state_dict)
     if removed:
         ml_utils.logger.info(

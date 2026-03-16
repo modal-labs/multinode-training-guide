@@ -123,6 +123,10 @@ CHECKPOINTS_DIR = "/checkpoints"
 
 # Default to 4 nodes (32x B200), matching TP=2 x EP=4 x PP=4 for GLM-5.
 N_NODES = int(os.environ.get("N_NODES", "4"))
+GPU_CONFIG = os.environ.get("GPU_TYPE", "B200:8")
+CLUSTER_RDMA = os.environ.get("CLUSTER_RDMA", "true").lower() == "true"
+EFA_ENABLED = os.environ.get("EFA_ENABLED", "true").lower() == "true"
+EXPERIMENTAL_OPTIONS = {"efa_enabled": True} if EFA_ENABLED else {}
 
 
 def _with_shared_eval_files(image: modal.Image) -> modal.Image:
@@ -473,7 +477,7 @@ def inspect_swift_megatron_export_arguments():
 
 @app.function(
     image=msswift_glm5_image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={
         HF_CACHE: hf_cache_vol,
         DATA_DIR: data_volume,
@@ -487,9 +491,9 @@ def inspect_swift_megatron_export_arguments():
     retries=0,
     memory=1048576,
     ephemeral_disk=2048000,
-    experimental_options={"efa_enabled": True},
+    experimental_options=EXPERIMENTAL_OPTIONS,
 )
-@modal.experimental.clustered(size=N_NODES, rdma=True)
+@modal.experimental.clustered(size=N_NODES, rdma=CLUSTER_RDMA)
 def train_dpo(
     run_id: Optional[str] = None,
     data_folder: str = "distilabel-math-preference-dpo",
@@ -813,42 +817,24 @@ def train_dpo(
     print(f"Results saved to {checkpoint_dir}")
 
 
-@app.function(
-    image=msswift_glm5_image,
-    gpu="B200:8",
-    volumes={
-        HF_CACHE: hf_cache_vol,
-        DATA_DIR: data_volume,
-        CHECKPOINTS_DIR: checkpoints_volume,
-    },
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=43200,
-    retries=0,
-    memory=1048576,
-    ephemeral_disk=2048000,
-    experimental_options={"efa_enabled": True},
-)
-@modal.experimental.clustered(size=N_NODES, rdma=True)
-def export_for_inference(
+def _export_for_inference_impl(
     run_id: str,
     checkpoint_name: Optional[str] = None,
     export_name: Optional[str] = None,
+    peft_format: bool = False,
     tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
     pp_size: int = PP_SIZE,
     cp_size: int = CP_SIZE,
     decoder_first_pipeline_num_layers: Optional[int] = None,
     decoder_last_pipeline_num_layers: Optional[int] = None,
+    *,
+    node_rank: int,
+    n_nodes: int,
+    master_addr: str,
 ):
     import subprocess
     from huggingface_hub import snapshot_download
-
-    cluster_info = modal.experimental.get_cluster_info()
-    node_rank = cluster_info.rank
-    n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
-    master_addr = (
-        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
-    )
 
     checkpoint_dir = _checkpoint_dir(run_id, checkpoint_name)
     export_dir = (
@@ -900,11 +886,23 @@ def export_for_inference(
         "--cp-size",
         str(cp_size),
         "--sequence-parallel",
-        "--decoder-first-pipeline-num-layers",
-        str(decoder_first_pipeline_num_layers),
-        "--decoder-last-pipeline-num-layers",
-        str(decoder_last_pipeline_num_layers),
     ]
+    if peft_format:
+        export_cmd.append("--peft-format")
+    if decoder_first_pipeline_num_layers is not None:
+        export_cmd.extend(
+            [
+                "--decoder-first-pipeline-num-layers",
+                str(decoder_first_pipeline_num_layers),
+            ]
+        )
+    if decoder_last_pipeline_num_layers is not None:
+        export_cmd.extend(
+            [
+                "--decoder-last-pipeline-num-layers",
+                str(decoder_last_pipeline_num_layers),
+            ]
+        )
 
     cmd = [
         "torchrun",
@@ -933,7 +931,7 @@ def export_for_inference(
 
 @app.function(
     image=msswift_glm5_image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={
         HF_CACHE: hf_cache_vol,
         DATA_DIR: data_volume,
@@ -944,10 +942,85 @@ def export_for_inference(
     retries=0,
     memory=1048576,
     ephemeral_disk=2048000,
-    experimental_options={"efa_enabled": True},
+    experimental_options=EXPERIMENTAL_OPTIONS,
 )
-@modal.experimental.clustered(size=N_NODES, rdma=True)
-def evaluate_megatron_native(
+@modal.experimental.clustered(size=N_NODES, rdma=CLUSTER_RDMA)
+def export_for_inference(
+    run_id: str,
+    checkpoint_name: Optional[str] = None,
+    export_name: Optional[str] = None,
+    peft_format: bool = False,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+    decoder_first_pipeline_num_layers: Optional[int] = None,
+    decoder_last_pipeline_num_layers: Optional[int] = None,
+):
+    cluster_info = modal.experimental.get_cluster_info()
+    return _export_for_inference_impl(
+        run_id=run_id,
+        checkpoint_name=checkpoint_name,
+        export_name=export_name,
+        peft_format=peft_format,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        decoder_first_pipeline_num_layers=decoder_first_pipeline_num_layers,
+        decoder_last_pipeline_num_layers=decoder_last_pipeline_num_layers,
+        node_rank=cluster_info.rank,
+        n_nodes=len(cluster_info.container_ips) if cluster_info.container_ips else 1,
+        master_addr=cluster_info.container_ips[0]
+        if cluster_info.container_ips
+        else "localhost",
+    )
+
+
+@app.function(
+    image=msswift_glm5_image,
+    gpu=GPU_CONFIG,
+    volumes={
+        HF_CACHE: hf_cache_vol,
+        DATA_DIR: data_volume,
+        CHECKPOINTS_DIR: checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=43200,
+    retries=0,
+    memory=1048576,
+    ephemeral_disk=2048000,
+)
+def export_for_inference_single_node(
+    run_id: str,
+    checkpoint_name: Optional[str] = None,
+    export_name: Optional[str] = None,
+    peft_format: bool = False,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+    decoder_first_pipeline_num_layers: Optional[int] = None,
+    decoder_last_pipeline_num_layers: Optional[int] = None,
+):
+    return _export_for_inference_impl(
+        run_id=run_id,
+        checkpoint_name=checkpoint_name,
+        export_name=export_name,
+        peft_format=peft_format,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        decoder_first_pipeline_num_layers=decoder_first_pipeline_num_layers,
+        decoder_last_pipeline_num_layers=decoder_last_pipeline_num_layers,
+        node_rank=0,
+        n_nodes=1,
+        master_addr="localhost",
+    )
+
+
+def _evaluate_megatron_native_impl(
     run_id: str,
     data_folder: str = "distilabel-math-preference-dpo",
     checkpoint_name: Optional[str] = None,
@@ -958,16 +1031,13 @@ def evaluate_megatron_native(
     cp_size: int = CP_SIZE,
     decoder_first_pipeline_num_layers: Optional[int] = None,
     decoder_last_pipeline_num_layers: Optional[int] = None,
+    *,
+    node_rank: int,
+    n_nodes: int,
+    master_addr: str,
 ):
     import subprocess
     from huggingface_hub import snapshot_download
-
-    cluster_info = modal.experimental.get_cluster_info()
-    node_rank = cluster_info.rank
-    n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
-    master_addr = (
-        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
-    )
 
     checkpoint_dir = _checkpoint_dir(run_id, checkpoint_name)
     eval_dataset = os.path.join(DATA_DIR, data_folder, EVAL_FILENAME)
@@ -1030,11 +1100,21 @@ def evaluate_megatron_native(
         "--cp-size",
         str(cp_size),
         "--sequence-parallel",
-        "--decoder-first-pipeline-num-layers",
-        str(decoder_first_pipeline_num_layers),
-        "--decoder-last-pipeline-num-layers",
-        str(decoder_last_pipeline_num_layers),
     ]
+    if decoder_first_pipeline_num_layers is not None:
+        cmd.extend(
+            [
+                "--decoder-first-pipeline-num-layers",
+                str(decoder_first_pipeline_num_layers),
+            ]
+        )
+    if decoder_last_pipeline_num_layers is not None:
+        cmd.extend(
+            [
+                "--decoder-last-pipeline-num-layers",
+                str(decoder_last_pipeline_num_layers),
+            ]
+        )
     if max_eval_samples is not None:
         cmd.extend(["--max-samples", str(max_eval_samples)])
 
@@ -1055,7 +1135,98 @@ def evaluate_megatron_native(
 
 @app.function(
     image=msswift_glm5_image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
+    volumes={
+        HF_CACHE: hf_cache_vol,
+        DATA_DIR: data_volume,
+        CHECKPOINTS_DIR: checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=43200,
+    retries=0,
+    memory=1048576,
+    ephemeral_disk=2048000,
+    experimental_options=EXPERIMENTAL_OPTIONS,
+)
+@modal.experimental.clustered(size=N_NODES, rdma=CLUSTER_RDMA)
+def evaluate_megatron_native(
+    run_id: str,
+    data_folder: str = "distilabel-math-preference-dpo",
+    checkpoint_name: Optional[str] = None,
+    max_eval_samples: Optional[int] = DEFAULT_EVAL_SIZE,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+    decoder_first_pipeline_num_layers: Optional[int] = None,
+    decoder_last_pipeline_num_layers: Optional[int] = None,
+):
+    cluster_info = modal.experimental.get_cluster_info()
+    return _evaluate_megatron_native_impl(
+        run_id=run_id,
+        data_folder=data_folder,
+        checkpoint_name=checkpoint_name,
+        max_eval_samples=max_eval_samples,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        decoder_first_pipeline_num_layers=decoder_first_pipeline_num_layers,
+        decoder_last_pipeline_num_layers=decoder_last_pipeline_num_layers,
+        node_rank=cluster_info.rank,
+        n_nodes=len(cluster_info.container_ips) if cluster_info.container_ips else 1,
+        master_addr=cluster_info.container_ips[0]
+        if cluster_info.container_ips
+        else "localhost",
+    )
+
+
+@app.function(
+    image=msswift_glm5_image,
+    gpu=GPU_CONFIG,
+    volumes={
+        HF_CACHE: hf_cache_vol,
+        DATA_DIR: data_volume,
+        CHECKPOINTS_DIR: checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=43200,
+    retries=0,
+    memory=1048576,
+    ephemeral_disk=2048000,
+)
+def evaluate_megatron_native_single_node(
+    run_id: str,
+    data_folder: str = "distilabel-math-preference-dpo",
+    checkpoint_name: Optional[str] = None,
+    max_eval_samples: Optional[int] = DEFAULT_EVAL_SIZE,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+    decoder_first_pipeline_num_layers: Optional[int] = None,
+    decoder_last_pipeline_num_layers: Optional[int] = None,
+):
+    return _evaluate_megatron_native_impl(
+        run_id=run_id,
+        data_folder=data_folder,
+        checkpoint_name=checkpoint_name,
+        max_eval_samples=max_eval_samples,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        decoder_first_pipeline_num_layers=decoder_first_pipeline_num_layers,
+        decoder_last_pipeline_num_layers=decoder_last_pipeline_num_layers,
+        node_rank=0,
+        n_nodes=1,
+        master_addr="localhost",
+    )
+
+
+@app.function(
+    image=msswift_glm5_image,
+    gpu=GPU_CONFIG,
     volumes={DATA_DIR: data_volume, CHECKPOINTS_DIR: checkpoints_volume},
     timeout=43200,
     retries=0,
@@ -1070,6 +1241,7 @@ def evaluate_hf_native(
     max_eval_samples: Optional[int] = DEFAULT_EVAL_SIZE,
     max_new_tokens: int = DEFAULT_EVAL_MAX_NEW_TOKENS,
 ):
+    from huggingface_hub import snapshot_download
     from msswift_eval_runtime import hf_score_and_generate
 
     checkpoint_dir = _checkpoint_dir(run_id, checkpoint_name)
@@ -1080,13 +1252,24 @@ def evaluate_hf_native(
     )
     eval_dataset = os.path.join(DATA_DIR, data_folder, EVAL_FILENAME)
     output_dir = eval_dir(export_dir, "hf-native")
+    adapter_config_path = os.path.join(export_dir, "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+        model_dir = snapshot_download(HF_MODEL, local_files_only=True)
+        tokenizer_dir = model_dir
+        adapter_dir = export_dir
+    else:
+        model_dir = export_dir
+        tokenizer_dir = export_dir
+        adapter_dir = None
 
     result = hf_score_and_generate(
-        export_dir,
+        model_dir,
+        tokenizer_dir,
         eval_dataset,
         output_dir,
         max_eval_samples,
         max_new_tokens,
+        adapter_dir=adapter_dir,
     )
     checkpoints_volume.commit()
     return {
@@ -1099,7 +1282,7 @@ def evaluate_hf_native(
 
 @app.function(
     image=sglang_eval_image,
-    gpu="B200:8",
+    gpu=GPU_CONFIG,
     volumes={DATA_DIR: data_volume, CHECKPOINTS_DIR: checkpoints_volume},
     timeout=43200,
     retries=0,
@@ -1115,6 +1298,7 @@ def evaluate_sglang(
     max_new_tokens: int = DEFAULT_EVAL_MAX_NEW_TOKENS,
     sglang_tp_size: int = 8,
 ):
+    from huggingface_hub import snapshot_download
     from msswift_eval_runtime import sglang_score_and_generate
 
     checkpoint_dir = _checkpoint_dir(run_id, checkpoint_name)
@@ -1125,14 +1309,40 @@ def evaluate_sglang(
     )
     eval_dataset = os.path.join(DATA_DIR, data_folder, EVAL_FILENAME)
     output_dir = eval_dir(export_dir, "sglang")
+    adapter_config_path = os.path.join(export_dir, "adapter_config.json")
+    server_extra_args = [
+        "--max-total-tokens",
+        "1000000",
+        "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
+        "--skip-server-warmup",
+    ]
+    lora_name = None
+    model_dir = export_dir
+    tokenizer_dir = export_dir
+    if os.path.exists(adapter_config_path):
+        model_dir = snapshot_download(HF_MODEL, local_files_only=True)
+        tokenizer_dir = model_dir
+        lora_name = "finetune"
+        server_extra_args.extend(
+            [
+                "--enable-lora",
+                "--lora-paths",
+                f"{lora_name}={export_dir}",
+            ]
+        )
 
     result = sglang_score_and_generate(
-        export_dir,
+        model_dir,
+        tokenizer_dir,
         eval_dataset,
         output_dir,
         max_eval_samples,
         max_new_tokens,
         tp_size=sglang_tp_size,
+        startup_timeout_s=1800,
+        server_extra_args=server_extra_args,
+        lora_name=lora_name,
     )
     checkpoints_volume.commit()
     return {

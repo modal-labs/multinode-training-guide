@@ -40,9 +40,9 @@ def _build_swift_args(cli_args):
     from swift.megatron.arguments import MegatronExportArguments
 
     temp_output_dir = tempfile.mkdtemp(prefix="msswift-megatron-eval-")
-    return MegatronExportArguments(
+    swift_args = MegatronExportArguments(
         model=cli_args.base_model_dir,
-        adapters=[cli_args.checkpoint_dir],
+        adapters=[],
         mcore_adapter=cli_args.checkpoint_dir,
         output_dir=temp_output_dir,
         exist_ok=True,
@@ -60,6 +60,8 @@ def _build_swift_args(cli_args):
         dataset=["placeholder"],
         load_args=True,
     )
+    setattr(swift_args, "_checkpoint_dir", cli_args.checkpoint_dir)
+    return swift_args
 
 
 def _load_megatron_model(swift_args):
@@ -75,20 +77,19 @@ def _load_megatron_model(swift_args):
     bridge = swift_args.megatron_model_meta.bridge_cls(swift_args)
     bridge.load_weights([mg_model], swift_args.model_info.model_dir)
     if swift_args.tuner_type == "lora":
+        peft_model = prepare_mcore_model(swift_args, mg_model)
         try:
-            peft_model = prepare_mcore_model(swift_args, mg_model)
             bridge.load_weights(
                 [mg_model],
-                swift_args.adapters[0],
+                swift_args._checkpoint_dir,
                 is_peft_format=True,
             )
-            print(f"Loaded HF adapter via GPT bridge from {swift_args.adapters[0]}")
+            print(f"Loaded HF adapter via GPT bridge from {swift_args._checkpoint_dir}")
         except Exception as hf_adapter_exc:
             print(
                 "HF adapter bridge load failed, falling back to MCore adapter load: "
                 f"{hf_adapter_exc}"
             )
-            peft_model = prepare_mcore_model(swift_args, mg_model)
             load_mcore_checkpoint_lenient(
                 swift_args, [peft_model], load_arg="mcore_adapter"
             )
@@ -139,20 +140,17 @@ def _score_rows(cli_args) -> None:
         full_messages = row["messages"] + [
             {"role": "assistant", "content": row["reference_response"]}
         ]
-        prompt_ids = _chat_tokens(tokenizer, row["messages"], add_generation_prompt=True)
-        full_ids = _chat_tokens(tokenizer, full_messages, add_generation_prompt=False)
-        if len(full_ids) <= len(prompt_ids):
-            skipped += 1
-            continue
-
         encoded = template.encode({"messages": full_messages})
         collated = template.data_collator([encoded], padding_to=padding_to)
         collated_input_ids = collated["input_ids"][0].tolist()
-        if collated_input_ids[: len(full_ids)] != full_ids:
-            raise ValueError(
-                f"Tokenizer/template token mismatch for example {row['id']}: "
-                f"chat_template={len(full_ids)} collator={len(collated_input_ids)}"
-            )
+        labels = collated["labels"][0].tolist()
+        if len(collated_input_ids) < 2 or len(labels) < 2:
+            skipped += 1
+            continue
+        response_mask = [label != -100 for label in labels[1:]]
+        if not any(response_mask):
+            skipped += 1
+            continue
 
         mg_inputs = to_device(collated, "cuda")
         for key in ["labels", "num_samples", "attention_mask_2d", "text_position_ids"]:
@@ -172,21 +170,38 @@ def _score_rows(cli_args) -> None:
         if dist.get_rank() != 0:
             continue
 
-        logits = mg_logits[0, : len(full_ids) - 1].float()
-        target_ids = torch.tensor(full_ids[1:], device=logits.device, dtype=torch.long)
+        logits = mg_logits[0, : len(collated_input_ids) - 1].float()
+        target_ids_list = collated_input_ids[1:]
+        target_ids = torch.tensor(
+            target_ids_list, device=logits.device, dtype=torch.long
+        )
         token_logprobs = torch.log_softmax(logits, dim=-1).gather(
             -1, target_ids.unsqueeze(-1)
         ).squeeze(-1)
-        response_start = len(prompt_ids) - 1
-        response_token_logprobs = token_logprobs[response_start:].cpu().tolist()
-        greedy_token_ids = logits.argmax(dim=-1)[response_start:].cpu().tolist()
+        token_logprobs_list = token_logprobs.cpu().tolist()
+        greedy_all_token_ids = logits.argmax(dim=-1).cpu().tolist()
+        response_token_ids = [
+            token_id
+            for token_id, include in zip(target_ids_list, response_mask)
+            if include
+        ]
+        response_token_logprobs = [
+            token_logprob
+            for token_logprob, include in zip(token_logprobs_list, response_mask)
+            if include
+        ]
+        greedy_token_ids = [
+            token_id
+            for token_id, include in zip(greedy_all_token_ids, response_mask)
+            if include
+        ]
 
         results.append(
             {
                 "id": row["id"],
                 "messages": row["messages"],
                 "reference_response": row["reference_response"],
-                "response_token_ids": full_ids[len(prompt_ids) :],
+                "response_token_ids": response_token_ids,
                 "response_token_logprobs": response_token_logprobs,
                 "sequence_sum_logprob": sum(response_token_logprobs),
                 "sequence_mean_logprob": (

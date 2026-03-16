@@ -46,6 +46,10 @@ def _chat_tokens(tokenizer, messages: List[Dict[str, str]], add_generation_promp
     return token_ids
 
 
+def _response_tokens(tokenizer, response_text: str) -> List[int]:
+    return tokenizer.encode(response_text, add_special_tokens=False)
+
+
 def hf_score_and_generate(
     model_dir: str,
     tokenizer_dir: str,
@@ -116,12 +120,10 @@ def hf_score_and_generate(
     total_rows = len(eval_rows)
     for idx, row in enumerate(eval_rows, start=1):
         prompt_ids = _chat_tokens(tokenizer, row["messages"], add_generation_prompt=True)
-        full_messages = row["messages"] + [
-            {"role": "assistant", "content": row["reference_response"]}
-        ]
-        full_ids = _chat_tokens(tokenizer, full_messages, add_generation_prompt=False)
-        if len(full_ids) <= len(prompt_ids):
+        response_token_ids = _response_tokens(tokenizer, row["reference_response"])
+        if not response_token_ids:
             continue
+        full_ids = prompt_ids + response_token_ids
 
         full_tensor = torch.tensor([full_ids], device=input_device, dtype=torch.long)
         prompt_tensor = torch.tensor([prompt_ids], device=input_device, dtype=torch.long)
@@ -161,7 +163,7 @@ def hf_score_and_generate(
                 "id": row["id"],
                 "messages": row["messages"],
                 "reference_response": row["reference_response"],
-                "response_token_ids": full_ids[len(prompt_ids) :],
+                "response_token_ids": response_token_ids,
                 "response_token_logprobs": response_token_logprobs,
                 "sequence_sum_logprob": sum(response_token_logprobs),
                 "sequence_mean_logprob": (
@@ -265,6 +267,7 @@ def sglang_score_and_generate(
     port: int = 30000,
     startup_timeout_s: int = 900,
     server_extra_args: Optional[List[str]] = None,
+    lora_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     tokenizer = _tokenizer_from_model(tokenizer_dir)
     eval_rows = read_jsonl(eval_dataset)
@@ -296,13 +299,9 @@ def sglang_score_and_generate(
         total_rows = len(eval_rows)
         for idx, row in enumerate(eval_rows, start=1):
             prompt_ids = _chat_tokens(tokenizer, row["messages"], add_generation_prompt=True)
-            full_messages = row["messages"] + [
-                {"role": "assistant", "content": row["reference_response"]}
-            ]
-            full_ids = _chat_tokens(tokenizer, full_messages, add_generation_prompt=False)
-            if len(full_ids) <= len(prompt_ids):
+            response_token_ids = _response_tokens(tokenizer, row["reference_response"])
+            if not response_token_ids:
                 continue
-            response_token_ids = full_ids[len(prompt_ids) :]
             response_logprobs = []
             for token_idx, target_token_id in enumerate(response_token_ids):
                 context_ids = prompt_ids + response_token_ids[:token_idx]
@@ -314,6 +313,7 @@ def sglang_score_and_generate(
                         "return_logprob": True,
                         "return_text_in_logprobs": True,
                         "token_ids_logprob": [target_token_id],
+                        **({"lora_path": lora_name} if lora_name else {}),
                     },
                     timeout=300,
                 )
@@ -343,6 +343,7 @@ def sglang_score_and_generate(
                         },
                         "return_logprob": True,
                         "return_text_in_logprobs": True,
+                        **({"lora_path": lora_name} if lora_name else {}),
                     },
                     timeout=300,
                 )
