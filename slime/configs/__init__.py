@@ -9,12 +9,12 @@ from .base import RLConfig
 _CONFIGS: dict[str, Callable[[], RLConfig]] = {}
 
 
-def get_config(name: str) -> RLConfig:
+def get_config(name: str, sync: bool = True) -> RLConfig:
     """Get a config by name."""
     if name not in _CONFIGS:
         available = ", ".join(sorted(_CONFIGS.keys()))
         raise ValueError(f"Unknown config: {name}. Available configs: {available}")
-    return _CONFIGS[name]()
+    return _CONFIGS[name](sync)
 
 
 def list_configs() -> list[str]:

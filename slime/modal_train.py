@@ -3,19 +3,19 @@ Unified SLIME GRPO training script for Modal.
 
 Usage:
     # Sync training with Qwen 0.5B (multi-node)
-    modal run modal_train.py::train_multi_node --config qwen-0.5b-sync
+    modal run modal_train.py::train_multi_node --config qwen-4b
 
     # Async training with Qwen 4B (multi-node)
-    modal run modal_train.py::train_multi_node --config qwen-4b-async
+    modal run modal_train.py::train_multi_node --config qwen-4b --no-sync
 
     # Single node training
-    modal run modal_train.py::train_single_node --config qwen-0.5b-sync
+    modal run modal_train.py::train_single_node --config qwen-4b
 
     # Single node training with LoRA (using local slime repo)
-    USE_LOCAL_SLIME=/path/to/slime modal run modal_train.py::train_single_node --config qwen-4b-lora
+    USE_LOCAL_SLIME=/path/to/slime modal run modal_train.py::train_single_node --config qwen-4b --no-sync
 
     # Download model
-    modal run modal_train.py::download_model --config qwen-4b-sync
+    modal run modal_train.py::download_model --config qwen-4b
 
     # Prepare dataset
     modal run modal_train.py::prepare_dataset
@@ -363,7 +363,7 @@ def list_available_configs():
 @modal.experimental.clustered(
     4, rdma=True
 )
-async def train_multi_node(config: str = "qwen-0.5b-sync"):
+async def train_multi_node(config: str = "qwen-4b", sync: bool = True):
     """Main entry point for multi-node GRPO training on Modal.
 
     Args:
@@ -371,7 +371,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
     """
     from configs import get_config
 
-    cfg = get_config(config)
+    cfg = get_config(config, sync)
 
     hf_cache_volume.reload()
     data_volume.reload()
@@ -412,7 +412,7 @@ async def train_multi_node(config: str = "qwen-0.5b-sync"):
         "efa_enabled": True,
     },
 )
-async def train_single_node(config: str = "qwen-0.5b-sync"):
+async def train_single_node(config: str = "qwen-4b", sync: bool = True):
     """Single-node GRPO training on Modal.
 
     Args:
@@ -420,7 +420,7 @@ async def train_single_node(config: str = "qwen-0.5b-sync"):
     """
     from configs import get_config
 
-    cfg = get_config(config)
+    cfg = get_config(config, sync)
 
     hf_cache_volume.reload()
     data_volume.reload()
