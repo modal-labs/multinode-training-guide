@@ -10,7 +10,7 @@ from .base import (
 )
 
 
-def get_config() -> RLConfig:
+def get_config(sync: bool = True) -> RLConfig:
     return RLConfig(
         model_name="Qwen3-8B",
         model_id="Qwen/Qwen3-8B",
@@ -19,7 +19,7 @@ def get_config() -> RLConfig:
         n_nodes=4,
         gpu="H100:8",
         app_name="slime-qwen3-8b-multi",
-        sync=True,
+        sync=sync,
 
         # Wandb
         wandb_project="slime-grpo",
@@ -45,7 +45,7 @@ def get_config() -> RLConfig:
             --num-rollout 3000
             --rollout-batch-size 128
             --n-samples-per-prompt 8
-            --global-batch-size 1024
+            --global-batch-size {1024 if sync else 1008}
 
             # Eval data
             --eval-prompt-data gsm8k {{data_path}}/gsm8k/test.parquet
@@ -58,8 +58,8 @@ def get_config() -> RLConfig:
 
             # Orchestration
             --actor-num-nodes 4
-            --actor-num-gpus-per-node 8
-            --colocate
+            --actor-num-gpus-per-node {8 if sync else 6}
+            {"--colocate" if sync else "--rollout-num-gpus 8"}
 
             # Eval
             --eval-interval 20
