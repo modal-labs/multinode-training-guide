@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,7 @@ async def run(
     config = TrialConfig(
         task=TaskConfig(path=Path(task_path)),
         trials_dir=Path("/tmp/harbor-trials"),
-        trial_name=f"{trial_name}-{int(started)}",
+        trial_name=f"{trial_name}-{int(started * 1000)}-{uuid.uuid4().hex[:8]}",
         agent=AgentConfig(
             import_path="harbor_agent:SimpleHarborAgent",
             model_name=model_name,

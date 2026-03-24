@@ -19,6 +19,7 @@ from configs.base import USACO_GIT_COMMIT, USACO_GIT_URL
 here = Path(__file__).parent
 MILES_GIT_COMMIT = "6e9151cc4fc02dfbf3b2271e5cd070c3e9c8ac55"
 MILES_SRC_PATH = Path("/root/miles-src")
+MILES_OVERRIDES_PATH = Path("/root/miles_overrides")
 
 image = (
     modal.Image.from_registry("radixark/miles:latest")
@@ -39,6 +40,7 @@ image = (
     .add_local_file(here / "harbor_agent.py", "/root/harbor_agent.py", copy=True)
     .add_local_file(here / "harbor_agent_function.py", "/root/harbor_agent_function.py", copy=True)
     .add_local_dir(here / "tasks", remote_path="/root/harbor_tasks", copy=True)
+    .add_local_dir(here / "overrides", remote_path="/root/miles_overrides", copy=True)
 )
 
 with image.imports():
@@ -59,6 +61,10 @@ checkpoints_volume = modal.Volume.from_name("miles-harbor-checkpoints", create_i
 
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
+RAY_CLIENT_SERVER_PORT = 10001
+RAY_METRICS_EXPORT_PORT = 20000
+RAY_MIN_WORKER_PORT = 20001
+RAY_MAX_WORKER_PORT = 29999
 SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 MULTI_NODE_COUNT = 2
 
@@ -80,6 +86,10 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
                 "--dashboard-host=0.0.0.0",
                 f"--dashboard-port={RAY_DASHBOARD_PORT}",
                 f"--port={RAY_PORT}",
+                f"--ray-client-server-port={RAY_CLIENT_SERVER_PORT}",
+                f"--metrics-export-port={RAY_METRICS_EXPORT_PORT}",
+                f"--min-worker-port={RAY_MIN_WORKER_PORT}",
+                f"--max-worker-port={RAY_MAX_WORKER_PORT}",
                 "--disable-usage-stats",
             ]
         )
@@ -109,6 +119,9 @@ def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
             f"--node-ip-address={node_ip_addr}",
             "--address",
             f"{main_node_addr}:{RAY_PORT}",
+            f"--metrics-export-port={RAY_METRICS_EXPORT_PORT}",
+            f"--min-worker-port={RAY_MIN_WORKER_PORT}",
+            f"--max-worker-port={RAY_MAX_WORKER_PORT}",
             "--disable-usage-stats",
         ]
     )
@@ -173,7 +186,7 @@ def _ensure_bootstrap_checkpoint(cfg, hf_model_path: str):
     ]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{MILES_SRC_PATH}:/root:/root/Megatron-LM" + (
+    env["PYTHONPATH"] = f"/root/miles_overrides:{MILES_SRC_PATH}:/root:/root/Megatron-LM" + (
         f":{existing_pythonpath}" if existing_pythonpath else ""
     )
     env["MASTER_ADDR"] = "127.0.0.1"
@@ -185,6 +198,20 @@ def _ensure_bootstrap_checkpoint(cfg, hf_model_path: str):
     print(f"Converting {cfg.model_id} into Megatron checkpoint at {bootstrap_path}")
     subprocess.run(cmd, check=True, env=env)
     checkpoints_volume.commit()
+
+
+def _install_runtime_overrides():
+    overrides = [
+        (
+            MILES_OVERRIDES_PATH / "miles" / "router" / "session" / "sessions.py",
+            MILES_SRC_PATH / "miles" / "router" / "session" / "sessions.py",
+        )
+    ]
+    for source, target in overrides:
+        if not source.exists():
+            raise FileNotFoundError(f"Missing override source: {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 def generate_miles_cmd(config, master_addr: str) -> tuple[str, dict]:
@@ -201,7 +228,7 @@ def generate_miles_cmd(config, master_addr: str) -> tuple[str, dict]:
         )
 
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
-    pythonpath = f"{MILES_SRC_PATH}:/root:/root/Megatron-LM"
+    pythonpath = f"/root/miles_overrides:{MILES_SRC_PATH}:/root:/root/Megatron-LM"
     if existing_pythonpath:
         pythonpath = f"{pythonpath}:{existing_pythonpath}"
 
@@ -255,6 +282,7 @@ def inspect_miles_runtime():
 
 
 async def run_training(config, n_nodes: int, master_addr: str):
+    _install_runtime_overrides()
     client = JobSubmissionClient("http://127.0.0.1:8265")
     miles_cmd, runtime_env = generate_miles_cmd(config, master_addr)
 
