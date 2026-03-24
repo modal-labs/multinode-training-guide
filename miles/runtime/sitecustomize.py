@@ -1,0 +1,4 @@
+from transformers_compat import register_transformers_compat
+
+
+register_transformers_compat()
