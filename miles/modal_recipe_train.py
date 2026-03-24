@@ -500,6 +500,46 @@ def prepare_dataset(
     print(f"Prepared dataset {hf_dataset} under {output_dir}")
 
 
+@app.function(
+    image=image,
+    timeout=30 * 60,
+)
+def inspect_bridge_support():
+    import inspect
+    import sys
+    import transformers
+    from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+    from megatron.bridge.models.conversion import model_bridge
+
+    sys.path.insert(0, REMOTE_RUNTIME_DIR.as_posix())
+    from transformers_compat import register_transformers_compat
+
+    register_transformers_compat()
+
+    print("AutoBridge._validate_config:")
+    print(inspect.getsource(AutoBridge._validate_config))
+    print("AutoBridge.from_hf_pretrained:")
+    print(inspect.getsource(AutoBridge.from_hf_pretrained))
+    registry = getattr(model_bridge.get_model_bridge, "_exact_types", {})
+    glm_keys = [key for key in registry.keys() if "Glm4" in str(key)]
+    print(f"Registry GLM keys: {glm_keys}")
+    glm4_moe_lite = getattr(transformers, "Glm4MoeLiteForCausalLM", None)
+    print(f"transformers.Glm4MoeLiteForCausalLM: {glm4_moe_lite}")
+    if glm4_moe_lite is not None:
+        print(f"Registry entry for lite class: {registry.get(glm4_moe_lite)}")
+        print(
+            "Registry entry for lite class name: "
+            f"{registry.get(getattr(glm4_moe_lite, '__name__', 'Glm4MoeLiteForCausalLM'))}"
+        )
+
+    try:
+        from megatron.bridge.models.glm.glm45_bridge import MegatronGLM4Bridge
+
+        print(f"MegatronGLM4Bridge: {MegatronGLM4Bridge}")
+    except Exception as exc:
+        print(f"Failed to import MegatronGLM4Bridge: {exc!r}")
+
+
 @app.local_entrypoint()
 def main(
     recipe: str = "glm4-7-flash-lora",

@@ -25,6 +25,41 @@ def _register_glm4_moe_lite() -> None:
     AutoConfig.register("glm4_moe_lite", glm4_moe_lite_compat, exist_ok=True)
 
 
+def _register_megatron_bridge_glm4_moe_lite_alias() -> None:
+    try:
+        import transformers
+        from megatron.bridge.models.conversion import model_bridge
+    except Exception:
+        return
+
+    try:
+        glm4_moe = getattr(transformers, "Glm4MoeForCausalLM")
+    except AttributeError:
+        return
+
+    glm4_moe_lite = getattr(transformers, "Glm4MoeLiteForCausalLM", None)
+    if glm4_moe_lite is None:
+        glm4_moe_lite = glm4_moe
+        setattr(transformers, "Glm4MoeLiteForCausalLM", glm4_moe_lite)
+
+    get_bridge = getattr(model_bridge, "get_model_bridge", None)
+    registry = getattr(get_bridge, "_exact_types", None)
+    if registry is None:
+        return
+
+    bridge = (
+        registry.get(glm4_moe)
+        or registry.get(getattr(glm4_moe, "__name__", None))
+        or registry.get("Glm4MoeForCausalLM")
+    )
+    if bridge is None:
+        return
+
+    registry[glm4_moe_lite] = bridge
+    registry[getattr(glm4_moe_lite, "__name__", "Glm4MoeLiteForCausalLM")] = bridge
+    registry["Glm4MoeLiteForCausalLM"] = bridge
+
+
 def _deepseek_ffn_hidden_size(config, layer_idx: int) -> int:
     first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
     if layer_idx < first_k_dense_replace:
@@ -103,4 +138,5 @@ def _register_sglang_glm_lora_hidden_dims() -> None:
 
 def register_transformers_compat() -> None:
     _register_glm4_moe_lite()
+    _register_megatron_bridge_glm4_moe_lite_alias()
     _register_sglang_glm_lora_hidden_dims()
