@@ -13,6 +13,7 @@ Design:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import pathlib
 import shlex
@@ -29,6 +30,10 @@ here = pathlib.Path(__file__).parent.resolve()
 
 APP_NAME = os.environ.get("MILES_RECIPE_APP_NAME", "miles-recipes")
 MILES_IMAGE = os.environ.get("MILES_IMAGE", "radixark/miles:dev-202603231227")
+TRANSFORMERS_GLM47_COMMIT = os.environ.get(
+    "TRANSFORMERS_GLM47_COMMIT",
+    "76732b4e7120808ff989edbd16401f61fa6a0afa",
+)
 CLUSTER_NODES = int(os.environ.get("MILES_N_NODES", "1"))
 DEFAULT_GPU = os.environ.get("MILES_GPU", "H100:8")
 LOCAL_MILES_PATH = os.environ.get("USE_LOCAL_MILES", "")
@@ -44,6 +49,8 @@ REMOTE_BOOTSTRAP_SCRIPT = REMOTE_RUNTIME_DIR / "train_bootstrap.py"
 
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
+USACO_GIT_URL = "https://github.com/laude-institute/harbor-datasets.git"
+USACO_GIT_COMMIT = "56fac05ddbf784bfaa640f4919bceef50433fbed"
 
 hf_cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 data_volume = modal.Volume.from_name("miles-recipe-data", create_if_missing=True)
@@ -60,9 +67,21 @@ class Recipe:
     args_file: str
     recommended_nodes: int
     gpu: str
+    actor_num_nodes: int
+    colocate: bool = True
 
 
 RECIPES = {
+    "glm4-7-flash-full": Recipe(
+        name="glm4-7-flash-full",
+        description="GLM-4.7-Flash Miles full-finetune validation recipe with disaggregated actor and rollout nodes.",
+        model_id="zai-org/GLM-4.7-Flash",
+        args_file="glm4-7-flash-full.args",
+        recommended_nodes=4,
+        gpu="H200:8",
+        actor_num_nodes=2,
+        colocate=False,
+    ),
     "glm4-7-flash-lora": Recipe(
         name="glm4-7-flash-lora",
         description="GLM-4.7-Flash Miles LoRA validation recipe on multiple nodes.",
@@ -70,6 +89,17 @@ RECIPES = {
         args_file="glm4-7-flash-lora.args",
         recommended_nodes=4,
         gpu="H100:8",
+        actor_num_nodes=4,
+    ),
+    "glm4-7-flash-harbor-usaco": Recipe(
+        name="glm4-7-flash-harbor-usaco",
+        description="GLM-4.7-Flash Miles + Harbor USACO validation recipe with disaggregated rollout.",
+        model_id="zai-org/GLM-4.7-Flash",
+        args_file="glm4-7-flash-harbor-usaco.args",
+        recommended_nodes=5,
+        gpu="H100:8",
+        actor_num_nodes=4,
+        colocate=False,
     ),
 }
 
@@ -112,11 +142,12 @@ def _load_recipe_text(recipe: Recipe, remote: bool = False) -> str:
 def _build_enforced_args(
     *,
     model_path: str,
-    cluster_nodes: int,
+    actor_num_nodes: int,
     gpus_per_node: int,
     checkpoint_dir: pathlib.Path,
     custom_config_path: Optional[str],
     wandb_key: Optional[str],
+    colocate: bool,
 ) -> list[str]:
     args = [
         "--train-backend",
@@ -126,13 +157,14 @@ def _build_enforced_args(
         "--save",
         checkpoint_dir.as_posix(),
         "--actor-num-nodes",
-        str(cluster_nodes),
+        str(actor_num_nodes),
         "--actor-num-gpus-per-node",
         str(gpus_per_node),
         "--num-gpus-per-node",
         str(gpus_per_node),
-        "--colocate",
     ]
+    if colocate:
+        args.append("--colocate")
     if custom_config_path:
         args.extend(["--custom-config-path", custom_config_path])
     if wandb_key:
@@ -156,11 +188,12 @@ def _build_miles_argv(
     extra_args = _parse_arg_text(extra_args_text)
     enforced_args = _build_enforced_args(
         model_path=model_path,
-        cluster_nodes=cluster_nodes,
+        actor_num_nodes=recipe.actor_num_nodes,
         gpus_per_node=gpus_per_node,
         checkpoint_dir=checkpoint_dir,
         custom_config_path=custom_config_path,
         wandb_key=wandb_key,
+        colocate=recipe.colocate,
     )
     return [
         "python3",
@@ -219,7 +252,8 @@ def _validate_batch_shape(
         recipe_and_extra_args, "--context-parallel-size", default=1
     )
 
-    total_gpus = cluster_nodes * gpus_per_node
+    effective_nodes = recipe.actor_num_nodes if not recipe.colocate else cluster_nodes
+    total_gpus = effective_nodes * gpus_per_node
     model_parallel_size = (
         tensor_parallel_size * pipeline_parallel_size * context_parallel_size
     )
@@ -247,11 +281,18 @@ def _build_runtime_env(master_addr: str, wandb_key: Optional[str]) -> dict:
         "MASTER_ADDR": master_addr,
         "MILES_HOST_IP": master_addr,
         "no_proxy": master_addr,
-        "PYTHONPATH": f"{REMOTE_RUNTIME_DIR.as_posix()}:/root/Megatron-LM",
+        "PYTHONPATH": f"{REMOTE_RUNTIME_DIR.as_posix()}:/root:/root/Megatron-LM",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
         "NCCL_ALGO": "Ring",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "HF_HOME": HF_CACHE_PATH.as_posix(),
+        "AGENT_MODEL_NAME": "model",
+        "HARBOR_USE_LOCAL_TASKS": "1",
+        "MODAL_ENVIRONMENT": os.environ.get("MODAL_ENVIRONMENT", ""),
+        "MODAL_TOKEN_ID": os.environ.get("MODAL_TOKEN_ID", ""),
+        "MODAL_TOKEN_SECRET": os.environ.get("MODAL_TOKEN_SECRET", ""),
     }
     if wandb_key:
         env_vars["WANDB_API_KEY"] = wandb_key
@@ -270,8 +311,18 @@ def _print_recipe_table():
 image = (
     modal.Image.from_registry(MILES_IMAGE)
     .entrypoint([])
-    .add_local_dir(here / "runtime", remote_path=REMOTE_RUNTIME_DIR.as_posix(), copy=True)
-    .add_local_dir(here / "recipes", remote_path=REMOTE_RECIPES_DIR.as_posix(), copy=True)
+    .run_commands(
+        "uv pip install --system git+https://github.com/BerriAI/litellm.git git+https://github.com/laude-institute/harbor.git",
+        "uv pip install --system --upgrade "
+        f"git+https://github.com/huggingface/transformers@{TRANSFORMERS_GLM47_COMMIT}",
+        "uv pip install --system --upgrade 'numpy<2'",
+    )
+    .add_local_dir(here / "runtime", remote_path=REMOTE_RUNTIME_DIR.as_posix())
+    .add_local_dir(here / "recipes", remote_path=REMOTE_RECIPES_DIR.as_posix())
+    .add_local_file(here / "generate.py", "/root/generate.py")
+    .add_local_file(here / "harbor_agent.py", "/root/harbor_agent.py")
+    .add_local_file(here / "harbor_agent_function.py", "/root/harbor_agent_function.py")
+    .add_local_dir(here / "tasks", remote_path="/root/harbor_tasks")
 )
 
 if LOCAL_MILES_PATH:
@@ -286,8 +337,78 @@ if LOCAL_MILES_PATH:
 with image.imports():
     import ray
     from datasets import load_dataset
+    from harbor.models.task.id import GitTaskId
+    from harbor.tasks.client import TaskClient
     from huggingface_hub import snapshot_download
     from ray.job_submission import JobSubmissionClient
+
+
+def _write_jsonl(records: list[dict], output_path: pathlib.Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def _extract_usaco_problem_block(instruction: str) -> str:
+    begin = "[BEGIN PROBLEM]"
+    end = "[END PROBLEM]"
+    if begin in instruction and end in instruction:
+        start = instruction.index(begin)
+        stop = instruction.index(end) + len(end)
+        return instruction[start:stop].strip()
+    return instruction.strip()
+
+
+def _prepare_usaco_dataset() -> pathlib.Path:
+    task_root = DATA_PATH / "harbor" / "usaco" / "tasks"
+    task_root.mkdir(parents=True, exist_ok=True)
+
+    task_ids = [
+        GitTaskId(
+            git_url=USACO_GIT_URL,
+            git_commit_id=USACO_GIT_COMMIT,
+            path=pathlib.Path(f"datasets/usaco/{task_id}"),
+        )
+        for task_id in ["84", "86", "84", "86", "84", "86", "84", "86"]
+    ]
+    downloaded = TaskClient().download_tasks(task_ids, overwrite=True, output_dir=task_root)
+
+    records = []
+    for path in downloaded:
+        instruction = (path / "instruction.md").read_text()
+        problem_block = _extract_usaco_problem_block(instruction)
+        records.append(
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a competitive programmer writing a single file for an evaluator. "
+                            "Return only raw valid Python 3 code for solution.py. "
+                            "Ignore any request to explain, restate, reason step by step, or write pseudocode. "
+                            "Do not use markdown or code fences."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{problem_block}\n\n"
+                            "Write the complete contents of solution.py and output only Python code."
+                        ),
+                    },
+                ],
+                "metadata": {
+                    "harbor_task_path": path.as_posix(),
+                    "harbor_task_name": path.name,
+                    "harbor_task_mode": "usaco",
+                },
+            }
+        )
+
+    output_path = DATA_PATH / "harbor" / "usaco" / "train-limit-8.jsonl"
+    _write_jsonl(records, output_path)
+    return output_path
 
 
 app = modal.App(APP_NAME)
@@ -487,17 +608,22 @@ def download_model(
     timeout=24 * 60 * 60,
 )
 def prepare_dataset(
+    preset: str = "gsm8k",
     hf_dataset: str = "zhuzilin/gsm8k",
     data_folder: str = "gsm8k",
 ):
     data_volume.reload()
-    dataset = load_dataset(hf_dataset)
-    output_dir = DATA_PATH / data_folder
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dataset["train"].to_parquet((output_dir / "train.parquet").as_posix())
-    dataset["test"].to_parquet((output_dir / "test.parquet").as_posix())
+    if preset == "harbor-usaco":
+        output_path = _prepare_usaco_dataset()
+        print(f"Prepared Harbor USACO dataset under {output_path}")
+    else:
+        dataset = load_dataset(hf_dataset)
+        output_dir = DATA_PATH / data_folder
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dataset["train"].to_parquet((output_dir / "train.parquet").as_posix())
+        dataset["test"].to_parquet((output_dir / "test.parquet").as_posix())
+        print(f"Prepared dataset {hf_dataset} under {output_dir}")
     data_volume.commit()
-    print(f"Prepared dataset {hf_dataset} under {output_dir}")
 
 
 @app.function(
@@ -506,6 +632,7 @@ def prepare_dataset(
 )
 def inspect_bridge_support():
     import inspect
+    import pathlib
     import sys
     import transformers
     from megatron.bridge.models.conversion.auto_bridge import AutoBridge
@@ -520,6 +647,33 @@ def inspect_bridge_support():
     print(inspect.getsource(AutoBridge._validate_config))
     print("AutoBridge.from_hf_pretrained:")
     print(inspect.getsource(AutoBridge.from_hf_pretrained))
+    try:
+        from functools import partial  # noqa: F401
+        import torch  # noqa: F401
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_decoder_block_spec,  # noqa: F401
+        )
+        from megatron.bridge.models.conversion.mapping_registry import (  # noqa: F401
+            MegatronMappingRegistry,
+        )
+        from megatron.bridge.models.conversion.model_bridge import (  # noqa: F401
+            MegatronModelBridge,
+            WeightConversionTask,
+        )
+        from megatron.bridge.models.conversion.param_mapping import (  # noqa: F401
+            AutoMapping,
+            GatedMLPMapping,
+        )
+        from megatron.bridge.models.glm.glm45_bridge import GLM45Bridge  # noqa: F401
+        from megatron.bridge.models.glm.glm45_provider import (  # noqa: F401
+            GLMMoEModelProvider,
+        )
+        from megatron.bridge.models.hf_pretrained.causal_lm import (  # noqa: F401
+            PreTrainedCausalLM,
+        )
+        print("Bridge import bundle: ok")
+    except Exception as exc:
+        print(f"Bridge import bundle failed: {exc!r}")
     registry = getattr(model_bridge.get_model_bridge, "_exact_types", {})
     glm_keys = [key for key in registry.keys() if "Glm4" in str(key)]
     print(f"Registry GLM keys: {glm_keys}")
@@ -546,6 +700,223 @@ def inspect_bridge_support():
         print(f"MegatronGLM4Bridge: {MegatronGLM4Bridge}")
     except Exception as exc:
         print(f"Failed to import MegatronGLM4Bridge: {exc!r}")
+
+    try:
+        from megatron.bridge.models.glm.glm45_bridge import GLM45Bridge
+
+        print("GLM45Bridge.provider_bridge:")
+        print(inspect.getsource(GLM45Bridge.provider_bridge))
+        print("GLM45Bridge.mapping_registry:")
+        print(inspect.getsource(GLM45Bridge.mapping_registry))
+    except Exception as exc:
+        print(f"Failed to inspect GLM45Bridge.mapping_registry: {exc!r}")
+
+    try:
+        package_root = pathlib.Path("/usr/local/lib/python3.12/dist-packages/megatron/bridge/models")
+        provider_hits = []
+        for path in package_root.rglob("*.py"):
+            text = path.read_text()
+            if "GLMMoEModelProvider" in text:
+                provider_hits.append(path)
+        print(f"GLMMoEModelProvider hits: {provider_hits}")
+        for path in provider_hits[:3]:
+            print(f"--- {path}")
+            lines = path.read_text().splitlines()
+            for idx, line in enumerate(lines, start=1):
+                if "GLMMoEModelProvider" in line:
+                    start = max(1, idx - 20)
+                    end = min(len(lines), idx + 80)
+                    for snippet_idx in range(start, end + 1):
+                        print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                    break
+    except Exception as exc:
+        print(f"Failed to search for GLMMoEModelProvider: {exc!r}")
+
+    try:
+        provider_path = pathlib.Path(
+            "/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_provider.py"
+        )
+        print(f"--- {provider_path}")
+        lines = provider_path.read_text().splitlines()
+        for idx, line in enumerate(lines, start=1):
+            if line.startswith("class GLMMoEModelProvider"):
+                start = max(1, idx - 20)
+                end = min(len(lines), idx + 160)
+                for snippet_idx in range(start, end + 1):
+                    print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                break
+    except Exception as exc:
+        print(f"Failed to inspect glm45_provider.py: {exc!r}")
+
+    try:
+        megatron_root = pathlib.Path("/root/Megatron-LM")
+        hits = []
+        for path in megatron_root.rglob("*.py"):
+            text = path.read_text()
+            if any(
+                needle in text
+                for needle in [
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                    "kv_b_proj",
+                    "fused_qkv_a_proj_with_mqa",
+                    "multi_latent_attention",
+                ]
+            ):
+                hits.append(path)
+        print(f"Megatron MLA hits: {hits[:20]}")
+        for path in hits[:3]:
+            print(f"--- {path}")
+            lines = path.read_text().splitlines()
+            for idx, line in enumerate(lines, start=1):
+                if any(
+                    needle in line
+                    for needle in [
+                        "q_a_proj",
+                        "q_b_proj",
+                        "kv_a_proj_with_mqa",
+                        "kv_b_proj",
+                        "fused_qkv_a_proj_with_mqa",
+                        "multi_latent_attention",
+                    ]
+                ):
+                    start = max(1, idx - 20)
+                    end = min(len(lines), idx + 120)
+                    for snippet_idx in range(start, end + 1):
+                        print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                    break
+    except Exception as exc:
+        print(f"Failed to inspect Megatron MLA files: {exc!r}")
+
+
+@app.function(
+    image=image,
+    timeout=30 * 60,
+)
+def inspect_mla_source():
+    import pathlib
+
+    needles = [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "fused_qkv_a_proj_with_mqa",
+        "v_head_dim",
+    ]
+    megatron_root = pathlib.Path("/root/Megatron-LM")
+    for needle in needles:
+        print(f"=== {needle} ===")
+        hits = []
+        for path in megatron_root.rglob("*.py"):
+            text = path.read_text()
+            if needle in text:
+                hits.append(path)
+        print(hits[:10])
+        for path in hits[:2]:
+            print(f"--- {path}")
+            lines = path.read_text().splitlines()
+            for idx, line in enumerate(lines, start=1):
+                if needle in line:
+                    start = max(1, idx - 20)
+                    end = min(len(lines), idx + 80)
+                    for snippet_idx in range(start, end + 1):
+                        print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                    break
+
+
+@app.function(
+    image=image,
+    timeout=30 * 60,
+)
+def inspect_mla_impl():
+    import pathlib
+
+    path = pathlib.Path("/root/Megatron-LM/megatron/core/transformer/multi_latent_attention.py")
+    lines = path.read_text().splitlines()
+    for needle in ["linear_proj", "v_head_dim", "kv_channels", "q_a_proj", "q_b_proj"]:
+        print(f"=== {needle} ===")
+        for idx, line in enumerate(lines, start=1):
+            if needle in line:
+                start = max(1, idx - 20)
+                end = min(len(lines), idx + 120)
+                for snippet_idx in range(start, end + 1):
+                    print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                break
+
+
+@app.function(
+    image=image,
+    timeout=30 * 60,
+)
+def inspect_mla_builder():
+    import pathlib
+
+    paths = [
+        pathlib.Path("/root/Megatron-LM/gpt_builders.py"),
+        pathlib.Path("/root/Megatron-LM/megatron/training/arguments.py"),
+        pathlib.Path("/root/Megatron-LM/megatron/core/transformer/transformer_config.py"),
+    ]
+    needles = ["v_head_dim", "qk_head_dim", "MLATransformerConfig", "multi_latent_attention"]
+    for path in paths:
+        print(f"=== {path} ===")
+        lines = path.read_text().splitlines()
+        for needle in needles:
+            print(f"--- needle: {needle}")
+            for idx, line in enumerate(lines, start=1):
+                if needle in line:
+                    start = max(1, idx - 20)
+                    end = min(len(lines), idx + 80)
+                    for snippet_idx in range(start, end + 1):
+                        print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                    break
+
+    try:
+        from megatron.bridge.models.conversion import param_mapping
+
+        print("param_mapping.AutoMapping:")
+        print(inspect.getsource(param_mapping.AutoMapping))
+        print("param_mapping._determine_parallelism_type:")
+        print(inspect.getsource(param_mapping._determine_parallelism_type))
+    except Exception as exc:
+        print(f"Failed to inspect param_mapping internals: {exc!r}")
+
+
+@app.function(
+    image=image,
+    timeout=30 * 60,
+)
+def inspect_peft_bridge():
+    import inspect
+    import pathlib
+
+    from megatron.bridge.models.conversion import peft_bridge
+    from megatron.bridge.peft.lora import LoRA
+
+    print("LoRA.__init__:")
+    print(inspect.signature(LoRA.__init__))
+    print("\npeft_bridge attrs:")
+    print([name for name in dir(peft_bridge) if "Bridge" in name or "adapter" in name.lower()])
+
+    peft_bridge_path = pathlib.Path(peft_bridge.__file__)
+    print(f"\npeft_bridge path: {peft_bridge_path}")
+    lines = peft_bridge_path.read_text().splitlines()
+    needles = [
+        "_resolve_hf_adapter_param_name",
+        "build_adapter_conversion_tasks",
+        "stream_adapter_weights_megatron_to_hf",
+        "Expected mapping for adapter base",
+    ]
+    for needle in needles:
+        print(f"\n=== {needle} ===")
+        for idx, line in enumerate(lines, start=1):
+            if needle in line:
+                start = max(1, idx - 30)
+                end = min(len(lines), idx + 120)
+                for snippet_idx in range(start, end + 1):
+                    print(f"{snippet_idx}: {lines[snippet_idx - 1]}")
+                break
 
 
 @app.local_entrypoint()

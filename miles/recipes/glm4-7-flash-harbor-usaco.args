@@ -1,4 +1,4 @@
-# GLM-4.7-Flash LoRA validation recipe.
+# GLM-4.7-Flash Harbor USACO validation recipe.
 
 # Model architecture from the upstream Miles model script.
 --moe-layer-freq "[0]*1+[1]*46"
@@ -28,6 +28,7 @@
 --position-embedding-type rope
 --no-position-embedding
 --normalization RMSNorm
+--norm-epsilon 1e-5
 --qk-layernorm
 --multi-latent-attention
 --q-lora-rank 768
@@ -39,37 +40,25 @@
 --vocab-size 154880
 --rotary-base 1000000
 --no-rope-fusion
---mtp-num-layers 1
+--mtp-num-layers 0
 
 # Checkpoint conversion
 --megatron-to-hf-mode bridge
 
-# LoRA
---lora-rank 32
---lora-alpha 32
---lora-dropout 0.0
---target-modules q_a_proj,q_b_proj,kv_a_proj_with_mqa,kv_b_proj,o_proj,gate_proj,up_proj,down_proj
-
-# Data and rollout
---prompt-data /data/gsm8k/train.parquet
+# Harbor dataset and rollout hooks
+--prompt-data /data/harbor/usaco/train-limit-8.jsonl
 --input-key messages
---label-key label
 --apply-chat-template
 --rollout-shuffle
---rm-type math
---num-rollout 100
+--rollout-max-response-len 256
+--rollout-temperature 0.0
+--custom-rm-path generate.reward_func
+--rollout-function-path generate.RolloutFn
+--update-weights-interval 1
+--num-rollout 8
 --rollout-batch-size 8
---n-samples-per-prompt 8
---rollout-max-response-len 2048
---rollout-temperature 1
---global-batch-size 64
-
-# Evaluation
---eval-interval 10
---eval-prompt-data gsm8k /data/gsm8k/test.parquet
---n-samples-per-eval-prompt 2
---eval-max-response-len 4096
---eval-top-k 1
+--n-samples-per-prompt 1
+--global-batch-size 8
 
 # Parallelism and performance
 --tensor-model-parallel-size 4
@@ -78,11 +67,19 @@
 --context-parallel-size 1
 --expert-model-parallel-size 8
 --expert-tensor-parallel-size 1
+--rollout-num-gpus 8
+--rollout-num-gpus-per-engine 4
 --recompute-granularity full
 --recompute-method uniform
 --recompute-num-layers 1
 --use-dynamic-batch-size
---max-tokens-per-gpu 32768
+--max-tokens-per-gpu 8192
+--sglang-mem-fraction-static 0.8
+--use-miles-router
+--sglang-router-port 30000
+--rollout-health-check-interval 5
+--rollout-health-check-timeout 10
+--rollout-health-check-first-wait 0
 
 # GRPO
 --advantage-estimator grpo
@@ -101,11 +98,6 @@
 --adam-beta1 0.9
 --adam-beta2 0.98
 
-# Rollout serving
---rollout-num-gpus-per-engine 4
---sglang-mem-fraction-static 0.7
---use-rollout-routing-replay
-
 # Training runtime
 --attention-dropout 0.0
 --hidden-dropout 0.0
@@ -113,11 +105,6 @@
 --attention-softmax-in-fp32
 --attention-backend flash
 --calculate-per-token-loss
---use-miles-router
 --use-fault-tolerance
---save-interval 25
-
-# Logging defaults
---wandb-project miles-modal
---wandb-group glm4-7-flash-lora
---disable-wandb-random-suffix
+--save-interval 1
+--no-save-optim

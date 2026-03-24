@@ -14,6 +14,7 @@ class RLConfig:
     model_id: str
     miles_model_name: str
     model_args: str
+    use_ref_load: bool = True
 
     app_name: str = "miles-harbor"
     n_nodes: int = 1
@@ -59,12 +60,14 @@ class RLConfig:
 
     def generate_train_args(self, hf_model_path: str, data_path: Path, checkpoints_path: Path) -> str:
         cleaned_model_args = self._clean_args(self.model_args)
-        ref_load_path = self.bootstrap_checkpoint_path(checkpoints_path)
-        base_args = (
-            f"--hf-checkpoint {hf_model_path} "
-            f"--ref-load {ref_load_path} "
-            f"--model-name {self.miles_model_name}"
-        )
+        base_args_parts = [
+            f"--hf-checkpoint {hf_model_path}",
+            f"--model-name {self.miles_model_name}",
+        ]
+        if self.use_ref_load:
+            ref_load_path = self.bootstrap_checkpoint_path(checkpoints_path)
+            base_args_parts.append(f"--ref-load {ref_load_path}")
+        base_args = " ".join(base_args_parts)
 
         cleaned = self._clean_args(self.miles_args)
         cleaned = cleaned.replace("{data_path}", str(data_path))
@@ -108,6 +111,49 @@ QWEN3_1_7B_MODEL_ARGS = """
     --vocab-size 151936
     --kv-channels 128
     --qk-layernorm
+"""
+
+GLM4_7_FLASH_MODEL_ARGS = """
+    --moe-layer-freq "[0]*1+[1]*46"
+    --num-experts 64
+    --moe-shared-expert-intermediate-size 1536
+    --moe-router-topk 4
+    --moe-grouped-gemm
+    --moe-permute-fusion
+    --moe-ffn-hidden-size 1536
+    --moe-router-score-function sigmoid
+    --moe-router-pre-softmax
+    --moe-router-enable-expert-bias
+    --moe-router-bias-update-rate 0
+    --moe-router-load-balancing-type seq_aux_loss
+    --moe-router-topk-scaling-factor 1.8
+    --moe-aux-loss-coeff 0
+    --moe-router-dtype fp32
+    --make-vocab-size-divisible-by 64
+    --num-layers 47
+    --hidden-size 2048
+    --ffn-hidden-size 10240
+    --num-attention-heads 20
+    --disable-bias-linear
+    --add-qkv-bias
+    --swiglu
+    --untie-embeddings-and-output-weights
+    --position-embedding-type rope
+    --no-position-embedding
+    --normalization RMSNorm
+    --qk-layernorm
+    --multi-latent-attention
+    --q-lora-rank 768
+    --kv-lora-rank 512
+    --qk-head-dim 192
+    --v-head-dim 256
+    --kv-channels 192
+    --qk-pos-emb-head-dim 64
+    --vocab-size 154880
+    --rotary-base 1000000
+    --no-rope-fusion
+    --mtp-num-layers 0
+    --megatron-to-hf-mode bridge
 """
 
 DEFAULT_PERF_ARGS = """

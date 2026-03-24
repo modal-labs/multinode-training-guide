@@ -20,12 +20,13 @@ here = Path(__file__).parent
 MILES_GIT_COMMIT = "6e9151cc4fc02dfbf3b2271e5cd070c3e9c8ac55"
 MILES_SRC_PATH = Path("/root/miles-src")
 MILES_OVERRIDES_PATH = Path("/root/miles_overrides")
+MILES_RUNTIME_PATH = Path("/root/miles_runtime")
+TRANSFORMERS_GLM47_COMMIT = "76732b4e7120808ff989edbd16401f61fa6a0afa"
 
 image = (
     modal.Image.from_registry("radixark/miles:latest")
+    .add_local_dir(here / "runtime", remote_path=MILES_RUNTIME_PATH.as_posix(), copy=True)
     .run_commands(
-        "python -m ensurepip || true",
-        "python -m pip install --upgrade pip",
         "uv pip install --system git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps",
         "uv pip install --system 'nvidia-modelopt[torch]>=0.37.0' --no-build-isolation",
         "uv pip install --system git+https://github.com/yushengsu-thu/Megatron-Bridge.git@merged-megatron-0.16.0rc0-miles --no-deps --no-build-isolation",
@@ -33,6 +34,10 @@ image = (
         f"cd {MILES_SRC_PATH} && git checkout {MILES_GIT_COMMIT}",
         f"cd {MILES_SRC_PATH} && uv pip install --system -e .",
         "uv pip install --system git+https://github.com/BerriAI/litellm.git git+https://github.com/laude-institute/harbor.git",
+        f"uv pip install --system --upgrade git+https://github.com/huggingface/transformers@{TRANSFORMERS_GLM47_COMMIT}",
+        "uv pip install --system --upgrade 'numpy<2'",
+        "cp /root/miles_runtime/transformers_compat.py /usr/local/lib/python3.12/dist-packages/transformers_compat.py",
+        "cp /root/miles_runtime/sitecustomize.py /usr/local/lib/python3.12/dist-packages/sitecustomize.py",
     )
     .entrypoint([])
     .add_local_dir(here / "configs", remote_path="/root/configs", copy=True)
@@ -66,7 +71,7 @@ RAY_METRICS_EXPORT_PORT = 20000
 RAY_MIN_WORKER_PORT = 20001
 RAY_MAX_WORKER_PORT = 29999
 SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
-MULTI_NODE_COUNT = 2
+MULTI_NODE_COUNT = int(os.environ.get("MILES_N_NODES", "2"))
 
 APP_NAME = os.environ.get("MILES_APP_NAME", "miles-harbor")
 app = modal.App(APP_NAME)
@@ -186,8 +191,11 @@ def _ensure_bootstrap_checkpoint(cfg, hf_model_path: str):
     ]
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"/root/miles_overrides:{MILES_SRC_PATH}:/root:/root/Megatron-LM" + (
+    env["PYTHONPATH"] = (
+        f"{MILES_RUNTIME_PATH}:/root/miles_overrides:{MILES_SRC_PATH}:/root:/root/Megatron-LM"
+        + (
         f":{existing_pythonpath}" if existing_pythonpath else ""
+        )
     )
     env["MASTER_ADDR"] = "127.0.0.1"
     env["MASTER_PORT"] = env.get("MASTER_PORT", "12355")
@@ -228,7 +236,7 @@ def generate_miles_cmd(config, master_addr: str) -> tuple[str, dict]:
         )
 
     existing_pythonpath = os.environ.get("PYTHONPATH", "")
-    pythonpath = f"/root/miles_overrides:{MILES_SRC_PATH}:/root:/root/Megatron-LM"
+    pythonpath = f"{MILES_RUNTIME_PATH}:/root/miles_overrides:{MILES_SRC_PATH}:/root:/root/Megatron-LM"
     if existing_pythonpath:
         pythonpath = f"{pythonpath}:{existing_pythonpath}"
 
@@ -250,7 +258,8 @@ def generate_miles_cmd(config, master_addr: str) -> tuple[str, dict]:
         }
     }
 
-    return f"python3 {train_script} {train_args}", runtime_env
+    bootstrap = MILES_RUNTIME_PATH / "train_bootstrap.py"
+    return f"python3 {bootstrap} {train_script} {train_args}", runtime_env
 
 
 @app.function(
@@ -371,7 +380,8 @@ def download_model(config: str = "hello-qwen-0-6b", revision: Optional[str] = No
     cfg = get_config(config)
     checkpoints_volume.reload()
     path = snapshot_download(repo_id=cfg.model_id, revision=revision)
-    _ensure_bootstrap_checkpoint(cfg, path)
+    if cfg.use_ref_load:
+        _ensure_bootstrap_checkpoint(cfg, path)
     print(f"Model downloaded to {path}")
     hf_cache_volume.commit()
 
@@ -447,9 +457,6 @@ async def train_multi_node(config: str = "usaco-qwen-0-6b", sync: bool = False):
     from configs import get_config
 
     cfg = get_config(config, sync)
-    if cfg.n_nodes != MULTI_NODE_COUNT:
-        raise ValueError(f"Config {config} expects {cfg.n_nodes} nodes, but train_multi_node is fixed to {MULTI_NODE_COUNT}.")
-
     await hf_cache_volume.reload.aio()
     await data_volume.reload.aio()
 
@@ -461,6 +468,10 @@ async def train_multi_node(config: str = "usaco-qwen-0-6b", sync: bool = False):
     ray_main_node_addr = cluster_info.container_ipv4_ips[0]
     my_ip_addr = cluster_info.container_ipv4_ips[cluster_info.rank]
     n_nodes = len(cluster_info.container_ipv4_ips)
+    if cfg.n_nodes != n_nodes:
+        raise ValueError(
+            f"Config {config} expects {cfg.n_nodes} nodes, but this clustered run has {n_nodes}."
+        )
 
     _init_ray(cluster_info.rank, ray_main_node_addr, my_ip_addr, n_nodes)
 

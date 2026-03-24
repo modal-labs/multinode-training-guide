@@ -1,4 +1,4 @@
-# GLM-4.7-Flash LoRA validation recipe.
+# GLM-4.7-Flash full-finetune validation recipe.
 
 # Model architecture from the upstream Miles model script.
 --moe-layer-freq "[0]*1+[1]*46"
@@ -39,16 +39,10 @@
 --vocab-size 154880
 --rotary-base 1000000
 --no-rope-fusion
---mtp-num-layers 1
+--mtp-num-layers 0
 
 # Checkpoint conversion
 --megatron-to-hf-mode bridge
-
-# LoRA
---lora-rank 32
---lora-alpha 32
---lora-dropout 0.0
---target-modules q_a_proj,q_b_proj,kv_a_proj_with_mqa,kv_b_proj,o_proj,gate_proj,up_proj,down_proj
 
 # Data and rollout
 --prompt-data /data/gsm8k/train.parquet
@@ -63,13 +57,6 @@
 --rollout-max-response-len 2048
 --rollout-temperature 1
 --global-batch-size 64
-
-# Evaluation
---eval-interval 10
---eval-prompt-data gsm8k /data/gsm8k/test.parquet
---n-samples-per-eval-prompt 2
---eval-max-response-len 4096
---eval-top-k 1
 
 # Parallelism and performance
 --tensor-model-parallel-size 4
@@ -103,8 +90,8 @@
 
 # Rollout serving
 --rollout-num-gpus-per-engine 4
+--rollout-num-gpus 16
 --sglang-mem-fraction-static 0.7
---use-rollout-routing-replay
 
 # Training runtime
 --attention-dropout 0.0
@@ -119,5 +106,5 @@
 
 # Logging defaults
 --wandb-project miles-modal
---wandb-group glm4-7-flash-lora
+--wandb-group glm4-7-flash-full
 --disable-wandb-random-suffix
