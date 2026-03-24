@@ -1,0 +1,119 @@
+# GLM-5 4-layer testing recipe.
+
+# Model architecture from the upstream Miles GLM-5 model script with the 4-layer override.
+--spec miles_plugins.models.glm5.glm5 get_glm5_spec
+--moe-layer-freq "[0]*3+[1]*1"
+--num-experts 256
+--moe-shared-expert-intermediate-size 2048
+--moe-router-topk 8
+--moe-grouped-gemm
+--moe-permute-fusion
+--moe-ffn-hidden-size 2048
+--moe-router-score-function sigmoid
+--moe-router-pre-softmax
+--moe-router-enable-expert-bias
+--moe-router-bias-update-rate 0
+--moe-router-load-balancing-type seq_aux_loss
+--moe-router-topk-scaling-factor 2.5
+--moe-aux-loss-coeff 0
+--moe-router-dtype fp32
+--make-vocab-size-divisible-by 16
+--num-layers 4
+--hidden-size 6144
+--ffn-hidden-size 12288
+--num-attention-heads 64
+--disable-bias-linear
+--swiglu
+--untie-embeddings-and-output-weights
+--position-embedding-type rope
+--no-position-embedding
+--normalization RMSNorm
+--qk-layernorm
+--multi-latent-attention
+--q-lora-rank 2048
+--kv-lora-rank 512
+--qk-head-dim 192
+--v-head-dim 256
+--kv-channels 192
+--qk-pos-emb-head-dim 64
+--vocab-size 154880
+--rotary-base 1000000
+--enable-experimental
+
+# Checkpoint conversion
+--megatron-to-hf-mode bridge
+
+# LoRA
+--lora-rank 32
+--lora-alpha 32
+--lora-dropout 0.0
+--target-modules all-linear
+
+# Data and rollout
+--prompt-data /data/gsm8k/train.parquet
+--input-key messages
+--label-key label
+--apply-chat-template
+--rollout-shuffle
+--rm-type math
+--num-rollout 100
+--rollout-batch-size 4
+--n-samples-per-prompt 8
+--rollout-max-response-len 1024
+--rollout-temperature 1
+--global-batch-size 32
+
+# Evaluation
+--eval-interval 10
+--eval-prompt-data gsm8k /data/gsm8k/test.parquet
+--n-samples-per-eval-prompt 2
+--eval-max-response-len 2048
+--eval-top-k 1
+
+# Parallelism and performance
+--tensor-model-parallel-size 2
+--sequence-parallel
+--pipeline-model-parallel-size 1
+--context-parallel-size 1
+--expert-model-parallel-size 4
+--expert-tensor-parallel-size 1
+--recompute-granularity full
+--recompute-method uniform
+--recompute-num-layers 1
+--use-dynamic-batch-size
+--max-tokens-per-gpu 3072
+
+# GRPO
+--advantage-estimator grpo
+--kl-loss-coef 0.0
+--kl-loss-type low_var_kl
+--kl-coef 0.0
+--entropy-coef 0.0
+--eps-clip 0.2
+--eps-clip-high 0.28
+
+# Optimizer
+--optimizer adam
+--lr 5e-6
+--lr-decay-style constant
+--weight-decay 0.1
+--adam-beta1 0.9
+--adam-beta2 0.98
+
+# Rollout serving
+--rollout-num-gpus-per-engine 1
+--sglang-mem-fraction-static 0.5
+
+# Training runtime
+--attention-dropout 0.0
+--hidden-dropout 0.0
+--accumulate-allreduce-grads-in-fp32
+--attention-softmax-in-fp32
+--calculate-per-token-loss
+--use-miles-router
+--save-interval 25
+
+# Logging defaults
+--wandb-project miles-modal
+--wandb-group glm5-744b-a40b-4layer-lora
+--disable-wandb-random-suffix
