@@ -525,6 +525,14 @@ def inspect_bridge_support():
     print(f"Registry GLM keys: {glm_keys}")
     glm4_moe_lite = getattr(transformers, "Glm4MoeLiteForCausalLM", None)
     print(f"transformers.Glm4MoeLiteForCausalLM: {glm4_moe_lite}")
+    glm4_moe_config = getattr(transformers, "Glm4MoeConfig", None)
+    print(f"transformers.Glm4MoeConfig.head_dim: {getattr(glm4_moe_config, 'head_dim', None)}")
+    try:
+        from megatron.bridge.models.glm import glm45_bridge
+
+        print(f"glm45_bridge exports: {[name for name in dir(glm45_bridge) if 'Bridge' in name]}")
+    except Exception as exc:
+        print(f"Failed to inspect glm45_bridge exports: {exc!r}")
     if glm4_moe_lite is not None:
         print(f"Registry entry for lite class: {registry.get(glm4_moe_lite)}")
         print(

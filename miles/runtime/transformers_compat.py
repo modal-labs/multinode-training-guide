@@ -1,3 +1,34 @@
+def _glm4_moe_head_dim(config) -> int:
+    qk_nope_head_dim = getattr(config, "qk_nope_head_dim", None)
+    if qk_nope_head_dim is not None:
+        return qk_nope_head_dim
+
+    qk_head_dim = getattr(config, "qk_head_dim", None)
+    if qk_head_dim is not None:
+        return qk_head_dim
+
+    v_head_dim = getattr(config, "v_head_dim", None)
+    if v_head_dim is not None:
+        return v_head_dim
+
+    hidden_size = getattr(config, "hidden_size")
+    num_attention_heads = getattr(config, "num_attention_heads")
+    return hidden_size // num_attention_heads
+
+
+def _glm4_moe_qk_head_dim(config) -> int:
+    qk_head_dim = getattr(config, "qk_head_dim", None)
+    if qk_head_dim is not None:
+        return qk_head_dim
+
+    qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
+    qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
+    if qk_nope_head_dim or qk_rope_head_dim:
+        return qk_nope_head_dim + qk_rope_head_dim
+
+    return _glm4_moe_head_dim(config)
+
+
 def _register_glm4_moe_lite() -> None:
     try:
         from transformers import AutoConfig
@@ -15,10 +46,19 @@ def _register_glm4_moe_lite() -> None:
     except Exception:
         return
 
+    if not isinstance(getattr(Glm4MoeConfig, "head_dim", None), property):
+        Glm4MoeConfig.head_dim = property(_glm4_moe_head_dim)
+    if not isinstance(getattr(Glm4MoeConfig, "qk_head_dim", None), property):
+        Glm4MoeConfig.qk_head_dim = property(_glm4_moe_qk_head_dim)
+
     glm4_moe_lite_compat = type(
         "Glm4MoeConfig",
         (Glm4MoeConfig,),
-        {"model_type": "glm4_moe_lite"},
+        {
+            "model_type": "glm4_moe_lite",
+            "head_dim": property(_glm4_moe_head_dim),
+            "qk_head_dim": property(_glm4_moe_qk_head_dim),
+        },
     )
     glm4_moe_lite_compat.__module__ = __name__
     globals()["Glm4MoeConfig"] = glm4_moe_lite_compat
