@@ -111,6 +111,8 @@ modal app stop <app-id>
 - The first successful USACO Harbor run used duplicated task IDs to reach the required rollout count for a tiny proof dataset. That was acceptable for proving plumbing, because the goal was a verified training loop rather than benchmark quality.
 - Harbor USACO trials often log `Convention artifacts dir not found or download failed (best-effort)` during agent execution. In this repo that warning was noisy but non-fatal.
 - Harbor trial cancellation messages can appear after a successful rollout batch when Miles aborts leftover generation requests during cleanup. Treat them as expected if they occur immediately after `Final collected ... samples from rollout to train`.
+- For short Miles validation runs on Modal, `--save-interval 1 --no-save-optim` was the practical way to confirm per-step checkpointing without filling the shared checkpoint volume with optimizer state.
+- For the 10-step USACO validations here, the reliable completion signal was `latest_checkpointed_iteration.txt` inside the checkpoint volume. Both working runs finished with that file set to `9`, matching checkpoints `iter_0000000` through `iter_0000009`.
 
 ## Known Working Miles + Harbor Paths
 
@@ -127,6 +129,14 @@ modal app stop <app-id>
     - rollout manager collected `8` samples
     - trainer logged `step 0`
     - first-step wall time was about `213s`
+- Validated USACO 10-step checkpoint run:
+  - config: `usaco-qwen-0-6b`
+  - topology: 2 nodes, disaggregated trainer and rollout/inference, `rdma=True`
+  - dataset: `harbor/usaco/train-limit-4.jsonl`
+  - result:
+    - trainer logged steps `0` through `9`
+    - checkpoint volume contained `iter_0000000` through `iter_0000009`
+    - `latest_checkpointed_iteration.txt` was `9`
 - Validated USACO scale-up:
   - config: `usaco-qwen-1-7b`
   - topology: 2 nodes, disaggregated trainer and rollout/inference, `rdma=True`
@@ -135,6 +145,14 @@ modal app stop <app-id>
     - rollout manager collected `8` samples
     - trainer logged `step 0`
     - first-step wall time was about `175s`
+- Validated USACO 10-step scale-up:
+  - config: `usaco-qwen-1-7b`
+  - topology: 2 nodes, disaggregated trainer and rollout/inference, `rdma=True`
+  - dataset: `harbor/usaco/train-limit-4.jsonl`
+  - result:
+    - trainer logged steps `0` through `9`
+    - checkpoint volume contained `iter_0000000` through `iter_0000009`
+    - `latest_checkpointed_iteration.txt` was `9`
 
 ## Large Hugging Face Downloads
 
