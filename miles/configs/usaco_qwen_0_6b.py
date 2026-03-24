@@ -28,15 +28,15 @@ def get_config(sync: bool = False) -> RLConfig:
         wandb_project="miles-harbor",
         wandb_run_name_prefix="usaco-qwen3-0p6b",
         harbor_task_mode="usaco",
-        harbor_task_limit=2,
-        harbor_task_ids=["84", "86"],
-        dataset_relpath="harbor/usaco/train-limit-2.jsonl",
+        harbor_task_limit=4,
+        harbor_task_ids=["84", "86", "84", "86"],
+        dataset_relpath="harbor/usaco/train-limit-4.jsonl",
         miles_args=f"""
             --prompt-data {{dataset_path}}
-            --num-rollout 2
-            --rollout-batch-size 2
+            --num-rollout 4
+            --rollout-batch-size 4
             --n-samples-per-prompt 2
-            --global-batch-size 4
+            --global-batch-size 8
             --attention-dropout 0.0
             --hidden-dropout 0.0
             --accumulate-allreduce-grads-in-fp32

@@ -83,6 +83,11 @@ modal app stop <app-id>
 - Modal client heartbeat warnings during long-running downloads were noisy but not fatal in this repo when the fetched-file count kept increasing.
 - If logs lag behind what the GPUs are doing, `modal container exec <container-id> -- nvidia-smi` is the quickest way to distinguish a real hang from a slow first step or delayed log flush.
 - During long GLM-5 runs, checkpoint files appeared inside the live container before the success lines showed up in `modal app logs`; if a run looks stalled, inspect the checkpoint directory in-container before declaring it wedged.
+- For Miles + Harbor multi-node runs, `modal app logs <app-id>` may stay nearly empty even while the job is healthy. In that case, inspect the live Ray session logs inside the containers, typically under `/tmp/ray/session_*/logs`, via `modal container exec`.
+- For Miles + Harbor, the most useful live files were:
+  - `job-driver-*.log` for the merged trainer and rollout timeline
+  - `worker-*-7586.err` for rollout-manager progress
+  - `worker-*-7880.err` for rank-0 trainer metrics such as `step 0`
 
 ## Volume Checks
 
@@ -98,6 +103,30 @@ modal app stop <app-id>
 - In this repo's Modal app layout, invoking a lightweight helper function can still trigger image creation for other functions defined in the same app.
 - That matters for big training images: a helper like dataset prep or model download may still spend time building the training image before any user code runs.
 - When validating very recent upstream support, pin the exact git commit in the Modal image definition instead of relying on a floating branch name.
+
+## Miles And Harbor Notes
+
+- The Miles multi-node topology here uses one trainer node and one rollout/inference node. That is enough to prove disaggregated training, but it means the trainer-side data parallel size is `8` because the trainer node owns 8 GPUs.
+- For Miles configs in this repo, `global_batch_size` must be divisible by `micro_batch_size * data_parallel_size`. With `micro_batch_size=1` and one 8-GPU trainer node, the first working USACO config needed `global_batch_size=8`; `4` failed during actor initialization.
+- The first successful USACO Harbor run used duplicated task IDs to reach the required rollout count for a tiny proof dataset. That was acceptable for proving plumbing, because the goal was a verified training loop rather than benchmark quality.
+- Harbor USACO trials often log `Convention artifacts dir not found or download failed (best-effort)` during agent execution. In this repo that warning was noisy but non-fatal.
+- Harbor trial cancellation messages can appear after a successful rollout batch when Miles aborts leftover generation requests during cleanup. Treat them as expected if they occur immediately after `Final collected ... samples from rollout to train`.
+
+## Known Working Miles + Harbor Paths
+
+- File: `miles/modal_train.py`
+- Validated hello proof:
+  - config: `hello-qwen-0-6b`
+  - topology: single-node
+  - result: Harbor-backed Miles training reached `step 1`
+- Validated USACO proof:
+  - config: `usaco-qwen-0-6b`
+  - topology: 2 nodes, disaggregated trainer and rollout/inference, `rdma=True`
+  - dataset: `harbor/usaco/train-limit-4.jsonl`
+  - result:
+    - rollout manager collected `8` samples
+    - trainer logged `step 0`
+    - first-step wall time was about `213s`
 
 ## Large Hugging Face Downloads
 
