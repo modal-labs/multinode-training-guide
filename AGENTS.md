@@ -1,0 +1,1 @@
+Read docs/agent-modal-training.md for details on how to run and debug training jobs on Modal.
