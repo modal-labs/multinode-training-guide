@@ -33,10 +33,13 @@ def get_config(sync: bool = False) -> RLConfig:
         dataset_relpath="harbor/usaco/train-limit-4.jsonl",
         miles_args=f"""
             --prompt-data {{dataset_path}}
-            --num-rollout 4
+            --num-rollout 10
             --rollout-batch-size 4
             --n-samples-per-prompt 2
             --global-batch-size 8
+            --save {{checkpoints_path}}/runs/usaco-qwen3-0p6b-10step
+            --save-interval 1
+            --no-save-optim
             --attention-dropout 0.0
             --hidden-dropout 0.0
             --accumulate-allreduce-grads-in-fp32
@@ -45,7 +48,6 @@ def get_config(sync: bool = False) -> RLConfig:
             --actor-num-nodes 1
             --actor-num-gpus-per-node 8
             --rollout-num-gpus 8
-            --ci-test
             --use-fault-tolerance
             --rollout-health-check-interval 5
             --rollout-health-check-timeout 10
