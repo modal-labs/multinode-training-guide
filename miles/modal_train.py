@@ -420,8 +420,8 @@ async def train_single_node(config: str = "hello-qwen-0-6b", sync: bool = False)
 
     cfg = get_config(config, sync)
 
-    hf_cache_volume.reload()
-    data_volume.reload()
+    await hf_cache_volume.reload.aio()
+    await data_volume.reload.aio()
     _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
 
     with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
@@ -450,8 +450,8 @@ async def train_multi_node(config: str = "usaco-qwen-0-6b", sync: bool = False):
     if cfg.n_nodes != MULTI_NODE_COUNT:
         raise ValueError(f"Config {config} expects {cfg.n_nodes} nodes, but train_multi_node is fixed to {MULTI_NODE_COUNT}.")
 
-    hf_cache_volume.reload()
-    data_volume.reload()
+    await hf_cache_volume.reload.aio()
+    await data_volume.reload.aio()
 
     cluster_info = modal.experimental.get_cluster_info()
     print(f"Rank: {cluster_info.rank}, task id: {os.environ['MODAL_TASK_ID']}")

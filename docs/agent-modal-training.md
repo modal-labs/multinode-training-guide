@@ -127,6 +127,14 @@ modal app stop <app-id>
     - rollout manager collected `8` samples
     - trainer logged `step 0`
     - first-step wall time was about `213s`
+- Validated USACO scale-up:
+  - config: `usaco-qwen-1-7b`
+  - topology: 2 nodes, disaggregated trainer and rollout/inference, `rdma=True`
+  - dataset: `harbor/usaco/train-limit-4.jsonl`
+  - result:
+    - rollout manager collected `8` samples
+    - trainer logged `step 0`
+    - first-step wall time was about `175s`
 
 ## Large Hugging Face Downloads
 
