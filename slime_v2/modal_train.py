@@ -16,9 +16,6 @@ experiment = os.environ.get("EXPERIMENT_CONFIG", "")
 exp_mod = get_module(experiment) if experiment else None
 modal_cfg = exp_mod.modal if exp_mod else None
 slime_cfg = exp_mod.slime if exp_mod else None
-experiment_secret = (
-    modal.Secret.from_dict({"EXPERIMENT_CONFIG": experiment}) if experiment else None
-)
 
 # ── Image ─────────────────────────────────────────────────────────────────────
 
@@ -79,13 +76,13 @@ def list_configs():
 @app.function(
     image=image,
     volumes={str(HF_CACHE_PATH): hf_cache_volume},
-    secrets=[experiment_secret] if experiment_secret else [],
     timeout=2 * 60 * 60,
 )
-def download_model():
+def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Download the experiment model to the HF cache volume."""
     from huggingface_hub import snapshot_download
 
+    slime_cfg = get_module(experiment).slime
     path = snapshot_download(repo_id=slime_cfg.hf_checkpoint)
     print(f"Downloaded to {path}")
     hf_cache_volume.commit()
@@ -94,11 +91,11 @@ def download_model():
 @app.function(
     image=image,
     volumes={str(DATA_PATH): data_volume},
-    secrets=[experiment_secret] if experiment_secret else [],
     timeout=2 * 60 * 60,
 )
-def prepare_dataset():
+def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Run the experiment's prepare_data() to populate the data volume."""
+    exp_mod = get_module(experiment)
     if not hasattr(exp_mod, "prepare_data"):
         raise RuntimeError(f"Experiment {experiment!r} has no prepare_data() function.")
     data_volume.reload()
@@ -110,12 +107,13 @@ def prepare_dataset():
     image=image,
     gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
     volumes=modal_volumes,
-    secrets=[experiment_secret] if experiment_secret else [],
     timeout=4 * 60 * 60,
 )
-def convert_checkpoint():
+def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw."""
     from huggingface_hub import snapshot_download
+
+    slime_cfg = get_module(experiment).slime
 
     if getattr(slime_cfg, "megatron_to_hf_mode", None) == "bridge":
         print(
@@ -140,14 +138,9 @@ def convert_checkpoint():
     mtp_num_layers = getattr(slime_cfg, "mtp_num_layers", None)
 
     if tp == 1:
-        # TP=1: use all available GPUs and let the script auto-compute PP + decoder_last.
-        # Megatron can reshard PP on load, so the checkpoint PP doesn't need to match training.
         nproc = slime_cfg.actor_num_gpus_per_node
         parallel_args = ""
     else:
-        # TP>1: checkpoint TP must match training TP (Megatron cannot reshard TP on load).
-        # Do NOT pass EP — expert weights are stored EP=1 and resharded to any EP on load,
-        # same as all canonical conversion examples in the slime docs.
         nproc = tp * pp
         parallel_args = (
             f"--tensor-model-parallel-size {tp} "
@@ -188,7 +181,7 @@ RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
 
-def _get_cluster_info() -> tuple[int, str, str, int]:
+def _get_cluster_info(slime_cfg) -> tuple[int, str, str, int]:
     """Return (rank, master_addr, my_ip, n_nodes) for this container."""
     if slime_cfg.total_nodes() > 1:
         info = modal.experimental.get_cluster_info()
@@ -228,7 +221,7 @@ def _start_ray_head(my_ip: str, n_nodes: int) -> None:
         raise RuntimeError(f"Timed out waiting for all {n_nodes} Ray nodes to join")
 
 
-def _resolve_hf_paths() -> None:
+def _resolve_hf_paths(slime_cfg) -> None:
     """Resolve any HF repo IDs in slime_cfg checkpoint fields to local cache paths."""
     from huggingface_hub import snapshot_download
 
@@ -244,7 +237,7 @@ def _resolve_hf_paths() -> None:
             setattr(slime_cfg, attr, _resolve(val))
 
 
-def _build_train_cmd() -> str:
+def _build_train_cmd(slime_cfg) -> str:
     """Build the Ray job entrypoint, sourcing model arch args if slime_model_script is set."""
     train_script = (
         f"{SLIME_ROOT}/{'train_async.py' if slime_cfg.async_mode else 'train.py'}"
@@ -263,8 +256,7 @@ def _build_train_cmd() -> str:
     image=image,
     gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
     volumes=modal_volumes,
-    secrets=[modal.Secret.from_name("wandb-secret")]
-    + ([experiment_secret] if experiment_secret else []),
+    secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,
     experimental_options={"efa_enabled": True},
 )
@@ -273,10 +265,11 @@ def _build_train_cmd() -> str:
     if slime_cfg and slime_cfg.total_nodes() > 1
     else lambda fn: fn
 )
-async def train():
+async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     await asyncio.gather(hf_cache_volume.reload.aio(), data_volume.reload.aio())
+    slime_cfg = get_module(experiment).slime
 
-    rank, master_addr, my_ip, n_nodes = _get_cluster_info()
+    rank, master_addr, my_ip, n_nodes = _get_cluster_info(slime_cfg)
     os.environ["SLIME_HOST_IP"] = my_ip
 
     if rank != 0:
@@ -295,14 +288,14 @@ async def train():
 
     # Head node: start Ray, submit the training job, and stream logs.
     _start_ray_head(my_ip, n_nodes)
-    _resolve_hf_paths()
+    _resolve_hf_paths(slime_cfg)
 
     # wandb-secret injects WANDB_API_KEY; falls back to local env or disabled.
     wandb_key = os.environ.get("WANDB_API_KEY", "")
     if wandb_key and getattr(slime_cfg, "use_wandb", False):
         slime_cfg.wandb_key = wandb_key
 
-    cmd = _build_train_cmd()
+    cmd = _build_train_cmd(slime_cfg)
     runtime_env = {
         "env_vars": {
             "no_proxy": f"127.0.0.1,{master_addr}",
