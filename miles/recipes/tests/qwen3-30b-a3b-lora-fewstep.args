@@ -1,0 +1,110 @@
+# Qwen3-30B-A3B bridge-mode LoRA recipe tuned to get through a few RL steps.
+# This keeps attention-only LoRA targets but trims rollout pressure and disables
+# eval so the run can reach training sooner.
+
+# Model architecture from the upstream Miles Qwen3-30B-A3B model script.
+--disable-bias-linear
+--qk-layernorm
+--group-query-attention
+--num-attention-heads 32
+--num-query-groups 4
+--kv-channels 128
+--num-layers 48
+--hidden-size 2048
+--ffn-hidden-size 6144
+--normalization RMSNorm
+--position-embedding-type rope
+--norm-epsilon 1e-6
+--rotary-percent 1.0
+--swiglu
+--untie-embeddings-and-output-weights
+--vocab-size 151936
+--rotary-base 1000000
+--moe-ffn-hidden-size 768
+--moe-router-score-function softmax
+--moe-token-dispatcher-type alltoall
+--moe-router-topk 8
+--moe-layer-freq "[1]*48"
+--num-experts 128
+--moe-grouped-gemm
+--moe-token-drop-policy probs
+--moe-router-dtype fp32
+--moe-permute-fusion
+--moe-aux-loss-coeff 0
+
+# Checkpoint conversion
+--megatron-to-hf-mode bridge
+
+# LoRA
+--lora-rank 32
+--lora-alpha 32
+--lora-dropout 0.0
+--target-modules linear_qkv,linear_proj
+
+# Data and rollout
+--prompt-data /data/gsm8k/train.parquet
+--input-key messages
+--label-key label
+--apply-chat-template
+--rollout-shuffle
+--rm-type math
+--num-rollout 8
+--rollout-batch-size 2
+--n-samples-per-prompt 2
+--rollout-max-response-len 512
+--rollout-temperature 1
+--global-batch-size 4
+
+# Parallelism and performance
+--tensor-model-parallel-size 4
+--sequence-parallel
+--pipeline-model-parallel-size 1
+--context-parallel-size 1
+--expert-model-parallel-size 8
+--expert-tensor-parallel-size 1
+--recompute-granularity full
+--recompute-method uniform
+--recompute-num-layers 1
+--use-dynamic-batch-size
+--max-tokens-per-gpu 1024
+
+# GRPO
+--advantage-estimator grpo
+--kl-loss-coef 0.0
+--kl-loss-type low_var_kl
+--kl-coef 0.0
+--entropy-coef 0.0
+--eps-clip 0.2
+--eps-clip-high 0.28
+
+# Optimizer
+--optimizer adam
+--lr 1e-5
+--lr-decay-style constant
+--weight-decay 0.1
+--adam-beta1 0.9
+--adam-beta2 0.98
+--optimizer-cpu-offload
+--overlap-cpu-optimizer-d2h-h2d
+--use-precision-aware-optimizer
+
+# Rollout serving
+--rollout-num-gpus-per-engine 8
+--sglang-mem-fraction-static 0.7
+--sglang-cuda-graph-max-bs 64
+--sglang-disable-cuda-graph
+
+# Training runtime
+--attention-dropout 0.0
+--hidden-dropout 0.0
+--accumulate-allreduce-grads-in-fp32
+--attention-softmax-in-fp32
+--attention-backend flash
+--calculate-per-token-loss
+--use-miles-router
+--save-interval 1000
+
+# Logging defaults
+--wandb-project miles-modal
+--wandb-group qwen3-30b-a3b-lora-fewstep
+--disable-wandb-random-suffix

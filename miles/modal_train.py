@@ -35,6 +35,7 @@ HF_CACHE_PATH = pathlib.Path("/root/.cache/huggingface")
 DATA_PATH = pathlib.Path("/data")
 CHECKPOINTS_PATH = pathlib.Path("/checkpoints")
 REMOTE_RECIPES_DIR = pathlib.Path("/root/miles-recipes")
+REMOTE_PATCH_DIR = pathlib.Path("/root/miles-modal-patches")
 REMOTE_MILES_DIR = pathlib.Path("/root/miles")
 REMOTE_TRAIN_SCRIPT = REMOTE_MILES_DIR / "train.py"
 
@@ -63,41 +64,49 @@ RECIPES = {
         name="qwen25-0p5b-lora",
         description="Single-node smoke test adapted from the upstream Miles LoRA example.",
         model_id="Qwen/Qwen2.5-0.5B-Instruct",
-        args_file="qwen25-0p5b-lora.args",
+        args_file="tests/qwen25-0p5b-lora.args",
         recommended_nodes=1,
         gpu="H100:8",
     ),
-    "glm4-7-flash-lora": Recipe(
-        name="glm4-7-flash-lora",
-        description="First real GLM MoE validation recipe on multiple nodes.",
-        model_id="zai-org/GLM-4.7-Flash",
-        args_file="glm4-7-flash-lora.args",
-        recommended_nodes=4,
+    "qwen3-30b-a3b-lora": Recipe(
+        name="qwen3-30b-a3b-lora",
+        description="Single-node Qwen3-30B-A3B bridge-mode LoRA validation recipe.",
+        model_id="Qwen/Qwen3-30B-A3B",
+        args_file="qwen3-30b-a3b-lora.args",
+        recommended_nodes=1,
         gpu="H100:8",
     ),
-    "glm5-744b-a40b-4layer-lora": Recipe(
-        name="glm5-744b-a40b-4layer-lora",
-        description="GLM-5 testing recipe using the upstream 4-layer model script shape.",
-        model_id="zai-org/GLM-5",
-        args_file="glm5-744b-a40b-4layer-lora.args",
+    "qwen3-30b-a3b-lora-fewstep": Recipe(
+        name="qwen3-30b-a3b-lora-fewstep",
+        description="Single-node Qwen3-30B-A3B attention-only LoRA recipe trimmed to chase a few full RL steps.",
+        model_id="Qwen/Qwen3-30B-A3B",
+        args_file="tests/qwen3-30b-a3b-lora-fewstep.args",
         recommended_nodes=1,
-        gpu="H200:8",
+        gpu="H100:8",
     ),
-    "glm5-744b-a40b-20layer-lora": Recipe(
-        name="glm5-744b-a40b-20layer-lora",
-        description="GLM-5 testing recipe using the upstream 20-layer model script shape.",
-        model_id="zai-org/GLM-5",
-        args_file="glm5-744b-a40b-20layer-lora.args",
-        recommended_nodes=2,
-        gpu="H200:8",
+    "qwen3-30b-a3b-lora-greedy-debug": Recipe(
+        name="qwen3-30b-a3b-lora-greedy-debug",
+        description="Single-node Qwen3-30B-A3B attention-only LoRA debug recipe with greedy rollout to validate LoRA sync.",
+        model_id="Qwen/Qwen3-30B-A3B",
+        args_file="tests/qwen3-30b-a3b-lora-greedy-debug.args",
+        recommended_nodes=1,
+        gpu="H100:8",
     ),
-    "glm5-744b-a40b-lora": Recipe(
-        name="glm5-744b-a40b-lora",
-        description="Full GLM-5 starter recipe for LoRA RLVR experiments.",
-        model_id="zai-org/GLM-5",
-        args_file="glm5-744b-a40b-lora.args",
-        recommended_nodes=8,
-        gpu="H200:8",
+    "qwen3-30b-a3b-experts-lora": Recipe(
+        name="qwen3-30b-a3b-experts-lora",
+        description="Second-phase Qwen3-30B-A3B recipe widened to expert linear_fc1/fc2 targets.",
+        model_id="Qwen/Qwen3-30B-A3B",
+        args_file="qwen3-30b-a3b-experts-lora.args",
+        recommended_nodes=1,
+        gpu="H100:8",
+    ),
+    "qwen3-30b-a3b-experts-fewstep": Recipe(
+        name="qwen3-30b-a3b-experts-fewstep",
+        description="Single-node Qwen3-30B-A3B expert-target LoRA recipe trimmed to chase a few RL steps.",
+        model_id="Qwen/Qwen3-30B-A3B",
+        args_file="tests/qwen3-30b-a3b-experts-fewstep.args",
+        recommended_nodes=1,
+        gpu="H100:8",
     ),
 }
 
@@ -205,7 +214,7 @@ def _build_runtime_env(master_addr: str, wandb_key: Optional[str]) -> dict:
     env_vars = {
         "MASTER_ADDR": master_addr,
         "no_proxy": master_addr,
-        "PYTHONPATH": "/root/Megatron-LM",
+        "PYTHONPATH": f"{REMOTE_PATCH_DIR.as_posix()}:/root/Megatron-LM",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_ALGO": "Ring",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
@@ -229,6 +238,11 @@ image = (
     modal.Image.from_registry(MILES_IMAGE)
     .entrypoint([])
     .add_local_dir(here / "recipes", remote_path=REMOTE_RECIPES_DIR.as_posix(), copy=True)
+    .add_local_dir(
+        here / "modal_patches",
+        remote_path=REMOTE_PATCH_DIR.as_posix(),
+        copy=True,
+    )
 )
 
 if LOCAL_MILES_PATH:
@@ -422,7 +436,7 @@ class MilesCluster:
     timeout=24 * 60 * 60,
 )
 def download_model(
-    recipe: str = "glm4-7-flash-lora",
+    recipe: str = "qwen3-30b-a3b-lora",
     revision: Optional[str] = None,
     model_id: Optional[str] = None,
 ):
@@ -462,7 +476,7 @@ def prepare_dataset(
 
 @app.local_entrypoint()
 def main(
-    recipe: str = "qwen25-0p5b-lora",
+    recipe: str = "qwen3-30b-a3b-lora",
     gpu: str = "",
     extra_args: str = "",
     extra_args_file: str = "",
