@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # Fields on SlimeConfig that are NOT SLIME CLI args.
 _SLIME_SKIP = {"environment", "async_mode", "slime_model_script"}
 
+# SlimeConfig fields that SLIME reads as YAML files at runtime.
+# Users may set these as inline dicts in Python configs; the launcher
+# materializes them to temp YAML files before building the CLI command.
+YAML_CONFIG_FIELDS = ("eval_config", "custom_config_path", "sglang_config")
+
 
 class ModalConfig:
     """Modal infrastructure configuration — GPU provisioning and image setup only."""

@@ -2,13 +2,14 @@ import asyncio
 import os
 import shlex
 import subprocess
+import tempfile
 import time
 
 import modal
 import modal.experimental
 
 from configs import get_module
-from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH
+from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, YAML_CONFIG_FIELDS
 
 # ── Experiment ────────────────────────────────────────────────────────────────
 
@@ -237,6 +238,19 @@ def _resolve_hf_paths(slime_cfg) -> None:
             setattr(slime_cfg, attr, _resolve(val))
 
 
+def _materialize_yaml_configs(slime_cfg, tmpdir: str) -> None:
+    """Write any inline dict YAML configs to temp files and update slime_cfg with paths."""
+    import yaml
+
+    for field in YAML_CONFIG_FIELDS:
+        val = getattr(slime_cfg, field, None)
+        if isinstance(val, dict):
+            path = os.path.join(tmpdir, f"{field}.yaml")
+            with open(path, "w") as f:
+                yaml.dump(val, f)
+            setattr(slime_cfg, field, path)
+
+
 def _build_train_cmd(slime_cfg) -> str:
     """Build the Ray job entrypoint, sourcing model arch args if slime_model_script is set."""
     train_script = (
@@ -289,6 +303,8 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     # Head node: start Ray, submit the training job, and stream logs.
     _start_ray_head(my_ip, n_nodes)
     _resolve_hf_paths(slime_cfg)
+
+    _materialize_yaml_configs(slime_cfg, tempfile.mkdtemp())
 
     # wandb-secret injects WANDB_API_KEY; falls back to local env or disabled.
     wandb_key = os.environ.get("WANDB_API_KEY", "")
