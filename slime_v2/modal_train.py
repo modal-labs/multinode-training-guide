@@ -114,7 +114,7 @@ def prepare_dataset():
     timeout=4 * 60 * 60,
 )
 def convert_checkpoint():
-    """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw. """
+    """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw."""
     from huggingface_hub import snapshot_download
 
     if getattr(slime_cfg, "megatron_to_hf_mode", None) == "bridge":
@@ -152,8 +152,16 @@ def convert_checkpoint():
         parallel_args = (
             f"--tensor-model-parallel-size {tp} "
             f"--pipeline-model-parallel-size {pp} "
-            + (f"--decoder-first-pipeline-num-layers {decoder_first} " if decoder_first else "")
-            + (f"--decoder-last-pipeline-num-layers {decoder_last} " if decoder_last else "")
+            + (
+                f"--decoder-first-pipeline-num-layers {decoder_first} "
+                if decoder_first
+                else ""
+            )
+            + (
+                f"--decoder-last-pipeline-num-layers {decoder_last} "
+                if decoder_last
+                else ""
+            )
         )
 
     mtp_arg = f"--mtp-num-layers {mtp_num_layers} " if mtp_num_layers else ""
@@ -225,7 +233,11 @@ def _resolve_hf_paths() -> None:
     from huggingface_hub import snapshot_download
 
     def _resolve(val: str) -> str:
-        return val if str(val).startswith("/") else snapshot_download(val, local_files_only=True)
+        return (
+            val
+            if str(val).startswith("/")
+            else snapshot_download(val, local_files_only=True)
+        )
 
     for attr in ("hf_checkpoint", "load", "ref_load", "critic_load"):
         if val := getattr(slime_cfg, attr, None):
@@ -251,7 +263,8 @@ def _build_train_cmd() -> str:
     image=image,
     gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
     volumes=modal_volumes,
-    secrets=[modal.Secret.from_name("wandb-secret")] + ([experiment_secret] if experiment_secret else []),
+    secrets=[modal.Secret.from_name("wandb-secret")]
+    + ([experiment_secret] if experiment_secret else []),
     timeout=24 * 60 * 60,
     experimental_options={"efa_enabled": True},
 )

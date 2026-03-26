@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Fields on SlimeConfig that are NOT SLIME CLI args.
 _SLIME_SKIP = {"environment", "async_mode", "slime_model_script"}
 
+
 class ModalConfig:
     """Modal infrastructure configuration — GPU provisioning and image setup only."""
 
@@ -72,9 +73,9 @@ class SlimeConfig:
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_NVLS_ENABLE": "1",
-    } 
-    async_mode: bool = False         # True → use train_async.py
-    slime_model_script: str = ""     # shell script path relative to /root/slime defining MODEL_ARGS
+    }
+    async_mode: bool = False  # True → use train_async.py
+    slime_model_script: str = ""  # shell script path relative to /root/slime
 
     def __init__(self, **kwargs: Any) -> None:
         # Fresh environment dict per instance — never mutate the class-level default.

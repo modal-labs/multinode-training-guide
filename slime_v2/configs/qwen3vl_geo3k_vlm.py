@@ -30,7 +30,7 @@ class _Slime(SlimeConfig):
     multimodal_keys = '{"image": "images"}'
     apply_chat_template = True
     rollout_shuffle = True
-    rm_type = "deepscaler"
+    rm_type = "math"
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     num_rollout = 3000

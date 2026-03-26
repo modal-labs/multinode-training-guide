@@ -5,7 +5,13 @@ To add a new experiment:
   2. Import it here and add an entry to CONFIGS.
 """
 
-from . import qwen_4b_gsm8k, qwen_8b_gsm8k, glm47_flash_dapo, glm47_flash_dapo_multinode, qwen3vl_geo3k_vlm
+from . import (
+    qwen_4b_gsm8k,
+    qwen_8b_gsm8k,
+    glm47_flash_dapo,
+    glm47_flash_dapo_multinode,
+    qwen3vl_geo3k_vlm,
+)
 
 CONFIGS = {
     "qwen-4b-gsm8k": qwen_4b_gsm8k,
