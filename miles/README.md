@@ -76,6 +76,12 @@ Qwen3-30B-A3B few-step all-layer validation:
 MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-lora-fewstep
 ```
 
+Qwen3-30B-A3B few-step all-layer validation in non-colocated mode:
+
+```bash
+MILES_N_NODES=2 modal run miles/modal_train.py --recipe qwen3-30b-a3b-lora-fewstep --no-colocate --actor-nodes 1 --allow-cluster-mismatch
+```
+
 Qwen3-30B-A3B expert-target LoRA follow-up:
 
 ```bash
@@ -106,6 +112,10 @@ MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-experts-fe
 - The baked Qwen3 recipes are single-node `H100:8` shapes. They are intended to
   validate end-to-end bridge-mode LoRA with colocated rollout first, not to
   exhaustively cover every parallelism combination.
+- The Modal wrapper now also supports a non-colocated split for experimentation:
+  total cluster size still comes from `MILES_N_NODES`, while `--actor-nodes`
+  controls how many of those nodes are reserved for Megatron training and the
+  remaining GPUs default to rollout.
 - Source inspection suggests the training path should handle TP / PP / EP / CP
   because the bridge setup forwards all of those settings into Megatron-Bridge,
   and Megatron-Bridge's PEFT tests cover pipeline-style model chunk lists. That
@@ -136,6 +146,11 @@ What the Modal runs have validated so far on `modal-labs`:
   `linear_qkv`, `linear_proj`, `linear_fc1`, and `linear_fc2`, injected expert
   modules under `decoder.layers.*.mlp.experts.*`, completed rollout collection,
   and reached at least `train/step` 1 on a single-node `H100:8` shape.
+- The same all-layer few-step recipe now also has non-colocated runtime
+  validation on `modal-labs` with a 2-node split: 1 node for actor training and
+  1 node for rollout (`--no-colocate --actor-nodes 1`). After forcing the Miles
+  router to advertise the cluster head IP and patching distributed LoRA sync to
+  export bridge adapters directly, the run reached at least `train/step` 2.
 - The attention-only debug/control recipe also works, but it is no longer the
   recommended configuration after comparing against the Thinking Machines
   guidance.

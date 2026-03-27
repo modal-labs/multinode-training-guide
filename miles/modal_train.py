@@ -150,11 +150,17 @@ def _build_enforced_args(
     *,
     model_path: str,
     cluster_nodes: int,
+    actor_nodes: int,
     gpus_per_node: int,
     checkpoint_dir: pathlib.Path,
     custom_config_path: Optional[str],
     wandb_key: Optional[str],
+    colocate: bool,
+    rollout_num_gpus: Optional[int],
 ) -> list[str]:
+    if actor_nodes < 1:
+        raise ValueError(f"actor_nodes must be >= 1, got {actor_nodes}")
+
     args = [
         "--train-backend",
         "megatron",
@@ -165,13 +171,20 @@ def _build_enforced_args(
         "--save",
         checkpoint_dir.as_posix(),
         "--actor-num-nodes",
-        str(cluster_nodes),
+        str(actor_nodes),
         "--actor-num-gpus-per-node",
         str(gpus_per_node),
         "--num-gpus-per-node",
         str(gpus_per_node),
-        "--colocate",
     ]
+    if colocate:
+        args.append("--colocate")
+    else:
+        if rollout_num_gpus is None or rollout_num_gpus < 1:
+            raise ValueError(
+                "rollout_num_gpus must be >= 1 when launching non-colocated rollout."
+            )
+        args.extend(["--rollout-num-gpus", str(rollout_num_gpus)])
     if custom_config_path:
         args.extend(["--custom-config-path", custom_config_path])
     if wandb_key:
@@ -184,24 +197,65 @@ def _build_miles_argv(
     *,
     model_path: str,
     cluster_nodes: int,
+    actor_nodes: int,
     gpus_per_node: int,
     checkpoint_dir: pathlib.Path,
     extra_args_text: str,
     custom_config_path: Optional[str],
     wandb_key: Optional[str],
     remote_recipe: bool,
+    colocate: bool,
+    rollout_num_gpus: Optional[int],
 ) -> list[str]:
     recipe_args = _parse_arg_text(_load_recipe_text(recipe, remote=remote_recipe))
     extra_args = _parse_arg_text(extra_args_text)
     enforced_args = _build_enforced_args(
         model_path=model_path,
         cluster_nodes=cluster_nodes,
+        actor_nodes=actor_nodes,
         gpus_per_node=gpus_per_node,
         checkpoint_dir=checkpoint_dir,
         custom_config_path=custom_config_path,
         wandb_key=wandb_key,
+        colocate=colocate,
+        rollout_num_gpus=rollout_num_gpus,
     )
     return ["python3", REMOTE_TRAIN_SCRIPT.as_posix(), *recipe_args, *extra_args, *enforced_args]
+
+
+def _resolve_actor_nodes(cluster_nodes: int, *, colocate: bool, actor_nodes: int) -> int:
+    if colocate:
+        return cluster_nodes
+    if actor_nodes > 0:
+        return actor_nodes
+    if cluster_nodes < 2:
+        raise ValueError(
+            "Non-colocated rollout needs spare cluster capacity. "
+            "Set MILES_N_NODES>=2 or pass --colocate."
+        )
+    return cluster_nodes - 1
+
+
+def _resolve_rollout_num_gpus(
+    cluster_nodes: int,
+    *,
+    actor_nodes: int,
+    gpus_per_node: int,
+    colocate: bool,
+    rollout_num_gpus: int,
+) -> Optional[int]:
+    if colocate:
+        return None
+    if rollout_num_gpus > 0:
+        return rollout_num_gpus
+    spare_gpus = (cluster_nodes - actor_nodes) * gpus_per_node
+    if spare_gpus < 1:
+        raise ValueError(
+            "Non-colocated rollout needs spare GPUs after reserving actor nodes. "
+            f"cluster_nodes={cluster_nodes}, actor_nodes={actor_nodes}, "
+            f"gpus_per_node={gpus_per_node}"
+        )
+    return spare_gpus
 
 
 def _read_optional_file(path_str: str) -> str:
@@ -213,6 +267,7 @@ def _read_optional_file(path_str: str) -> str:
 def _build_runtime_env(master_addr: str, wandb_key: Optional[str]) -> dict:
     env_vars = {
         "MASTER_ADDR": master_addr,
+        "MILES_HOST_IP": master_addr,
         "no_proxy": master_addr,
         "PYTHONPATH": f"{REMOTE_PATCH_DIR.as_posix()}:/root/Megatron-LM",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
@@ -365,6 +420,9 @@ class MilesCluster:
         extra_args_text: str = "",
         custom_config_yaml: str = "",
         wandb_key: str = "",
+        actor_nodes: int | None = None,
+        colocate: bool = True,
+        rollout_num_gpus: int | None = None,
     ) -> dict:
         self._ensure_ray_started()
 
@@ -389,23 +447,32 @@ class MilesCluster:
             custom_config_path = f"/tmp/{recipe.name}-{run_id}-overrides.yaml"
             pathlib.Path(custom_config_path).write_text(custom_config_yaml)
 
+        resolved_actor_nodes = actor_nodes if actor_nodes is not None else CLUSTER_NODES
+        resolved_rollout_num_gpus = rollout_num_gpus
         argv = _build_miles_argv(
             recipe,
             model_path=model_path,
             cluster_nodes=CLUSTER_NODES,
+            actor_nodes=resolved_actor_nodes,
             gpus_per_node=gpus_per_node,
             checkpoint_dir=checkpoint_dir,
             extra_args_text=extra_args_text,
             custom_config_path=custom_config_path,
             wandb_key=wandb_key or None,
             remote_recipe=True,
+            colocate=colocate,
+            rollout_num_gpus=resolved_rollout_num_gpus,
         )
         entrypoint = shlex.join(argv)
         runtime_env = _build_runtime_env(self.main_addr, wandb_key or None)
 
         print(f"Recipe: {recipe.name}")
         print(f"Model: {recipe.model_id}")
-        print(f"Nodes: {CLUSTER_NODES}")
+        print(f"Cluster nodes: {CLUSTER_NODES}")
+        print(f"Actor nodes: {resolved_actor_nodes}")
+        print(f"Colocate: {colocate}")
+        if not colocate:
+            print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
         print(f"GPUs per node: {gpus_per_node}")
         print(f"Checkpoint dir: {checkpoint_dir}")
         print(f"Entrypoint: {entrypoint}")
@@ -484,6 +551,9 @@ def main(
     list_recipes: bool = False,
     dry_run: bool = False,
     allow_cluster_mismatch: bool = False,
+    colocate: bool = True,
+    actor_nodes: int = 0,
+    rollout_num_gpus: int = 0,
 ):
     if list_recipes:
         _print_recipe_table()
@@ -492,6 +562,18 @@ def main(
     selected_recipe = _get_recipe(recipe)
     selected_gpu = gpu or selected_recipe.gpu
     gpus_per_node = _parse_gpus_per_node(selected_gpu)
+    resolved_actor_nodes = _resolve_actor_nodes(
+        CLUSTER_NODES,
+        colocate=colocate,
+        actor_nodes=actor_nodes,
+    )
+    resolved_rollout_num_gpus = _resolve_rollout_num_gpus(
+        CLUSTER_NODES,
+        actor_nodes=resolved_actor_nodes,
+        gpus_per_node=gpus_per_node,
+        colocate=colocate,
+        rollout_num_gpus=rollout_num_gpus,
+    )
 
     if (
         not allow_cluster_mismatch
@@ -515,16 +597,23 @@ def main(
             selected_recipe,
             model_path="$MODEL_PATH",
             cluster_nodes=CLUSTER_NODES,
+            actor_nodes=resolved_actor_nodes,
             gpus_per_node=gpus_per_node,
             checkpoint_dir=checkpoint_dir,
             extra_args_text=merged_extra_args,
             custom_config_path="/tmp/custom-config.yaml" if custom_config_yaml else None,
             wandb_key="$WANDB_API_KEY" if wandb_key else None,
             remote_recipe=False,
+            colocate=colocate,
+            rollout_num_gpus=resolved_rollout_num_gpus,
         )
         print(f"Recipe: {selected_recipe.name}")
         print(f"Model: {selected_recipe.model_id}")
         print(f"Cluster nodes: {CLUSTER_NODES}")
+        print(f"Actor nodes: {resolved_actor_nodes}")
+        print(f"Colocate: {colocate}")
+        if not colocate:
+            print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
         print(f"GPU: {selected_gpu}")
         print(shlex.join(argv))
         return
@@ -532,6 +621,10 @@ def main(
     print(f"Recipe: {selected_recipe.name}")
     print(f"Model: {selected_recipe.model_id}")
     print(f"Cluster nodes: {CLUSTER_NODES}")
+    print(f"Actor nodes: {resolved_actor_nodes}")
+    print(f"Colocate: {colocate}")
+    if not colocate:
+        print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
     print(f"GPU: {selected_gpu}")
 
     cluster = MilesCluster.with_options(gpu=selected_gpu)()
@@ -541,5 +634,8 @@ def main(
         extra_args_text=merged_extra_args,
         custom_config_yaml=custom_config_yaml,
         wandb_key=wandb_key,
+        actor_nodes=resolved_actor_nodes,
+        colocate=colocate,
+        rollout_num_gpus=resolved_rollout_num_gpus,
     )
     print(result)

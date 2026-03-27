@@ -408,8 +408,216 @@ def _patch_sglang_sampling_probability_sanitization() -> None:
     _log("[miles-modal] patched SGLang sampling to sanitize invalid probability rows")
 
 
+def _patch_distributed_lora_sync() -> None:
+    try:
+        import base64
+        import io
+        import torch
+        from miles.backends.megatron_utils.lora_utils import (
+            LORA_ADAPTER_NAME,
+            build_lora_sync_config,
+            is_lora_weight_name,
+        )
+        from miles.backends.megatron_utils.update_weight import (
+            update_weight_from_distributed as distributed_mod,
+            update_weight_from_tensor as tensor_mod,
+        )
+        from miles.backends.megatron_utils.update_weight.hf_weight_iterator_base import (
+            HfWeightIteratorBase,
+        )
+    except Exception as exc:
+        _log(
+            "[miles-modal] distributed LoRA sync patch unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+
+    UpdateWeightFromDistributed = getattr(
+        distributed_mod, "UpdateWeightFromDistributed", None
+    )
+    if UpdateWeightFromDistributed is None:
+        _log("[miles-modal] distributed LoRA sync patch missing updater class")
+        return
+
+    original_init = getattr(UpdateWeightFromDistributed, "__init__", None)
+    original_update_weights = getattr(UpdateWeightFromDistributed, "update_weights", None)
+    if original_init is None or original_update_weights is None:
+        _log("[miles-modal] distributed LoRA sync patch missing target methods")
+        return
+
+    if getattr(original_update_weights, "__module__", "") == __name__:
+        _log("[miles-modal] distributed LoRA sync patch already present")
+        return
+
+    ray = distributed_mod.ray
+    dist = distributed_mod.dist
+    get_gloo_group = distributed_mod.get_gloo_group
+    post_process_weights = distributed_mod.post_process_weights
+    FlattenedTensorBucket = tensor_mod.FlattenedTensorBucket
+    MultiprocessingSerializer = tensor_mod.MultiprocessingSerializer
+    check_results = tensor_mod._check_weight_sync_results
+
+    def _serialize_lora_named_tensors(named_tensors):
+        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+        if not isinstance(flattened_tensor, torch.Tensor):
+            raise TypeError(
+                "Expected LoRA flattened tensor to be a torch.Tensor, got "
+                f"{type(flattened_tensor).__name__}"
+            )
+        if flattened_tensor.is_cuda:
+            flattened_tensor = flattened_tensor.detach().cpu()
+        buffer = io.BytesIO()
+        torch.save(flattened_tensor.contiguous(), buffer)
+        flattened_tensor_data = {
+            "_miles_modal_format": "torch_save_flattened_lora_v2",
+            "flattened_tensor_torch_save_b64": base64.b64encode(buffer.getvalue()).decode(
+                "ascii"
+            ),
+            "metadata": [
+                {
+                    "name": meta.name,
+                    "shape": list(meta.shape),
+                    "dtype": str(meta.dtype).removeprefix("torch."),
+                    "start_idx": meta.start_idx,
+                    "end_idx": meta.end_idx,
+                    "numel": meta.numel,
+                }
+                for meta in flattened_tensor_bucket.get_metadata()
+            ],
+        }
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+
+    def __init__(
+        self,
+        args,
+        model,
+        weights_getter,
+        *,
+        model_name,
+        quantization_config,
+        is_lora=False,
+    ):
+        original_init(
+            self,
+            args,
+            model,
+            weights_getter,
+            model_name=model_name,
+            quantization_config=quantization_config,
+            is_lora=is_lora,
+        )
+        self.weights_getter = weights_getter
+        self.is_lora = is_lora
+        self._lora_loaded = False
+        if self.is_lora:
+            self._hf_weight_iterator = HfWeightIteratorBase.create(
+                args=args,
+                model=model,
+                model_name=model_name,
+                quantization_config=quantization_config,
+                is_lora=True,
+            )
+            self._lora_config = build_lora_sync_config(args)
+        else:
+            self._hf_weight_iterator = None
+            self._lora_config = None
+
+    @torch.no_grad()
+    def update_weights(self):
+        if not getattr(self, "is_lora", False):
+            return original_update_weights(self)
+
+        self.weight_version += 1
+        rank = dist.get_rank()
+
+        if rank == 0:
+            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if self.quantization_config and self.quantization_config["quant_method"] in [
+                "compressed-tensors"
+            ]:
+                post_process_weights(
+                    restore_weights_before_load=True,
+                    post_process_quantization=False,
+                    rollout_engines=self.rollout_engines,
+                )
+        dist.barrier(group=get_gloo_group())
+
+        megatron_local_weights = self.weights_getter() if self.weights_getter else {}
+        all_lora_named_tensors = []
+        sync_chunk_count = 0
+
+        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
+            megatron_local_weights
+        ):
+            lora_named_tensors = [
+                (name, tensor)
+                for name, tensor in hf_named_tensors
+                if is_lora_weight_name(name)
+            ]
+            if not lora_named_tensors:
+                continue
+
+            sync_chunk_count += 1
+            if self._is_pp_src_rank:
+                all_lora_named_tensors.extend(
+                    (name, tensor.detach().cpu())
+                    for name, tensor in lora_named_tensors
+                )
+
+        if self._is_pp_src_rank:
+            if sync_chunk_count == 0:
+                raise RuntimeError(
+                    "Distributed LoRA weight sync failed: bridge export produced zero "
+                    "LoRA chunks."
+                )
+
+            serialized_tensors = _serialize_lora_named_tensors(all_lora_named_tensors)
+            if self._lora_loaded:
+                ray.get(
+                    [
+                        engine.unload_lora_adapter.remote(lora_name=LORA_ADAPTER_NAME)
+                        for engine in self.rollout_engines
+                    ]
+                )
+
+            results = ray.get(
+                [
+                    engine.load_lora_adapter_from_tensors.remote(
+                        lora_name=LORA_ADAPTER_NAME,
+                        config_dict=self._lora_config,
+                        serialized_tensors=serialized_tensors,
+                        load_format="flattened_bucket",
+                    )
+                    for engine in self.rollout_engines
+                ]
+            )
+            check_results(results, is_lora=True)
+            self._lora_loaded = True
+
+        dist.barrier(group=get_gloo_group())
+        if rank == 0:
+            if self.quantization_config and self.quantization_config["quant_method"] in [
+                "compressed-tensors",
+                "mxfp8",
+            ]:
+                post_process_weights(
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                    rollout_engines=self.rollout_engines,
+                )
+            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+
+    UpdateWeightFromDistributed.__init__ = __init__
+    UpdateWeightFromDistributed.update_weights = update_weights
+    _log("[miles-modal] patched distributed LoRA sync to export bridge adapters directly")
+
+
 _register_linear_cross_entropy_module()
 _patch_lora_cpu_serialization()
 _patch_sglang_lora_numpy_rehydration()
 _patch_sglang_logprob_sanitization()
 _patch_sglang_sampling_probability_sanitization()
+_patch_distributed_lora_sync()
