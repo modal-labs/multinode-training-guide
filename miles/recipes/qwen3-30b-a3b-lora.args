@@ -1,6 +1,6 @@
-# Qwen3-30B-A3B bridge-mode LoRA validation recipe.
-# Phase 1: confirm end-to-end Miles + Megatron-Bridge + SGLang support with
-# attention-only LoRA targets before widening into expert MLP modules.
+# Qwen3-30B-A3B bridge-mode LoRA recipe aligned with the
+# "LoRA Without Regret" guidance from Thinking Machines:
+# apply LoRA to the attention and MLP/MoE linear layers, not attention only.
 
 # Model architecture from the upstream Miles Qwen3-30B-A3B model script.
 --disable-bias-linear
@@ -39,7 +39,7 @@
 --lora-rank 32
 --lora-alpha 32
 --lora-dropout 0.0
---target-modules linear_qkv,linear_proj
+--target-modules linear_qkv,linear_proj,linear_fc1,linear_fc2
 
 # Data and rollout
 --prompt-data /data/gsm8k/train.parquet

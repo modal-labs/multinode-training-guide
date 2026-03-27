@@ -70,7 +70,7 @@ RECIPES = {
     ),
     "qwen3-30b-a3b-lora": Recipe(
         name="qwen3-30b-a3b-lora",
-        description="Single-node Qwen3-30B-A3B bridge-mode LoRA validation recipe.",
+        description="Single-node Qwen3-30B-A3B all-layer bridge-mode LoRA recipe aligned with current best practices.",
         model_id="Qwen/Qwen3-30B-A3B",
         args_file="qwen3-30b-a3b-lora.args",
         recommended_nodes=1,
@@ -78,7 +78,7 @@ RECIPES = {
     ),
     "qwen3-30b-a3b-lora-fewstep": Recipe(
         name="qwen3-30b-a3b-lora-fewstep",
-        description="Single-node Qwen3-30B-A3B attention-only LoRA recipe trimmed to chase a few full RL steps.",
+        description="Single-node Qwen3-30B-A3B all-layer LoRA recipe trimmed to chase a few full RL steps.",
         model_id="Qwen/Qwen3-30B-A3B",
         args_file="tests/qwen3-30b-a3b-lora-fewstep.args",
         recommended_nodes=1,
@@ -86,7 +86,7 @@ RECIPES = {
     ),
     "qwen3-30b-a3b-lora-greedy-debug": Recipe(
         name="qwen3-30b-a3b-lora-greedy-debug",
-        description="Single-node Qwen3-30B-A3B attention-only LoRA debug recipe with greedy rollout to validate LoRA sync.",
+        description="Single-node Qwen3-30B-A3B attention-only debug/control recipe with greedy rollout.",
         model_id="Qwen/Qwen3-30B-A3B",
         args_file="tests/qwen3-30b-a3b-lora-greedy-debug.args",
         recommended_nodes=1,
@@ -94,7 +94,7 @@ RECIPES = {
     ),
     "qwen3-30b-a3b-experts-lora": Recipe(
         name="qwen3-30b-a3b-experts-lora",
-        description="Second-phase Qwen3-30B-A3B recipe widened to expert linear_fc1/fc2 targets.",
+        description="Explicit all-layer Qwen3-30B-A3B LoRA recipe including expert linear_fc1/fc2 targets.",
         model_id="Qwen/Qwen3-30B-A3B",
         args_file="qwen3-30b-a3b-experts-lora.args",
         recommended_nodes=1,
@@ -102,7 +102,7 @@ RECIPES = {
     ),
     "qwen3-30b-a3b-experts-fewstep": Recipe(
         name="qwen3-30b-a3b-experts-fewstep",
-        description="Single-node Qwen3-30B-A3B expert-target LoRA recipe trimmed to chase a few RL steps.",
+        description="Explicit all-layer Qwen3-30B-A3B few-step recipe including expert linear_fc1/fc2 targets.",
         model_id="Qwen/Qwen3-30B-A3B",
         args_file="tests/qwen3-30b-a3b-experts-fewstep.args",
         recommended_nodes=1,

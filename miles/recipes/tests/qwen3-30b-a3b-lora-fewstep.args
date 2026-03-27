@@ -1,6 +1,6 @@
 # Qwen3-30B-A3B bridge-mode LoRA recipe tuned to get through a few RL steps.
-# This keeps attention-only LoRA targets but trims rollout pressure and disables
-# eval so the run can reach training sooner.
+# This keeps the smaller rollout shape from validation, but uses the
+# article-aligned all-layer LoRA target set rather than attention only.
 
 # Model architecture from the upstream Miles Qwen3-30B-A3B model script.
 --disable-bias-linear
@@ -39,7 +39,7 @@
 --lora-rank 32
 --lora-alpha 32
 --lora-dropout 0.0
---target-modules linear_qkv,linear_proj
+--target-modules linear_qkv,linear_proj,linear_fc1,linear_fc2
 
 # Data and rollout
 --prompt-data /data/gsm8k/train.parquet

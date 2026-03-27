@@ -1,6 +1,6 @@
 # Qwen3-30B-A3B bridge-mode LoRA recipe narrowed for faster Modal debugging.
-# This keeps attention-only LoRA targets, trims rollout pressure, and uses
-# deterministic top-k=1 decoding so the next run quickly isolates rollout bugs.
+# This intentionally keeps attention-only LoRA as a diagnostic control, trims
+# rollout pressure, and uses deterministic top-k=1 decoding to isolate bugs.
 
 # Model architecture from the upstream Miles Qwen3-30B-A3B model script.
 --disable-bias-linear

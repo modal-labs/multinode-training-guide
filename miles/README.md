@@ -24,16 +24,20 @@ Current recipes:
 
 - `qwen25-0p5b-lora`: single-node smoke test adapted from the upstream Miles
   LoRA example.
-- `qwen3-30b-a3b-lora`: first-pass Qwen3-30B-A3B bridge-mode LoRA validation
-  recipe, restricted to attention targets (`linear_qkv`, `linear_proj`).
-- `qwen3-30b-a3b-lora-fewstep`: trimmed attention-only recipe that is intended
-  to prove a few full RL updates on Modal.
-- `qwen3-30b-a3b-experts-lora`: second-pass Qwen3-30B-A3B recipe widened to
-  expert `linear_fc1` and `linear_fc2` targets after the baseline path works.
-- `qwen3-30b-a3b-experts-fewstep`: trimmed expert-target recipe built from the
-  working few-step shape.
+- `qwen3-30b-a3b-lora`: default Qwen3-30B-A3B all-layer recipe, targeting
+  attention plus MLP/MoE layers (`linear_qkv`, `linear_proj`, `linear_fc1`,
+  `linear_fc2`).
+- `qwen3-30b-a3b-lora-fewstep`: trimmed all-layer recipe that is intended to
+  prove a few full RL updates on Modal.
+- `qwen3-30b-a3b-experts-lora`: explicit all-layer alias that makes the expert
+  `linear_fc1` / `linear_fc2` targeting obvious in the name.
+- `qwen3-30b-a3b-experts-fewstep`: trimmed explicit all-layer alias built from
+  the working few-step shape.
 
 Testing/debug recipe files live under [`recipes/tests/`](./recipes/tests).
+The attention-only recipe is kept only as
+[`qwen3-30b-a3b-lora-greedy-debug`](./recipes/tests/qwen3-30b-a3b-lora-greedy-debug.args),
+as a diagnostic control rather than a recommended training setup.
 
 ## Prepare assets
 
@@ -66,7 +70,7 @@ Qwen3-30B-A3B baseline LoRA validation:
 MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-lora
 ```
 
-Qwen3-30B-A3B few-step attention-only validation:
+Qwen3-30B-A3B few-step all-layer validation:
 
 ```bash
 MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-lora-fewstep
@@ -89,6 +93,16 @@ MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-experts-fe
 - Start with standard LoRA, not DoRA. Miles' current rollout sync and adapter
   filtering are LoRA-specific and keyed off `lora_A` / `lora_B` names, so DoRA
   is not the first validation target.
+- The default Qwen3 recipes now follow the recommendations from Thinking
+  Machines' “LoRA Without Regret”: keep the standard `alpha=32` / `1/r`
+  parameterization, use a LoRA LR around 10x the FullFT baseline (`1e-5` here
+  vs. the upstream Qwen3-30B-A3B FullFT `1e-6`), and include the MLP/MoE layers
+  rather than using attention-only LoRA.
+- One MoE-specific nuance from the article is not exposed cleanly by the current
+  Miles recipe surface: their Qwen3 MoE experiments scale per-expert LoRA rank
+  by the number of active experts. Our recipes currently use a uniform
+  `--lora-rank 32` across all targeted modules because Miles exposes one global
+  LoRA rank, not per-module or per-expert ranks.
 - The baked Qwen3 recipes are single-node `H100:8` shapes. They are intended to
   validate end-to-end bridge-mode LoRA with colocated rollout first, not to
   exhaustively cover every parallelism combination.
@@ -99,8 +113,8 @@ MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-experts-fe
 - Miles currently supports LoRA weight sync only for colocated rollout engines.
   Distributed non-colocated rollout sync is not yet implemented for LoRA.
 - The baseline Qwen3 recipe stays close to the upstream Miles single-node
-  Qwen3-30B-A3B shape. The expert-target recipe is a follow-on experiment, not
-  the initial correctness target.
+  Qwen3-30B-A3B shape while using all-layer LoRA. The explicit expert-target
+  recipe names are kept mainly for clarity and backwards compatibility.
 
 ## Observed On Modal
 
@@ -117,21 +131,14 @@ The current wrapper includes runtime patches in
 
 What the Modal runs have validated so far on `modal-labs`:
 
-- `qwen3-30b-a3b-lora` gets through bridge-mode LoRA creation and attention
-  module injection (`linear_qkv`, `linear_proj`), and it can start loading the
-  Hugging Face checkpoint into Megatron.
-- `qwen3-30b-a3b-lora-fewstep` now gets through full RL training on Modal. In
-  recent runs it passed rollout, weight sync, and actor training repeatedly and
-  reached at least `train/step` 6 on a single-node `H100:8` shape.
-- `qwen3-30b-a3b-experts-lora` goes further: it creates LoRA with
-  `linear_qkv`, `linear_proj`, `linear_fc1`, and `linear_fc2`, injects those
-  expert targets under `decoder.layers.*.mlp.experts.*`, loads weights, pushes
-  the adapter into SGLang, and starts `Eval gsm8k`.
-- `qwen3-30b-a3b-experts-fewstep` has validated the widened target surface on
-  Modal: Miles creates LoRA with `linear_fc1` / `linear_fc2`, injects those
-  expert modules, completes weight sync, and reaches rollout collection plus
-  actor training. A detached confirmation of a full expert-target train step is
-  still in progress.
+- The all-layer Qwen3-30B-A3B LoRA shape now has runtime validation on Modal.
+  In recent detached runs of the few-step recipe shape, Miles created LoRA with
+  `linear_qkv`, `linear_proj`, `linear_fc1`, and `linear_fc2`, injected expert
+  modules under `decoder.layers.*.mlp.experts.*`, completed rollout collection,
+  and reached at least `train/step` 1 on a single-node `H100:8` shape.
+- The attention-only debug/control recipe also works, but it is no longer the
+  recommended configuration after comparing against the Thinking Machines
+  guidance.
 - The remaining instability has been in the colocated SGLang rollout path, not
   in LoRA target discovery. The main concrete runtime failures we hit were:
   non-finite logprobs breaking HTTP JSON serialization, and invalid sampling
@@ -141,8 +148,8 @@ Current interpretation:
 
 - Qwen3-30B-A3B MoE LoRA support in Miles is real enough to instantiate,
   target, load, and export adapters for both attention and expert MLP layers.
-- Attention-only Qwen3-30B-A3B LoRA is now runtime-validated for repeated RL
-  updates on `modal-labs`.
+- Attention-only Qwen3-30B-A3B LoRA is still runtime-validated as a debug
+  control on `modal-labs`, but it is no longer the recommended default.
 - The remaining risk is concentrated in the colocated SGLang rollout lifecycle,
   which is coupled to `offload_rollout` / `enable_memory_saver=True` in the
   current Miles SGLang engine setup, especially once expert-target LoRA is
