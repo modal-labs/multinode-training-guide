@@ -1,27 +1,38 @@
-"""
-Thin Modal launcher for multi-node Miles training.
+"""Launch Miles training jobs on Modal.
 
-Design:
-- Bootstrap the Ray cluster once in modal.enter() inside a clustered modal.Cls.
-- Submit the actual Miles job from a modal.method() on rank 0.
-- Keep Miles recipes as native CLI flag files under miles/recipes/.
-- Own only infrastructure-critical flags in Python:
-  cluster size, GPUs per node, model path resolution, checkpoint path, and
-  optional YAML override transport.
+This module defines the clustered `MilesCluster` launcher, helper functions for
+model download and dataset preparation, and a local CLI entrypoint for
+submitting runs.
+
+It supports two execution modes:
+  - deployed: submit runs to a deployed `MilesCluster` with a fixed compute shape
+  - ephemeral: launch a one-off app directly from the local entrypoint
+
+The Python wrapper owns only Modal and Ray orchestration plus a small set of
+infrastructure-critical flags. Model and training arguments live in `recipes/`.
 """
 
 import datetime as dt
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import time
-from dataclasses import dataclass
 from typing import Optional
 
 import modal
 import modal.experimental
 
+from recipes import (
+    Recipe,
+    format_recipe_table,
+    get_optional_recipe,
+    load_recipe_text,
+    merge_arg_texts,
+    parse_arg_text,
+    read_arg_file,
+)
 
 here = pathlib.Path(__file__).parent.resolve()
 
@@ -34,7 +45,7 @@ LOCAL_MILES_PATH = os.environ.get("USE_LOCAL_MILES", "")
 HF_CACHE_PATH = pathlib.Path("/root/.cache/huggingface")
 DATA_PATH = pathlib.Path("/data")
 CHECKPOINTS_PATH = pathlib.Path("/checkpoints")
-REMOTE_RECIPES_DIR = pathlib.Path("/root/miles-recipes")
+REMOTE_RECIPES_DIR = pathlib.Path("/root/recipes")
 REMOTE_PATCH_DIR = pathlib.Path("/root/miles-modal-patches")
 REMOTE_MILES_DIR = pathlib.Path("/root/miles")
 REMOTE_TRAIN_SCRIPT = REMOTE_MILES_DIR / "train.py"
@@ -49,75 +60,6 @@ checkpoints_volume = modal.Volume.from_name(
 )
 
 
-@dataclass(frozen=True)
-class Recipe:
-    name: str
-    description: str
-    model_id: str
-    args_file: str
-    recommended_nodes: int
-    gpu: str
-
-
-RECIPES = {
-    "qwen25-0p5b-lora": Recipe(
-        name="qwen25-0p5b-lora",
-        description="Single-node smoke test adapted from the upstream Miles LoRA example.",
-        model_id="Qwen/Qwen2.5-0.5B-Instruct",
-        args_file="tests/qwen25-0p5b-lora.args",
-        recommended_nodes=1,
-        gpu="H100:8",
-    ),
-    "qwen3-30b-a3b-lora": Recipe(
-        name="qwen3-30b-a3b-lora",
-        description="Single-node Qwen3-30B-A3B all-layer bridge-mode LoRA recipe aligned with current best practices.",
-        model_id="Qwen/Qwen3-30B-A3B",
-        args_file="qwen3-30b-a3b-lora.args",
-        recommended_nodes=1,
-        gpu="H100:8",
-    ),
-    "qwen3-30b-a3b-lora-fewstep": Recipe(
-        name="qwen3-30b-a3b-lora-fewstep",
-        description="Single-node Qwen3-30B-A3B all-layer LoRA recipe trimmed to chase a few full RL steps.",
-        model_id="Qwen/Qwen3-30B-A3B",
-        args_file="tests/qwen3-30b-a3b-lora-fewstep.args",
-        recommended_nodes=1,
-        gpu="H100:8",
-    ),
-    "qwen3-30b-a3b-lora-greedy-debug": Recipe(
-        name="qwen3-30b-a3b-lora-greedy-debug",
-        description="Single-node Qwen3-30B-A3B attention-only debug/control recipe with greedy rollout.",
-        model_id="Qwen/Qwen3-30B-A3B",
-        args_file="tests/qwen3-30b-a3b-lora-greedy-debug.args",
-        recommended_nodes=1,
-        gpu="H100:8",
-    ),
-    "qwen3-30b-a3b-experts-lora": Recipe(
-        name="qwen3-30b-a3b-experts-lora",
-        description="Explicit all-layer Qwen3-30B-A3B LoRA recipe including expert linear_fc1/fc2 targets.",
-        model_id="Qwen/Qwen3-30B-A3B",
-        args_file="qwen3-30b-a3b-experts-lora.args",
-        recommended_nodes=1,
-        gpu="H100:8",
-    ),
-    "qwen3-30b-a3b-experts-fewstep": Recipe(
-        name="qwen3-30b-a3b-experts-fewstep",
-        description="Explicit all-layer Qwen3-30B-A3B few-step recipe including expert linear_fc1/fc2 targets.",
-        model_id="Qwen/Qwen3-30B-A3B",
-        args_file="tests/qwen3-30b-a3b-experts-fewstep.args",
-        recommended_nodes=1,
-        gpu="H100:8",
-    ),
-}
-
-
-def _get_recipe(name: str) -> Recipe:
-    if name not in RECIPES:
-        available = ", ".join(sorted(RECIPES))
-        raise ValueError(f"Unknown recipe: {name}. Available recipes: {available}")
-    return RECIPES[name]
-
-
 def _parse_gpus_per_node(gpu: str) -> int:
     try:
         return int(gpu.rsplit(":", 1)[1])
@@ -127,29 +69,44 @@ def _parse_gpus_per_node(gpu: str) -> int:
         ) from exc
 
 
-def _clean_arg_text(arg_text: str) -> str:
-    lines: list[str] = []
-    for raw_line in arg_text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if line:
-            lines.append(line)
-    return "\n".join(lines)
+def _resolve_model_id(recipe: Recipe | None, model_id: str) -> str:
+    if model_id:
+        return model_id
+    if recipe:
+        return recipe.model_id
+    raise ValueError("Pass --recipe or --model-id.")
 
 
-def _parse_arg_text(arg_text: str) -> list[str]:
-    cleaned = _clean_arg_text(arg_text)
-    return shlex.split(cleaned) if cleaned else []
+def _sanitize_path_component(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return sanitized or "run"
 
 
-def _load_recipe_text(recipe: Recipe, remote: bool = False) -> str:
-    base_dir = REMOTE_RECIPES_DIR if remote else here / "recipes"
-    return (base_dir / recipe.args_file).read_text()
+def _resolve_run_label(recipe: Recipe | None, *, model_id: str, run_name: str) -> str:
+    if run_name:
+        return _sanitize_path_component(run_name)
+    if recipe:
+        return recipe.name
+    return _sanitize_path_component(model_id)
+
+
+def _resolve_base_args_text(
+    recipe: Recipe | None,
+    *,
+    args_text: str,
+    recipes_dir: pathlib.Path,
+) -> str:
+    parts: list[str] = []
+    if recipe:
+        parts.append(load_recipe_text(recipe, base_dir=recipes_dir))
+    if args_text:
+        parts.append(args_text)
+    return merge_arg_texts(*parts)
 
 
 def _build_enforced_args(
     *,
     model_path: str,
-    cluster_nodes: int,
     actor_nodes: int,
     gpus_per_node: int,
     checkpoint_dir: pathlib.Path,
@@ -193,25 +150,22 @@ def _build_enforced_args(
 
 
 def _build_miles_argv(
-    recipe: Recipe,
     *,
+    base_args_text: str,
     model_path: str,
-    cluster_nodes: int,
     actor_nodes: int,
     gpus_per_node: int,
     checkpoint_dir: pathlib.Path,
     extra_args_text: str,
     custom_config_path: Optional[str],
     wandb_key: Optional[str],
-    remote_recipe: bool,
     colocate: bool,
     rollout_num_gpus: Optional[int],
 ) -> list[str]:
-    recipe_args = _parse_arg_text(_load_recipe_text(recipe, remote=remote_recipe))
-    extra_args = _parse_arg_text(extra_args_text)
+    base_args = parse_arg_text(base_args_text)
+    extra_args = parse_arg_text(extra_args_text)
     enforced_args = _build_enforced_args(
         model_path=model_path,
-        cluster_nodes=cluster_nodes,
         actor_nodes=actor_nodes,
         gpus_per_node=gpus_per_node,
         checkpoint_dir=checkpoint_dir,
@@ -220,10 +174,18 @@ def _build_miles_argv(
         colocate=colocate,
         rollout_num_gpus=rollout_num_gpus,
     )
-    return ["python3", REMOTE_TRAIN_SCRIPT.as_posix(), *recipe_args, *extra_args, *enforced_args]
+    return [
+        "python3",
+        REMOTE_TRAIN_SCRIPT.as_posix(),
+        *base_args,
+        *extra_args,
+        *enforced_args,
+    ]
 
 
-def _resolve_actor_nodes(cluster_nodes: int, *, colocate: bool, actor_nodes: int) -> int:
+def _resolve_actor_nodes(
+    cluster_nodes: int, *, colocate: bool, actor_nodes: int
+) -> int:
     if colocate:
         return cluster_nodes
     if actor_nodes > 0:
@@ -258,12 +220,6 @@ def _resolve_rollout_num_gpus(
     return spare_gpus
 
 
-def _read_optional_file(path_str: str) -> str:
-    if not path_str:
-        return ""
-    return pathlib.Path(path_str).read_text()
-
-
 def _build_runtime_env(master_addr: str, wandb_key: Optional[str]) -> dict:
     env_vars = {
         "MASTER_ADDR": master_addr,
@@ -282,21 +238,17 @@ def _build_runtime_env(master_addr: str, wandb_key: Optional[str]) -> dict:
 
 def _print_recipe_table():
     print("Available recipes:")
-    for recipe in sorted(RECIPES.values(), key=lambda item: item.name):
-        print(
-            f"  - {recipe.name}: {recipe.description} "
-            f"(model={recipe.model_id}, nodes={recipe.recommended_nodes}, gpu={recipe.gpu})"
-        )
+    for line in format_recipe_table():
+        print(line)
 
 
 image = (
     modal.Image.from_registry(MILES_IMAGE)
     .entrypoint([])
-    .add_local_dir(here / "recipes", remote_path=REMOTE_RECIPES_DIR.as_posix(), copy=True)
+    .add_local_dir(here / "recipes", remote_path=REMOTE_RECIPES_DIR.as_posix())
     .add_local_dir(
         here / "modal_patches",
         remote_path=REMOTE_PATCH_DIR.as_posix(),
-        copy=True,
     )
 )
 
@@ -316,6 +268,9 @@ with image.imports():
 
 
 app = modal.App(APP_NAME)
+
+
+# ---- Training Cluster Cls ---- #
 
 
 @app.cls(
@@ -414,12 +369,15 @@ class MilesCluster:
     @modal.method()
     async def submit_training(
         self,
-        recipe_name: str,
+        recipe_name: str = "",
         *,
+        model_id: str = "",
+        base_args_text: str = "",
         gpus_per_node: int,
         extra_args_text: str = "",
         custom_config_yaml: str = "",
         wandb_key: str = "",
+        run_name: str = "",
         actor_nodes: int | None = None,
         colocate: bool = True,
         rollout_num_gpus: int | None = None,
@@ -430,44 +388,65 @@ class MilesCluster:
             while True:
                 time.sleep(10)
 
-        recipe = _get_recipe(recipe_name)
+        recipe = get_optional_recipe(recipe_name)
+        resolved_model_id = _resolve_model_id(recipe, model_id)
+        resolved_base_args_text = _resolve_base_args_text(
+            recipe,
+            args_text=base_args_text,
+            recipes_dir=REMOTE_RECIPES_DIR,
+        )
+        if not resolved_base_args_text:
+            raise ValueError(
+                "No training args were provided. Choose a recipe or pass --args/--args-file."
+            )
+        run_label = _resolve_run_label(
+            recipe,
+            model_id=resolved_model_id,
+            run_name=run_name,
+        )
 
         try:
-            model_path = snapshot_download(repo_id=recipe.model_id, local_files_only=True)
+            model_path = snapshot_download(
+                repo_id=resolved_model_id, local_files_only=True
+            )
         except Exception as exc:
-            raise RuntimeError(
-                f"Model {recipe.model_id} is not present in the shared HF cache. "
+            recipe_hint = (
                 f"Run `modal run miles/modal_train.py::download_model --recipe {recipe.name}` first."
+                if recipe
+                else f"Run `modal run miles/modal_train.py::download_model --model-id {resolved_model_id}` first."
+            )
+            raise RuntimeError(
+                f"Model {resolved_model_id} is not present in the shared HF cache. "
+                f"{recipe_hint}"
             ) from exc
 
         run_id = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        checkpoint_dir = CHECKPOINTS_PATH / recipe.name / run_id
+        checkpoint_dir = CHECKPOINTS_PATH / run_label / run_id
         custom_config_path = None
         if custom_config_yaml:
-            custom_config_path = f"/tmp/{recipe.name}-{run_id}-overrides.yaml"
+            custom_config_path = f"/tmp/{run_label}-{run_id}-overrides.yaml"
             pathlib.Path(custom_config_path).write_text(custom_config_yaml)
 
         resolved_actor_nodes = actor_nodes if actor_nodes is not None else CLUSTER_NODES
         resolved_rollout_num_gpus = rollout_num_gpus
         argv = _build_miles_argv(
-            recipe,
+            base_args_text=resolved_base_args_text,
             model_path=model_path,
-            cluster_nodes=CLUSTER_NODES,
             actor_nodes=resolved_actor_nodes,
             gpus_per_node=gpus_per_node,
             checkpoint_dir=checkpoint_dir,
             extra_args_text=extra_args_text,
             custom_config_path=custom_config_path,
             wandb_key=wandb_key or None,
-            remote_recipe=True,
             colocate=colocate,
             rollout_num_gpus=resolved_rollout_num_gpus,
         )
         entrypoint = shlex.join(argv)
         runtime_env = _build_runtime_env(self.main_addr, wandb_key or None)
 
-        print(f"Recipe: {recipe.name}")
-        print(f"Model: {recipe.model_id}")
+        print(f"Recipe: {recipe.name if recipe else '<none>'}")
+        print(f"Model: {resolved_model_id}")
+        print(f"Run label: {run_label}")
         print(f"Cluster nodes: {CLUSTER_NODES}")
         print(f"Actor nodes: {resolved_actor_nodes}")
         print(f"Colocate: {colocate}")
@@ -479,7 +458,9 @@ class MilesCluster:
 
         with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
             print(f"Dashboard URL: {tunnel.url}")
-            job_id = self.client.submit_job(entrypoint=entrypoint, runtime_env=runtime_env)
+            job_id = self.client.submit_job(
+                entrypoint=entrypoint, runtime_env=runtime_env
+            )
             print(f"Submitted Ray job: {job_id}")
 
             async for line in self.client.tail_job_logs(job_id):
@@ -491,9 +472,14 @@ class MilesCluster:
         return {
             "job_id": job_id,
             "status": status,
-            "recipe": recipe.name,
+            "recipe": recipe.name if recipe else None,
+            "model_id": resolved_model_id,
+            "run_name": run_label,
             "checkpoint_dir": checkpoint_dir.as_posix(),
         }
+
+
+# ---- Model Download Utility ---- #
 
 
 @app.function(
@@ -509,7 +495,12 @@ def download_model(
 ):
     from huggingface_hub import snapshot_download
 
-    resolved_model_id = model_id or _get_recipe(recipe).model_id
+    selected_recipe = get_optional_recipe(recipe)
+    resolved_model_id = model_id or (
+        selected_recipe.model_id if selected_recipe else ""
+    )
+    if not resolved_model_id:
+        raise ValueError("Pass --recipe or --model-id.")
     hf_cache_volume.reload()
     path = snapshot_download(
         repo_id=resolved_model_id,
@@ -520,6 +511,9 @@ def download_model(
     hf_cache_volume.commit()
 
 
+# ---- Dataset Processing Utility ---- #
+
+
 @app.function(
     image=image,
     volumes={DATA_PATH.as_posix(): data_volume},
@@ -528,29 +522,47 @@ def download_model(
 def prepare_dataset(
     hf_dataset: str = "zhuzilin/gsm8k",
     data_folder: str = "gsm8k",
+    train_limit: int = 0,
+    test_limit: int = 0,
 ):
     from datasets import load_dataset
 
     data_volume.reload()
     dataset = load_dataset(hf_dataset)
+    train_split = dataset["train"]
+    test_split = dataset["test"]
+    if train_limit > 0:
+        train_split = train_split.select(range(min(train_limit, len(train_split))))
+    if test_limit > 0:
+        test_split = test_split.select(range(min(test_limit, len(test_split))))
     output_dir = DATA_PATH / data_folder
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset["train"].to_parquet((output_dir / "train.parquet").as_posix())
-    dataset["test"].to_parquet((output_dir / "test.parquet").as_posix())
+    train_split.to_parquet((output_dir / "train.parquet").as_posix())
+    test_split.to_parquet((output_dir / "test.parquet").as_posix())
     data_volume.commit()
-    print(f"Prepared dataset {hf_dataset} under {output_dir}")
+    print(
+        f"Prepared dataset {hf_dataset} under {output_dir} "
+        f"(train_rows={len(train_split)}, test_rows={len(test_split)})"
+    )
+
+
+# ---- Local Entrypoint ---- #
 
 
 @app.local_entrypoint()
 def main(
-    recipe: str = "qwen3-30b-a3b-lora",
+    recipe: str = "",
+    model_id: str = "",
     gpu: str = "",
+    args: str = "",
+    args_file: str = "",
     extra_args: str = "",
     extra_args_file: str = "",
     custom_config: str = "",
     list_recipes: bool = False,
     dry_run: bool = False,
     allow_cluster_mismatch: bool = False,
+    run_name: str = "",
     colocate: bool = True,
     actor_nodes: int = 0,
     rollout_num_gpus: int = 0,
@@ -559,8 +571,9 @@ def main(
         _print_recipe_table()
         return
 
-    selected_recipe = _get_recipe(recipe)
-    selected_gpu = gpu or selected_recipe.gpu
+    selected_recipe = get_optional_recipe(recipe)
+    resolved_model_id = _resolve_model_id(selected_recipe, model_id)
+    selected_gpu = gpu or (selected_recipe.gpu if selected_recipe else DEFAULT_GPU)
     gpus_per_node = _parse_gpus_per_node(selected_gpu)
     resolved_actor_nodes = _resolve_actor_nodes(
         CLUSTER_NODES,
@@ -576,7 +589,8 @@ def main(
     )
 
     if (
-        not allow_cluster_mismatch
+        selected_recipe
+        and not allow_cluster_mismatch
         and CLUSTER_NODES != selected_recipe.recommended_nodes
     ):
         raise ValueError(
@@ -585,30 +599,44 @@ def main(
             f"Rerun with the recommended value or pass --allow-cluster-mismatch."
         )
 
-    merged_extra_args = "\n".join(
-        part for part in [extra_args, _read_optional_file(extra_args_file)] if part
+    base_args_text = merge_arg_texts(args, read_arg_file(args_file))
+    resolved_base_args_text = _resolve_base_args_text(
+        selected_recipe,
+        args_text=base_args_text,
+        recipes_dir=here / "recipes",
     )
-    custom_config_yaml = _read_optional_file(custom_config)
+    if not resolved_base_args_text:
+        raise ValueError(
+            "No training args were provided. Choose a recipe or pass --args/--args-file."
+        )
+    merged_extra_args = merge_arg_texts(extra_args, read_arg_file(extra_args_file))
+    custom_config_yaml = read_arg_file(custom_config)
     wandb_key = os.environ.get("WANDB_API_KEY", "")
-    checkpoint_dir = CHECKPOINTS_PATH / selected_recipe.name / "DRY_RUN"
+    resolved_run_label = _resolve_run_label(
+        selected_recipe,
+        model_id=resolved_model_id,
+        run_name=run_name,
+    )
+    checkpoint_dir = CHECKPOINTS_PATH / resolved_run_label / "DRY_RUN"
 
     if dry_run:
         argv = _build_miles_argv(
-            selected_recipe,
+            base_args_text=resolved_base_args_text,
             model_path="$MODEL_PATH",
-            cluster_nodes=CLUSTER_NODES,
             actor_nodes=resolved_actor_nodes,
             gpus_per_node=gpus_per_node,
             checkpoint_dir=checkpoint_dir,
             extra_args_text=merged_extra_args,
-            custom_config_path="/tmp/custom-config.yaml" if custom_config_yaml else None,
+            custom_config_path="/tmp/custom-config.yaml"
+            if custom_config_yaml
+            else None,
             wandb_key="$WANDB_API_KEY" if wandb_key else None,
-            remote_recipe=False,
             colocate=colocate,
             rollout_num_gpus=resolved_rollout_num_gpus,
         )
-        print(f"Recipe: {selected_recipe.name}")
-        print(f"Model: {selected_recipe.model_id}")
+        print(f"Recipe: {selected_recipe.name if selected_recipe else '<none>'}")
+        print(f"Model: {resolved_model_id}")
+        print(f"Run label: {resolved_run_label}")
         print(f"Cluster nodes: {CLUSTER_NODES}")
         print(f"Actor nodes: {resolved_actor_nodes}")
         print(f"Colocate: {colocate}")
@@ -618,8 +646,9 @@ def main(
         print(shlex.join(argv))
         return
 
-    print(f"Recipe: {selected_recipe.name}")
-    print(f"Model: {selected_recipe.model_id}")
+    print(f"Recipe: {selected_recipe.name if selected_recipe else '<none>'}")
+    print(f"Model: {resolved_model_id}")
+    print(f"Run label: {resolved_run_label}")
     print(f"Cluster nodes: {CLUSTER_NODES}")
     print(f"Actor nodes: {resolved_actor_nodes}")
     print(f"Colocate: {colocate}")
@@ -627,13 +656,25 @@ def main(
         print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
     print(f"GPU: {selected_gpu}")
 
-    cluster = MilesCluster.with_options(gpu=selected_gpu)()
+    try:
+        cluster_cls = modal.Cls.from_name(APP_NAME, "MilesCluster")
+        print(f"Using deployed Modal class: {APP_NAME}.MilesCluster")
+    except modal.exception.NotFoundError:
+        cluster_cls = MilesCluster
+        print(
+            f"No deployed Modal class found for {APP_NAME}.MilesCluster; using an ephemeral app."
+        )
+
+    cluster = cluster_cls.with_options(gpu=selected_gpu)()
     result = cluster.submit_training.remote(
-        recipe_name=selected_recipe.name,
+        recipe_name=selected_recipe.name if selected_recipe else "",
+        model_id=resolved_model_id,
+        base_args_text=base_args_text,
         gpus_per_node=gpus_per_node,
         extra_args_text=merged_extra_args,
         custom_config_yaml=custom_config_yaml,
         wandb_key=wandb_key,
+        run_name=resolved_run_label,
         actor_nodes=resolved_actor_nodes,
         colocate=colocate,
         rollout_num_gpus=resolved_rollout_num_gpus,
