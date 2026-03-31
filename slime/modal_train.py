@@ -8,18 +8,27 @@ import time
 import modal
 import modal.experimental
 
-import configs as _configs
+from configs import (
+    qwen_4b_gsm8k,
+    qwen_8b_gsm8k,
+    glm47_flash_dapo,
+    glm47_flash_dapo_multinode,
+    qwen3vl_geo3k_vlm,
+    qwen3vl_geo3k_vlm_diff,
+    qwen3vl_geo3k_vlm_noncolocate_multinode,
+)
 from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, YAML_CONFIG_FIELDS
 
 # ── Config registry ───────────────────────────────────────────────────────────
 
 CONFIGS = {
-    "qwen-4b-gsm8k": _configs.qwen_4b_gsm8k,
-    "qwen-8b-gsm8k": _configs.qwen_8b_gsm8k,
-    "glm4.7-flash-dapo": _configs.glm47_flash_dapo,
-    "glm4.7-flash-dapo-2n": _configs.glm47_flash_dapo_multinode,
-    "qwen3vl-geo3k-vlm": _configs.qwen3vl_geo3k_vlm,
-    "qwen3vl-geo3k-vlm-diff": _configs.qwen3vl_geo3k_vlm_diff,
+    "qwen-4b-gsm8k": qwen_4b_gsm8k,
+    "qwen-8b-gsm8k": qwen_8b_gsm8k,
+    "glm4.7-flash-dapo": glm47_flash_dapo,
+    "glm4.7-flash-dapo-2n": glm47_flash_dapo_multinode,
+    "qwen3vl-geo3k-vlm": qwen3vl_geo3k_vlm,
+    "qwen3vl-geo3k-vlm-diff": qwen3vl_geo3k_vlm_diff,
+    "qwen3vl-geo3k-vlm-noncolocate-2n": qwen3vl_geo3k_vlm_noncolocate_multinode,
 }
 
 
@@ -27,6 +36,7 @@ def get_module(name: str):
     if name not in CONFIGS:
         raise ValueError(f"Unknown config {name!r}. Available: {sorted(CONFIGS)}")
     return CONFIGS[name]
+
 
 # ── Experiment (client-side only — feeds decorator params) ────────────────────
 
@@ -114,9 +124,9 @@ def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
 )
 def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Run the prepare_data() to populate the data volume."""
-    exp_mod = get_module(experiment)
+    slime_cfg = get_module(experiment).slime
     data_volume.reload()
-    exp_mod.prepare_data()
+    slime_cfg.prepare_data()
     data_volume.commit()
 
 

@@ -95,24 +95,25 @@ slime = _Slime()
 Every attribute on `_Slime` (except `environment`, `async_mode`, `slime_model_script`) is forwarded to
 SLIME as a CLI argument: `field_name` → `--field-name`. See `configs/base.py` for full rules.
 
-### 2. Add a `prepare_data()` function (if needed)
+### 2. Add a `prepare_data()` method (if needed)
 
-If your experiment needs to download or preprocess a dataset, define a module-level `prepare_data()`
-function. It runs inside the Modal container with the `slime-data` volume mounted at `DATA_PATH`.
+If your experiment needs to download or preprocess a dataset, override `prepare_data()` on `_Slime`.
+It runs inside the Modal container with the `slime-data` volume mounted at `DATA_PATH`.
 
 ```python
-def prepare_data() -> None:
-    """Download my dataset to the data volume."""
-    from huggingface_hub import snapshot_download
+class _Slime(SlimeConfig):
+    ...
+    def prepare_data(self) -> None:
+        from huggingface_hub import snapshot_download
 
-    snapshot_download(
-        repo_id="org/my-dataset",
-        repo_type="dataset",
-        local_dir=f"{DATA_PATH}/my_dataset",
-    )
+        snapshot_download(
+            repo_id="org/my-dataset",
+            repo_type="dataset",
+            local_dir=f"{DATA_PATH}/my_dataset",
+        )
 ```
 
-If no `prepare_data()` is defined, `prepare_dataset` will raise an error — simply skip that step.
+If `prepare_data()` is not overridden, `prepare_dataset` will raise `NotImplementedError` — simply skip that step.
 
 ### 3. Register the experiment
 

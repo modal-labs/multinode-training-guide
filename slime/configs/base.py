@@ -133,6 +133,9 @@ class SlimeConfig:
                 out += [flag, str(val)]
         return out
 
+    def prepare_data(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} has no prepare_data()")
+
     def total_nodes(self) -> int:
         """Total Modal cluster nodes required by this config.
 

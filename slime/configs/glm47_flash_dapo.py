@@ -112,25 +112,24 @@ class _Slime(SlimeConfig):
     wandb_group = "glm4.7-flash-dapo-math-1n"
     disable_wandb_random_suffix = True
 
+    def prepare_data(self) -> None:
+        """Download DAPO-Math-17k and AIME-2024 from HuggingFace to the data volume."""
+        import os
+        from huggingface_hub import snapshot_download
+
+        os.makedirs(f"{DATA_PATH}/dapo-math-17k", exist_ok=True)
+        os.makedirs(f"{DATA_PATH}/aime-2024", exist_ok=True)
+
+        snapshot_download(
+            repo_id="zhuzilin/dapo-math-17k",
+            repo_type="dataset",
+            local_dir=f"{DATA_PATH}/dapo-math-17k",
+        )
+        snapshot_download(
+            repo_id="zhuzilin/aime-2024",
+            repo_type="dataset",
+            local_dir=f"{DATA_PATH}/aime-2024",
+        )
+
 
 slime = _Slime()
-
-
-def prepare_data() -> None:
-    """Download DAPO-Math-17k and AIME-2024 from HuggingFace to the data volume."""
-    import os
-    from huggingface_hub import snapshot_download
-
-    os.makedirs(f"{DATA_PATH}/dapo-math-17k", exist_ok=True)
-    os.makedirs(f"{DATA_PATH}/aime-2024", exist_ok=True)
-
-    snapshot_download(
-        repo_id="zhuzilin/dapo-math-17k",
-        repo_type="dataset",
-        local_dir=f"{DATA_PATH}/dapo-math-17k",
-    )
-    snapshot_download(
-        repo_id="zhuzilin/aime-2024",
-        repo_type="dataset",
-        local_dir=f"{DATA_PATH}/aime-2024",
-    )

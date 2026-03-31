@@ -103,16 +103,15 @@ class _Slime(SlimeConfig):
     wandb_group = "qwen3-vl-30b-a3b-instruct-megatron"
     disable_wandb_random_suffix = True
 
+    def prepare_data(self) -> None:
+        """Download the Geo3K VLM parquet dataset to the data volume."""
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            repo_id="chenhegu/geo3k_imgurl",
+            repo_type="dataset",
+            local_dir=f"{DATA_PATH}/geo3k_imgurl",
+        )
+
 
 slime = _Slime()
-
-
-def prepare_data() -> None:
-    """Download the Geo3K VLM parquet dataset to the data volume."""
-    from huggingface_hub import snapshot_download
-
-    snapshot_download(
-        repo_id="chenhegu/geo3k_imgurl",
-        repo_type="dataset",
-        local_dir=f"{DATA_PATH}/geo3k_imgurl",
-    )
