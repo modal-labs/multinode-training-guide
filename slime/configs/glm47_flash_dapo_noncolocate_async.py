@@ -3,10 +3,13 @@
 TP=2, PP=2, CP=2, EP=8 → TP×EP=16, requires 3 nodes total.
 Checkpoint: convert with nproc=4 (TP=2, PP=2, decoder_last=23) → GLM-4.7-Flash_torch_dist_tp2pp2
 """
-from configs.glm47_flash_dapo_noncolocate import _Slime as _Glm47Slime, modal
+
+from configs import glm47_flash_dapo_noncolocate as _base
+
+modal = _base.modal
 
 
-class _Slime(_Glm47Slime):
+class _Slime(_base._Slime):
     # ── Async ──────────────────────────────────────────────────────────────────
     async_mode = True
 

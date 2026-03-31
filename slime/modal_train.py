@@ -75,7 +75,8 @@ def list_configs():
         mod = get_module(name)
         nodes = mod.slime.total_nodes()
         gpu = f"{mod.modal.gpu}:{mod.slime.actor_num_gpus_per_node}"
-        print(f"  {name:<40} {nodes} node(s) × {gpu}")
+        mode = "async" if mod.slime.async_mode else "sync"
+        print(f"  {name:<40} {nodes} node(s) × {gpu}  ({mode})")
 
 
 @app.function(
@@ -296,10 +297,11 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
 
     client = JobSubmissionClient("http://127.0.0.1:8265")
     job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
+    nodes = slime_cfg.total_nodes()
+    gpu = f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}"
+    mode = "async" if slime_cfg.async_mode else "sync"
     print(f"Job submitted: {job_id}")
-    print(
-        f"Training {experiment:<40} {slime_cfg.total_nodes()} node(s) × {modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}"
-    )
+    print(f"Training {experiment:<40} {nodes} node(s) × {gpu}  ({mode})")
     print(f"Command: {cmd}, runtime_env: {runtime_env}")
 
     async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:

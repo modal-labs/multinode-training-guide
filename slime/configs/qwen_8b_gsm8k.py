@@ -4,13 +4,12 @@ Inherits all settings from qwen_4b_gsm8k and overrides what differs:
 model checkpoint, architecture, node count, and batch sizes.
 """
 
-from configs.base import ModalConfig
-from configs.qwen_4b_gsm8k import _Slime as _Qwen4bSlime
+from configs import qwen_4b_gsm8k as _base
 
-modal = ModalConfig(gpu="H200")
+modal = _base.modal
 
 
-class _Slime(_Qwen4bSlime):
+class _Slime(_base._Slime):
     # ── Model ─────────────────────────────────────────────────────────────────
     hf_checkpoint = "Qwen/Qwen3-8B"
 

@@ -22,7 +22,7 @@ modal run slime/modal_train.py::list_configs
 Downloads the experiment's HF checkpoint to the `huggingface-cache` volume.
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime/modal_train.py::download_model
+EXPERIMENT_CONFIG=glm47_flash_dapo modal run slime/modal_train.py::download_model
 ```
 
 ### 3. Prepare dataset (one-time)
@@ -31,7 +31,7 @@ Downloads and preprocesses the training dataset to the `slime-data` volume.
 Only required if the experiment defines a `prepare_data()` function (see [Adding an experiment](#adding-an-experiment)).
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime/modal_train.py::prepare_dataset
+EXPERIMENT_CONFIG=glm47_flash_dapo modal run slime/modal_train.py::prepare_dataset
 ```
 
 ### 4. Convert checkpoint (one-time, raw mode only)
@@ -40,13 +40,13 @@ Converts the HF checkpoint to `torch_dist` format. Only required when `megatron_
 Skip this step if using bridge mode.
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime/modal_train.py::convert_checkpoint
+EXPERIMENT_CONFIG=glm47_flash_dapo modal run slime/modal_train.py::convert_checkpoint
 ```
 
 ### 5. Run training
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run -d slime/modal_train.py::train
+EXPERIMENT_CONFIG=glm47_flash_dapo modal run -d slime/modal_train.py::train
 ```
 
 Use `-d` (detached) to keep training running after you close your terminal.
@@ -115,27 +115,18 @@ class _Slime(SlimeConfig):
 
 If `prepare_data()` is not overridden, `prepare_dataset` will raise `NotImplementedError` — simply skip that step.
 
-### 3. Register the experiment
+### 3. Run the workflow
 
-In `configs/__init__.py`, import the module and add an entry to `CONFIGS`:
-
-```python
-from . import my_experiment
-
-CONFIGS = {
-    ...
-    "my-experiment": my_experiment,
-}
-```
-
-### 4. Run the workflow
+`EXPERIMENT_CONFIG` is the config filename without `.py`:
 
 ```bash
-EXPERIMENT_CONFIG=my-experiment modal run slime/modal_train.py::download_model
-EXPERIMENT_CONFIG=my-experiment modal run slime/modal_train.py::prepare_dataset  # if prepare_data() defined
-EXPERIMENT_CONFIG=my-experiment modal run slime/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
-EXPERIMENT_CONFIG=my-experiment modal run -d slime/modal_train.py::train
+EXPERIMENT_CONFIG=my_experiment modal run slime/modal_train.py::download_model
+EXPERIMENT_CONFIG=my_experiment modal run slime/modal_train.py::prepare_dataset  # if prepare_data() defined
+EXPERIMENT_CONFIG=my_experiment modal run slime/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
+EXPERIMENT_CONFIG=my_experiment modal run -d slime/modal_train.py::train
 ```
+
+No registration step needed — the launcher discovers configs automatically from the `configs/` directory.
 
 ## YAML config fields
 
