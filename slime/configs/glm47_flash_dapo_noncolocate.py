@@ -9,12 +9,13 @@ from configs.glm47_flash_dapo import _Slime as _Glm47Slime
 
 
 class _Slime(_Glm47Slime):
-    ref_load = f"{CHECKPOINTS_PATH}/GLM-4.7-Flash_torch_dist_tp2pp2"
-
     # ── Infrastructure ────────────────────────────────────────────────────────
     actor_num_nodes = 2
     colocate = False
     rollout_num_gpus = 16
+
+    # ── Checkpoint ─────────────────────────────────────────────────────────────
+    ref_load = f"{CHECKPOINTS_PATH}/GLM-4.7-Flash_torch_dist_tp2pp2"
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     sglang_mem_fraction_static = 0.8
