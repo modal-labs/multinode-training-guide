@@ -5,7 +5,7 @@ Checkpoint: convert with nproc=4 (TP=2, PP=2, decoder_last=23) → GLM-4.7-Flash
 """
 
 from configs.base import CHECKPOINTS_PATH
-from configs.glm47_flash_dapo import _Slime as _Glm47Slime, modal, prepare_data  # noqa: F401
+from configs.glm47_flash_dapo import _Slime as _Glm47Slime, modal
 
 
 class _Slime(_Glm47Slime):
