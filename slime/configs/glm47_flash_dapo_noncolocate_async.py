@@ -12,6 +12,7 @@ modal = _base.modal
 class _Slime(_base._Slime):
     # ── Async ──────────────────────────────────────────────────────────────────
     async_mode = True
+    update_weights_interval = 3
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     wandb_group = "glm4.7-flash-dapo-math-noncolocate-async"
