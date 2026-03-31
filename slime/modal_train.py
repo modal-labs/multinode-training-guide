@@ -8,33 +8,8 @@ import time
 import modal
 import modal.experimental
 
-from configs import (
-    qwen_4b_gsm8k,
-    qwen_8b_gsm8k,
-    glm47_flash_dapo,
-    glm47_flash_dapo_noncolocate_2node,
-    qwen3vl_geo3k_vlm,
-    qwen3vl_geo3k_vlm_diff,
-)
+from configs import get_module, _CONFIGS_DIR
 from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, YAML_CONFIG_FIELDS
-
-# ── Config registry ───────────────────────────────────────────────────────────
-
-CONFIGS = {
-    "qwen-4b-gsm8k": qwen_4b_gsm8k,
-    "qwen-8b-gsm8k": qwen_8b_gsm8k,
-    "glm4.7-flash-dapo": glm47_flash_dapo,
-    "glm4.7-flash-dapo-noncolocate-2n": glm47_flash_dapo_noncolocate_2node,
-    "qwen3vl-geo3k-vlm": qwen3vl_geo3k_vlm,
-    "qwen3vl-geo3k-vlm-diff": qwen3vl_geo3k_vlm_diff,
-}
-
-
-def get_module(name: str):
-    if name not in CONFIGS:
-        raise ValueError(f"Unknown config {name!r}. Available: {sorted(CONFIGS)}")
-    return CONFIGS[name]
-
 
 # ── Experiment (client-side only — feeds decorator params) ────────────────────
 
@@ -93,12 +68,14 @@ app = modal.App(experiment)
 @app.local_entrypoint()
 def list_configs():
     """Print all available experiments."""
+    _skip = {"base", "__init__"}
+    names = sorted(f.stem for f in _CONFIGS_DIR.glob("*.py") if f.stem not in _skip)
     print("Available experiments:")
-    for name in sorted(CONFIGS):
-        mod = CONFIGS[name]
+    for name in names:
+        mod = get_module(name)
         nodes = mod.slime.total_nodes()
         gpu = f"{mod.modal.gpu}:{mod.slime.actor_num_gpus_per_node}"
-        print(f"  {name:<24} {nodes} node(s) × {gpu}")
+        print(f"  {name:<40} {nodes} node(s) × {gpu}")
 
 
 @app.function(
@@ -268,7 +245,9 @@ def _build_train_cmd(slime_cfg) -> str:
 )
 async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     await asyncio.gather(hf_cache_volume.reload.aio(), data_volume.reload.aio())
-    slime_cfg = get_module(experiment).slime
+    exp_mod = get_module(experiment)
+    slime_cfg = exp_mod.slime
+    modal_cfg = exp_mod.modal
 
     if slime_cfg.total_nodes() > 1:
         info = modal.experimental.get_cluster_info()
@@ -318,6 +297,9 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     client = JobSubmissionClient("http://127.0.0.1:8265")
     job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
     print(f"Job submitted: {job_id}")
+    print(
+        f"Training {experiment:<40} {slime_cfg.total_nodes()} node(s) × {modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}"
+    )
     print(f"Command: {cmd}, runtime_env: {runtime_env}")
 
     async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:

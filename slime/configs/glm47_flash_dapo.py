@@ -38,11 +38,11 @@ class _Slime(SlimeConfig):
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     num_rollout = 3000
-    rollout_batch_size = 128
+    rollout_batch_size = 64
     rollout_max_response_len = 32768
     rollout_temperature = 1.0
     n_samples_per_prompt = 8
-    global_batch_size = 1024
+    global_batch_size = 512
     rollout_num_gpus_per_engine = 8
     sglang_mem_fraction_static = 0.7
     sglang_enable_dp_attention = True
@@ -54,6 +54,7 @@ class _Slime(SlimeConfig):
     sglang_speculative_eagle_topk = 1
     sglang_speculative_num_draft_tokens = 3
     sglang_max_running_requests = 512
+    use_fault_tolerance = True
 
     # ── Eval ──────────────────────────────────────────────────────────────────
     eval_interval = 20
