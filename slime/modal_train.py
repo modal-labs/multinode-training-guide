@@ -12,7 +12,7 @@ from configs import (
     qwen_4b_gsm8k,
     qwen_8b_gsm8k,
     glm47_flash_dapo,
-    glm47_flash_dapo_noncolocate_multinode,
+    glm47_flash_dapo_noncolocate_2node,
     qwen3vl_geo3k_vlm,
     qwen3vl_geo3k_vlm_diff,
 )
@@ -24,7 +24,7 @@ CONFIGS = {
     "qwen-4b-gsm8k": qwen_4b_gsm8k,
     "qwen-8b-gsm8k": qwen_8b_gsm8k,
     "glm4.7-flash-dapo": glm47_flash_dapo,
-    "glm4.7-flash-dapo-noncolocate-2n": glm47_flash_dapo_noncolocate_multinode,
+    "glm4.7-flash-dapo-noncolocate-2n": glm47_flash_dapo_noncolocate_2node,
     "qwen3vl-geo3k-vlm": qwen3vl_geo3k_vlm,
     "qwen3vl-geo3k-vlm-diff": qwen3vl_geo3k_vlm_diff,
 }
