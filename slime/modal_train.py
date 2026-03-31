@@ -8,8 +8,25 @@ import time
 import modal
 import modal.experimental
 
-from configs import get_module
+import configs as _configs
 from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, YAML_CONFIG_FIELDS
+
+# ── Config registry ───────────────────────────────────────────────────────────
+
+CONFIGS = {
+    "qwen-4b-gsm8k": _configs.qwen_4b_gsm8k,
+    "qwen-8b-gsm8k": _configs.qwen_8b_gsm8k,
+    "glm4.7-flash-dapo": _configs.glm47_flash_dapo,
+    "glm4.7-flash-dapo-2n": _configs.glm47_flash_dapo_multinode,
+    "qwen3vl-geo3k-vlm": _configs.qwen3vl_geo3k_vlm,
+    "qwen3vl-geo3k-vlm-diff": _configs.qwen3vl_geo3k_vlm_diff,
+}
+
+
+def get_module(name: str):
+    if name not in CONFIGS:
+        raise ValueError(f"Unknown config {name!r}. Available: {sorted(CONFIGS)}")
+    return CONFIGS[name]
 
 # ── Experiment (client-side only — feeds decorator params) ────────────────────
 
@@ -68,8 +85,6 @@ app = modal.App(experiment)
 @app.local_entrypoint()
 def list_configs():
     """Print all available experiments."""
-    from configs import CONFIGS
-
     print("Available experiments:")
     for name in sorted(CONFIGS):
         mod = CONFIGS[name]
