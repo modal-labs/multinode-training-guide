@@ -212,6 +212,7 @@ def _prepare_slime_cfg(slime_cfg, tmpdir: str) -> None:
             path = os.path.join(tmpdir, f"{field}.yaml")
             with open(path, "w") as f:
                 yaml.dump(val, f)
+            print(f"Materialized {field} → {path}")
             setattr(slime_cfg, field, path)
 
 

@@ -1,6 +1,6 @@
-# slime_v2 — Modal launcher for SLIME training
+# slime — Modal launcher for SLIME training
 
-Thin Modal launcher that runs [SLIME](https://github.com/SLIT-AI/SLIME) RL training on GPU clusters.
+Thin Modal launcher that runs [SLIME](https://github.com/THUDM/slime) RL training on GPU clusters.
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ All commands take the experiment name via `EXPERIMENT_CONFIG`. Run from the repo
 ### 1. List available experiments
 
 ```bash
-modal run slime_v2/modal_train.py::list_configs
+modal run slime/modal_train.py::list_configs
 ```
 
 ### 2. Download model (one-time)
@@ -22,7 +22,7 @@ modal run slime_v2/modal_train.py::list_configs
 Downloads the experiment's HF checkpoint to the `huggingface-cache` volume.
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime_v2/modal_train.py::download_model
+EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime/modal_train.py::download_model
 ```
 
 ### 3. Prepare dataset (one-time)
@@ -31,7 +31,7 @@ Downloads and preprocesses the training dataset to the `slime-data` volume.
 Only required if the experiment defines a `prepare_data()` function (see [Adding an experiment](#adding-an-experiment)).
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime_v2/modal_train.py::prepare_dataset
+EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime/modal_train.py::prepare_dataset
 ```
 
 ### 4. Convert checkpoint (one-time, raw mode only)
@@ -40,13 +40,13 @@ Converts the HF checkpoint to `torch_dist` format. Only required when `megatron_
 Skip this step if using bridge mode.
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime_v2/modal_train.py::convert_checkpoint
+EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run slime/modal_train.py::convert_checkpoint
 ```
 
 ### 5. Run training
 
 ```bash
-EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run -d slime_v2/modal_train.py::train
+EXPERIMENT_CONFIG=glm4.7-flash-dapo modal run -d slime/modal_train.py::train
 ```
 
 Use `-d` (detached) to keep training running after you close your terminal.
@@ -130,10 +130,10 @@ CONFIGS = {
 ### 4. Run the workflow
 
 ```bash
-EXPERIMENT_CONFIG=my-experiment modal run slime_v2/modal_train.py::download_model
-EXPERIMENT_CONFIG=my-experiment modal run slime_v2/modal_train.py::prepare_dataset  # if prepare_data() defined
-EXPERIMENT_CONFIG=my-experiment modal run slime_v2/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
-EXPERIMENT_CONFIG=my-experiment modal run -d slime_v2/modal_train.py::train
+EXPERIMENT_CONFIG=my-experiment modal run slime/modal_train.py::download_model
+EXPERIMENT_CONFIG=my-experiment modal run slime/modal_train.py::prepare_dataset  # if prepare_data() defined
+EXPERIMENT_CONFIG=my-experiment modal run slime/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
+EXPERIMENT_CONFIG=my-experiment modal run -d slime/modal_train.py::train
 ```
 
 ## YAML config fields

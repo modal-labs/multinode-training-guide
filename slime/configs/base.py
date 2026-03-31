@@ -1,4 +1,4 @@
-"""Base configuration classes and volume mount paths for slime_v2.
+"""Base configuration classes and volume mount paths for slime.
 
 Two separate concerns:
 
@@ -11,10 +11,9 @@ cli_args(). The 'environment' field is the only exception — it is injected
 into the Ray job runtime env, not passed to SLIME directly.
 """
 
-import logging
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # ── Volume mount paths ────────────────────────────────────────────────────────
 
@@ -22,7 +21,9 @@ HF_CACHE_PATH = Path("/root/.cache/huggingface")
 DATA_PATH = Path("/data")
 CHECKPOINTS_PATH = Path("/checkpoints")
 
-logger = logging.getLogger(__name__)
+# ── Types ─────────────────────────────────────────────────────────────────────
+
+GPUType = Literal["H100", "H200", "B200", "B300", "A100"]
 
 # Fields on SlimeConfig that are NOT SLIME CLI args.
 _SLIME_SKIP = {"environment", "async_mode", "slime_model_script"}
@@ -36,14 +37,10 @@ YAML_CONFIG_FIELDS = ("eval_config", "custom_config_path", "sglang_config")
 class ModalConfig:
     """Modal infrastructure configuration — GPU provisioning and image setup only."""
 
-    gpu: str = "H200"  # GPU model only (e.g. "H100", "H200", "B200")
-    local_slime: str = ""  # path to local slime repo for dev overlay
-    patch_files: list[
-        str
-    ] = []  # local patch files; each injected into image at /tmp/<filename>
-    image_run_commands: list[
-        str
-    ] = []  # commands to run during image build (e.g. git apply /tmp/my.patch)
+    gpu: GPUType = "H200"
+    local_slime: str | None = None  # path to local slime repo for dev overlay
+    patch_files: list[str] = []  # local patch files; each injected into image at /tmp/<filename>
+    image_run_commands: list[str] = []  # commands to run during image build (e.g. git apply /tmp/my.patch)
 
     def __init__(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():
@@ -140,8 +137,8 @@ class SlimeConfig:
         """Total Modal cluster nodes required by this config.
 
         Derived from actor/critic/rollout GPU counts. Modal provisions whole
-        nodes, so we ceil-divide. If total GPUs aren't a clean multiple of
-        gpus_per_node, a warning is logged (unused GPUs on the last node).
+        nodes, so we ceil-divide. Raises if total GPUs aren't a clean multiple
+        of gpus_per_node.
         """
         f = self._fields()
         gpus_per_node = f.get("actor_num_gpus_per_node", 8)
@@ -163,12 +160,9 @@ class SlimeConfig:
             total_gpus = training_gpus + rollout_gpus
 
         if total_gpus % gpus_per_node != 0:
-            logger.warning(
-                "total_gpus=%d is not a multiple of gpus_per_node=%d — "
-                "%d GPU(s) on the last node will be unused.",
-                total_gpus,
-                gpus_per_node,
-                gpus_per_node - (total_gpus % gpus_per_node),
+            raise ValueError(
+                f"total_gpus={total_gpus} is not a multiple of gpus_per_node={gpus_per_node}. "
+                f"Adjust actor_num_nodes, rollout_num_gpus, or actor_num_gpus_per_node."
             )
 
         return math.ceil(total_gpus / gpus_per_node)
