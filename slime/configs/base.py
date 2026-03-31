@@ -39,8 +39,12 @@ class ModalConfig:
 
     gpu: GPUType = "H200"
     local_slime: str | None = None  # path to local slime repo for dev overlay
-    patch_files: list[str] = []  # local patch files; each injected into image at /tmp/<filename>
-    image_run_commands: list[str] = []  # commands to run during image build (e.g. git apply /tmp/my.patch)
+    patch_files: list[
+        str
+    ] = []  # local patch files; each injected into image at /tmp/<filename>
+    image_run_commands: list[
+        str
+    ] = []  # commands to run during image build (e.g. git apply /tmp/my.patch)
 
     def __init__(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():

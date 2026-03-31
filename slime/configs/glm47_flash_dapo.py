@@ -10,7 +10,7 @@ from configs.base import ModalConfig, SlimeConfig, DATA_PATH, CHECKPOINTS_PATH
 modal = ModalConfig(
     gpu="H200",
     image_run_commands=[
-        "uv pip install --system 'transformers>=5.0'",
+        "uv pip install --system 'transformers>=5.0,<5.4.0'",
     ],
     # local_slime="/home/ec2-user/nan_wonderland/slime",
 )
