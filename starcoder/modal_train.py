@@ -56,7 +56,10 @@ class LaunchType(Enum):
         wandb_secret,
         hf_secret,
     ],
-    gpu="H200:8",
+    gpu="H100:8",
+    experimental_options={
+        "efa_enabled": "True",
+    },
     timeout=60 * 60 * 24,
 )
 @modal.experimental.clustered(n_nodes, rdma=True)
