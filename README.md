@@ -31,6 +31,7 @@ Other relevant documentation in our guide:
 - [Multi-GPU Training](https://modal.com/docs/guide/gpu#multi-gpu-training)
 - [Using CUDA on Modal](https://modal.com/docs/guide/cuda)
 - [GPU Metrics](https://modal.com/docs/guide/gpu-metrics)
+- [Agent guide for running training jobs on Modal](docs/agent-modal-training.md)
 
 # Demo
 
