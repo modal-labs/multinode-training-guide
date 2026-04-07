@@ -73,6 +73,31 @@ modal app stop <app-id>
 
 - `modal app logs <app-id>` only shows function and container logs after user code starts. It does not show the earlier image-build phase.
 - For multi-node jobs, expect repeated startup blocks, one per node.
+- In general, the examples in this repo build on training frameworks with notoriously noisy logs. It's often best to be proactively defensive with context by filtering the logs, either with `grep`/`rg`, or with the extra parameters available to `modal app logs`:
+
+```bash
+
+# Fetch the last 500 log entries and grep them
+modal app logs <app-id> --tail 500 | rg "error|CUDA|OOM|loss"
+
+# Fetch only stderr from a particular function call
+modal app logs <app-id> --source stderr --function-call-id <function-call-id>
+
+# Search for specific keywords in logs
+modal app logs <app-id> --search "error"
+modal app logs <app-id> --search "loss"
+
+# Show container IDs alongside logs to distinguish output from different nodes in multi-node jobs
+modal app logs <app-id> -f --show-container-id
+
+# Filter logs to a single container, or function call, or function
+modal app logs <app-id> --container <container-id>
+
+# Fetch logs from a specific time window
+modal app logs <app-id> --since 2h
+modal app logs <app-id> --since 30m --until 10m
+```
+
 - When logs lag behind actual progress, inspect live containers directly:
 
 ```bash
