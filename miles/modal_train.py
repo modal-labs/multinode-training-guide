@@ -656,17 +656,7 @@ def main(
         print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
     print(f"GPU: {selected_gpu}")
 
-    try:
-        cluster_cls = modal.Cls.from_name(APP_NAME, "MilesCluster")
-        print(f"Using deployed Modal class: {APP_NAME}.MilesCluster")
-    except modal.exception.NotFoundError:
-        cluster_cls = MilesCluster
-        print(
-            f"No deployed Modal class found for {APP_NAME}.MilesCluster; using an ephemeral app."
-        )
-
-    cluster = cluster_cls.with_options(gpu=selected_gpu)()
-    result = cluster.submit_training.remote(
+    submit_kwargs = dict(
         recipe_name=selected_recipe.name if selected_recipe else "",
         model_id=resolved_model_id,
         base_args_text=base_args_text,
@@ -679,4 +669,18 @@ def main(
         colocate=colocate,
         rollout_num_gpus=resolved_rollout_num_gpus,
     )
+
+    try:
+        cluster = modal.Cls.from_name(APP_NAME, "MilesCluster").with_options(
+            gpu=selected_gpu
+        )()
+        print(f"Using deployed Modal class: {APP_NAME}.MilesCluster")
+        result = cluster.submit_training.remote(**submit_kwargs)
+    except modal.exception.NotFoundError:
+        print(
+            f"No deployed Modal class found for {APP_NAME}.MilesCluster; using an ephemeral app."
+        )
+        cluster = MilesCluster.with_options(gpu=selected_gpu)()
+        result = cluster.submit_training.remote(**submit_kwargs)
+
     print(result)

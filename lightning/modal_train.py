@@ -69,13 +69,16 @@ def train_single_node():
 
 @app.function(
     gpu=f"H100:{n_proc_per_node}",
+    experimental_options={
+        "efa_enabled": True,
+    },
     volumes={
         "/root/data": volume,  #
         "/root/out": volume_model_output,
     },
     timeout=hours_in_seconds(1),
 )
-@modal.experimental.clustered(n_nodes)
+@modal.experimental.clustered(n_nodes, rdma=True)
 def train_multi_node():
     """
     Train the model on a multi-node cluster with N GPUs per node (typically 8).
