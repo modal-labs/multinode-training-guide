@@ -3,7 +3,6 @@ from pathlib import Path
 import modal
 import modal.experimental
 import training.config as config
-from torchrun_util import torchrun
 
 cuda_version = "12.4.0"
 flavor = "devel"  # includes full CUDA toolkit
@@ -15,7 +14,7 @@ training_code_dir = Path(__file__).parent / "training"
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
     .apt_install("curl", "unzip", "vim", "git", "htop")
-    .pip_install("torch==2.5.1", "torchvision==0.20.1", "nvidia-dali-cuda120==1.43.0")
+    .pip_install("torch==2.5.1", "torchvision==0.20.1", "nvidia-dali-cuda120==1.53.0")
     # needed until they update PyPI (https://github.com/webdataset/webdataset/issues/415)
     .pip_install(
         "git+https://github.com/thecodingwizard/webdataset.git@e16ee8ecc8824351281e933beda6c25e539e9794"
@@ -49,6 +48,8 @@ app = modal.App(
 )
 @modal.experimental.clustered(size=config.nodes)
 def train_resnet():
+    from torchrun_util import torchrun
+
     cluster_info = modal.experimental.get_cluster_info()
 
     torchrun.run(

@@ -27,10 +27,13 @@ base_image = (
 )
 
 LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+MLX_MONITOR_PATH = os.path.join(
+    os.path.dirname(LOCAL_CODE_DIR), "utils", "mlx_monitor.py"
+)
 REMOTE_CODE_DIR = "/root/"
 REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
 
 train_image = base_image.add_local_dir(
     LOCAL_CODE_DIR,
     remote_path=REMOTE_CODE_DIR,
-).add_local_file("../utils/mlx_monitor.py", remote_path="/root/mlx_monitor.py")
+).add_local_file(MLX_MONITOR_PATH, remote_path="/root/mlx_monitor.py")
