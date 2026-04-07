@@ -7,6 +7,7 @@ This document captures durable repo-specific workflow for agents launching and d
 - Keep secrets out of this file.
 - Record reusable workflow and runtime behavior, not one-off experiment notes.
 - Prefer repo-root commands so the runbook works from a clean checkout.
+- Keep the guidance generic enough that an agent can discover the right entrypoint from the repo rather than relying on a fixed list.
 
 ## Environment Setup
 
@@ -15,24 +16,15 @@ This document captures durable repo-specific workflow for agents launching and d
 - If your local setup relies on shell init for auth or helper tooling, ensure that setup is loaded before launching jobs.
 - Store credentials in local shell config or Modal secrets, not in tracked files.
 
-## Common Entrypoints
+## Finding The Right Entrypoint
 
-These are the main training entrypoints from the repo root:
+Discover the launch path from the repo itself instead of assuming a fixed command.
 
-| Example | Entrypoint |
-|---------|------------|
-| `benchmark/` | `modal run benchmark/modal_train.py` |
-| `lightning/` | `modal run lightning/modal_train.py::train_multi_node` |
-| `megatron/` | `modal run --detach megatron/modal_train.py::train_lora` |
-| `miles/` | `modal run miles/modal_train.py --recipe <recipe>` |
-| `ms-swift/` | `modal run --detach ms-swift/modal_train.py::train_model` |
-| `nanoGPT/` | `modal run nanoGPT/modal_train.py::speedrun_multi_node` |
-| `resnet50/` | `modal run --detach resnet50/modal_train.py` |
-| `slime/` | `modal run -d slime/modal_train.py::train` |
-| `starcoder/` | `modal run starcoder/modal_train.py::train_multi_node --launch-type torchrun` |
-| `verl/` | `modal run verl/modal_train.py::train_multi_node` |
-
-Check the example README before launching if that directory has extra setup steps such as model download, dataset prep, or required secrets.
+- Start with the workflow README and identify the documented `modal run` path.
+- Inspect the corresponding launcher module to see whether it exposes intermediate stages such as dataset prep, model download, checkpoint conversion, benchmark, evaluation, or training.
+- Check for cheaper discovery paths first, such as `--help`, `--list`, `--dry-run`, or a single-node variant.
+- If the launcher uses a local entrypoint, make sure the documented invocation still maps to that entrypoint from the repo root.
+- If the workflow requires secrets, volumes, or cached artifacts, treat those prerequisites as explicit stages rather than assuming training is the first runnable step.
 
 ## Launching Jobs
 
@@ -45,6 +37,7 @@ modal run --detach path/to/modal_train.py::function
 - Use the smallest dataset subset that still exercises the full stack when proving a new path.
 - Once one topology works, keep the topology fixed and change one tuning parameter at a time.
 - Treat model downloads, dataset prep, conversion, and training as separate checkpoints when the example supports that split.
+- Prefer proving the workflow stage-by-stage rather than jumping straight to the longest training command.
 
 ## Scheduling Expectations
 
@@ -111,14 +104,16 @@ modal volume ls <volume-name> / --env <env>
 ## Debugging Strategy
 
 1. Prove the launch path with the smallest useful dataset or shortest run.
-2. Wait through scheduling before assuming failure.
-3. Confirm app creation and active task count with `modal app list --json`.
-4. Inspect logs only after workers appear.
-5. If logs are ambiguous, check live containers and committed volumes separately.
-6. After a known-good run, change one variable at a time.
+2. Derive the exact command from the README and launcher instead of guessing.
+3. Wait through scheduling before assuming failure.
+4. Confirm app creation and active task count with `modal app list --json`.
+5. Inspect logs only after workers appear.
+6. If logs are ambiguous, check live containers and committed volumes separately.
+7. After a known-good run, change one variable at a time.
 
 ## Updating This Runbook
 
 - Add new notes when they describe durable Modal behavior or a stable repo workflow.
 - Do not preserve temporary experiment history here once it has served its purpose.
 - If a lesson only applies to one example, prefer that example's README over this shared runbook.
+- Do not turn this file into a catalog of current example entrypoints; keep it focused on how to discover and debug them.
