@@ -1,0 +1,11 @@
+[project]
+name = "multinode-training-guide"
+version = "0.1.0"
+description = "Repo-level Python tooling for multinode-training-guide"
+requires-python = ">=3.11"
+dependencies = [
+    "modal",
+]
+
+[tool.uv]
+package = false
