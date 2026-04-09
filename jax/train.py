@@ -1,4 +1,5 @@
 import os
+import time
 import jax
 import optax
 import equinox as eqx
@@ -18,8 +19,10 @@ image = (
 app = modal.App("jax-mlp-training", image=image)
 volume = modal.Volume.from_name("jax-mlp-weights", create_if_missing=True)
 
+
 def loss_fn(model, x, y_true):
     return jax.numpy.mean((y_true - model(x)) ** 2)
+
 
 @eqx.filter_jit
 def update(model, opt_state, x, y_true, optimizer):
@@ -52,7 +55,7 @@ def plot_losses(losses, save_path="loss_curve.png"):
 
 
 @app.function(
-    gpu="H100:2",
+    gpu="H100:8",
     volumes={
         CHECKPOINT_DIR: volume,
     },
@@ -76,15 +79,23 @@ def train(
     all_losses = []
 
     for epoch in range(epochs):
+        average_t = 0
         for step in range(steps_per_epoch):
             key, batch_key = jax.random.split(key)
             x = jax.random.normal(batch_key, (batch_size, 4))
             y_true = x**2
 
+            t0 = time.perf_counter()
             model, opt_state, loss = update(model, opt_state, x, y_true, optimizer)
+            t1 = time.perf_counter()
+
+            average_t = t1 - t0
+
             all_losses.append(float(loss))
 
-        print(f"Epoch {epoch + 1}/{epochs}, Loss {all_losses[-1]:.6f}")
+        print(
+            f"Epoch {epoch + 1}/{epochs}, Loss {all_losses[-1]:.6f}, Average time per step {average_t:.9f}s"
+        )
         save_checkpoint(model, epoch, CHECKPOINT_DIR)
 
     plot_losses(all_losses)
