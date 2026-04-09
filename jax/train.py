@@ -6,7 +6,7 @@ import equinox as eqx
 import matplotlib.pyplot as plt
 import modal
 import modal.experimental
-from model import MLP
+from model import MLP, BatchNormState
 
 CHECKPOINT_DIR = "/checkpoints"
 LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,16 +20,19 @@ app = modal.App("jax-mlp-training", image=image)
 volume = modal.Volume.from_name("jax-mlp-weights", create_if_missing=True)
 
 
-def loss_fn(model, x, y_true):
-    return jax.numpy.mean((y_true - model(x)) ** 2)
+def loss_fn(model, x, y_true, state):
+    out, state = model(x, state)
+    return (jax.numpy.mean((y_true - out) ** 2), state)
 
 
 @eqx.filter_jit
-def update(model, opt_state, x, y_true, optimizer):
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(model, x, y_true)
+def update(model, opt_state, x, y_true, optimizer, state):
+    (loss, state), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(
+        model, x, y_true, state
+    )
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss
+    return model, opt_state, loss, state
 
 
 def save_checkpoint(model, epoch, path):
@@ -54,6 +57,7 @@ def plot_losses(losses, save_path="loss_curve.png"):
     print(f"Loss curve saved to {save_path}")
 
 
+# TODO(atoniolo76): setup Jax mesh for distributed training
 @app.function(
     gpu="H100:8",
     volumes={
@@ -73,10 +77,16 @@ def train(
 
     key = jax.random.PRNGKey(seed)
     key, model_key = jax.random.split(key)
-    model = MLP(in_shape=4, hidden_dim=hidden_size, out_shape=1, key=model_key)
+    model = MLP(in_shape=4, hidden_dim=hidden_size, out_shape=4, key=model_key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     all_losses = []
+
+    state = BatchNormState(
+        training_time=True,
+        mean=jax.numpy.zeros(hidden_size),
+        var=jax.numpy.zeros(hidden_size),
+    )
 
     for epoch in range(epochs):
         average_t = 0
@@ -86,7 +96,10 @@ def train(
             y_true = x**2
 
             t0 = time.perf_counter()
-            model, opt_state, loss = update(model, opt_state, x, y_true, optimizer)
+            model, opt_state, loss, state = update(
+                model, opt_state, x, y_true, optimizer, state
+            )
+            jax.block_until_ready(loss)
             t1 = time.perf_counter()
 
             average_t = t1 - t0
@@ -98,9 +111,32 @@ def train(
         )
         save_checkpoint(model, epoch, CHECKPOINT_DIR)
 
+    state = BatchNormState(
+        training_time=False,
+        mean=state.mean / (steps_per_epoch * epochs),
+        var=state.var / (steps_per_epoch * epochs),
+    )
+
+    # Commit volume
+    volume.commit()
+
     plot_losses(all_losses)
-    return model
+    return model, state
 
 
-if __name__ == "__main__":
-    train()
+@app.function(
+    gpu="H100:1",
+)
+def predict(x: jax.Array):
+    print("Starting training on two nodes...")
+    call = train.spawn()
+    model, state = call.get()
+    return model(x, state)
+
+
+@app.local_entrypoint()
+def main():
+    x = jax.random.normal(jax.random.PRNGKey(5678), (1, 4))
+    y, state = predict.remote(x)
+    print("Sample input: ", x)
+    print("Sample output: ", y)

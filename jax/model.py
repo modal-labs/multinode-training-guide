@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from math import sqrt
 import jax
 import equinox as eqx
@@ -49,6 +50,17 @@ class GroupNorm(eqx.Module):
         return x * self.gamma + self.beta
 
 
+class BatchNormState(eqx.Module):
+    training_time: bool
+    mean: jax.Array
+    var: jax.Array
+
+    def __init__(self, training_time: bool, mean: jax.Array, var: jax.Array):
+        self.training_time = training_time
+        self.mean = mean
+        self.var = var
+
+
 class BatchNorm(eqx.Module):
     gamma: jax.Array
     beta: jax.Array
@@ -61,15 +73,20 @@ class BatchNorm(eqx.Module):
         self.epsilon = 1e-5
 
     # TODO(atoniolo76): add flag for inference time vs. training time
-    def __call__(
-        self,
-        x,
-    ):
-        mean = jax.numpy.mean(x, axis=0)
-        var = jax.numpy.var(x, axis=0)
+    def __call__(self, x, state: BatchNormState):
+        if state.training_time:
+            mean = jax.numpy.mean(x, axis=0)
+            var = jax.numpy.var(x, axis=0)
+            state = BatchNormState(
+                training_time=True, mean=state.mean + mean, var=state.var + var
+            )
+        else:
+            mean = state.mean
+            var = state.var
+
         return (
-            (x - mean) / jax.numpy.sqrt(var + self.epsilon)
-        ) * self.gamma + self.beta
+            ((x - mean) / jax.numpy.sqrt(var + self.epsilon)) * self.gamma + self.beta
+        ), state
 
 
 class MLP(eqx.Module):
@@ -85,7 +102,9 @@ class MLP(eqx.Module):
         layers["output"] = Linear(hidden_dim, out_shape, okey)
         self.layers = layers
 
-    def __call__(self, x):
-        return self.layers["output"](
-            jax.numpy.tanh(self.layers["batchnorm"](self.layers["input"](x)))
-        )
+    def __call__(self, x, state):
+        x = self.layers["input"](x)
+        x, state = self.layers["batchnorm"](x, state)
+        x = jax.numpy.tanh(x)
+        x = self.layers["output"](x)
+        return x, state
