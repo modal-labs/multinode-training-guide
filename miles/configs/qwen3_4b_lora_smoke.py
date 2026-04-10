@@ -1,6 +1,6 @@
 """Qwen3-4B LoRA GRPO smoke test — single node, 4x H200, colocated.
 
-Reduced config for Modal verification: num_rollout=2, no WandB, no eval.
+Reduced config for Modal verification: num_rollout=2, no eval.
 Corresponds to nan_wonderland/miles/examples/lora/run-qwen3-4b-megatron-lora-result.sh
 """
 
@@ -76,6 +76,12 @@ class _Miles(MilesConfig):
     sglang_decode_log_interval = 1000
     sglang_mem_fraction_static = 0.4
     sglang_chunked_prefill_size = 4096
+
+    # ── WandB ─────────────────────────────────────────────────────────────────
+    use_wandb = True
+    wandb_project = "miles-lora"
+    wandb_group = "qwen3-4b-lora-smoke"
+    disable_wandb_random_suffix = True
 
     # ── Environment (per-config, not base defaults) ───────────────────────────
     def __init__(self):
