@@ -1,18 +1,25 @@
 import os
 import time
 import jax
+from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import equinox as eqx
 import matplotlib.pyplot as plt
 import modal
 import modal.experimental
+import sys
 from model import MLP, BatchNormState
 
 CHECKPOINT_DIR = "/checkpoints"
 LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+cuda_version = "12.4.0"  # should be no greater than host CUDA version
+flavor = "devel"  #  includes full CUDA toolkit
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
 image = (
-    modal.Image.debian_slim()
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
     .pip_install("jax[cuda12]", "equinox", "matplotlib", "optax")
     .add_local_dir(LOCAL_CODE_DIR, remote_path="/root")
 )
@@ -73,6 +80,17 @@ def train(
     hidden_size=64,
     seed=5678,
 ):
+    cluster_info = modal.experimental.get_cluster_info()
+    node_rank = cluster_info.rank
+    master_addr = cluster_info.container_ipv4_ips[0]
+    nproc = len(cluster_info.container_ipv4_ips)
+
+    jax.distributed.initialize(f"{master_addr}:12345", nproc, node_rank)
+
+    print(f"Number of devices: {len(jax.devices())}")
+
+    mesh = jax.make_mesh((8, nproc), ("i", "j"))
+    print(f"Mesh: {mesh}")
     optimizer = optax.adam(learning_rate)
 
     key = jax.random.PRNGKey(seed)
@@ -90,19 +108,48 @@ def train(
 
     for epoch in range(epochs):
         average_t = 0
-        for step in range(steps_per_epoch):
+        for _ in range(steps_per_epoch):
             key, batch_key = jax.random.split(key)
             x = jax.random.normal(batch_key, (batch_size, 4))
-            y_true = x**2
+
+            data_sharding = NamedSharding(mesh, P(("i", "j"), None))
+            weight_sharding = NamedSharding(mesh, P())
+            global_x = jax.device_put(x, data_sharding)
+            global_y_true = jax.device_put(global_x**2, data_sharding)
 
             t0 = time.perf_counter()
-            model, opt_state, loss, state = update(
-                model, opt_state, x, y_true, optimizer, state
+
+            model = jax.tree.map(
+                lambda x: (
+                    jax.device_put(x, weight_sharding)
+                    if isinstance(x, jax.Array)
+                    else x
+                ),
+                model,
             )
-            jax.block_until_ready(loss)
+            opt_state = jax.tree.map(
+                lambda x: (
+                    jax.device_put(x, weight_sharding)
+                    if isinstance(x, jax.Array)
+                    else x
+                ),
+                opt_state,
+            )
+            state = jax.tree.map(
+                lambda x: (
+                    jax.device_put(x, weight_sharding)
+                    if isinstance(x, jax.Array)
+                    else x
+                ),
+                state,
+            )
+
+            model, opt_state, loss, state = update(
+                model, opt_state, global_x, global_y_true, optimizer, state
+            )
             t1 = time.perf_counter()
 
-            average_t = t1 - t0
+            average_t = (t1 - t0) / nproc
 
             all_losses.append(float(loss))
 
