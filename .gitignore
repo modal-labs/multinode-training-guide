@@ -176,6 +176,23 @@ cython_debug/
 
 # experimental
 slime/test_configs
+slime/configs/glm47_355b_a32b_noncolocate.py
+slime/configs/glm47_355b_a32b_noncolocate_delta_compression.py
+slime/configs/glm47_355b_a32b_noncolocate_delta_compression_bitmask.py
+slime/configs/glm47_355b_a32b_noncolocate_delta_compression_indices.py
+slime/configs/glm47_flash_dapo_noncolocate_dela_compression.py
+slime/configs/qwen3_235b_a22b_dapo_non_colocate.py
+slime/configs/qwen3_dapo_noncolocate_delta_compression.py
+slime/configs/qwen3_dapo_noncolocate_delta_compression_bitmask.py
+slime/configs/qwen3_dapo_noncolocate_delta_compression_indices.py
+slime/configs/qwen3vl_geo3k_vlm_delta_compression.py
 
 # Ruff cache
 .ruff_cache/
+
+# Codex cache
+.codex
+.codex/
+
+# Humanize plugin state
+.humanize/
