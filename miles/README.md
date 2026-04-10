@@ -6,6 +6,9 @@ Thin Modal launcher that runs [Miles](https://github.com/radixark/miles) RL trai
 
 - Modal CLI installed and authenticated
 - Set your Modal environment: `export MODAL_ENVIRONMENT=<your-env>`
+- Modal secrets:
+  - `huggingface-secret` — required for `download_model` and `prepare_dataset`
+  - `wandb-secret` — required only for experiments with `use_wandb = True`
 
 ## Running an experiment
 

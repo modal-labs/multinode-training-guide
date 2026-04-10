@@ -191,11 +191,18 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
         print(f"Saved torch_dist checkpoint to {save_path}")
 
 
+_train_secrets = (
+    [modal.Secret.from_name("wandb-secret")]
+    if miles_cfg and getattr(miles_cfg, "use_wandb", False)
+    else []
+)
+
+
 @app.function(
     image=image,
     gpu=f"{modal_cfg.gpu}:{miles_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
     volumes=modal_volumes,
-    secrets=[modal.Secret.from_name("wandb-secret")],
+    secrets=_train_secrets,
     timeout=24 * 60 * 60,
     experimental_options={"efa_enabled": True},
 )
