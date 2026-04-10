@@ -3,13 +3,13 @@ import os
 import shlex
 import subprocess
 import tempfile
-import time
 
 import modal
 import modal.experimental
 
 from configs import get_module, _CONFIGS_DIR
-from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, YAML_CONFIG_FIELDS
+from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH
+from modal_helpers.utils import get_checkpoint_conversion_policy
 
 # ── Experiment (client-side only — feeds decorator params) ────────────────────
 
@@ -28,14 +28,13 @@ image = (
     )  # Please check https://hub.docker.com/r/slimerl/slime/tags for the latest version
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
+    .add_local_python_source("modal_helpers", copy=True)
 )
 if modal_cfg:
     for patch in modal_cfg.patch_files:
         image = image.add_local_file(
             patch, f"/tmp/{os.path.basename(patch)}", copy=True
         )
-    if modal_cfg.image_run_commands:
-        image = image.run_commands(*modal_cfg.image_run_commands)
     if modal_cfg.local_slime:
         image = image.add_local_dir(
             modal_cfg.local_slime,
@@ -43,10 +42,17 @@ if modal_cfg:
             copy=True,
             ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
         )
+    if modal_cfg.image_run_commands:
+        image = image.run_commands(*modal_cfg.image_run_commands)
 
 with image.imports():
-    import ray
     from ray.job_submission import JobSubmissionClient
+    from modal_helpers.utils import (
+        build_train_cmd,
+        get_modal_cluster_context,
+        prepare_slime_config,
+        start_ray_head,
+    )
 
 # ── Volumes ───────────────────────────────────────────────────────────────────
 
@@ -60,9 +66,12 @@ modal_volumes = {
     str(CHECKPOINTS_PATH): checkpoints_volume,
 }
 
-# ── App & Utilities ──────────────────────────────────────────────────────────
+# ── App ──────────────────────────────────────────────────────────────────────
 
 app = modal.App(experiment)
+
+RAY_PORT = 6379
+RAY_DASHBOARD_PORT = 8265
 
 
 @app.local_entrypoint()
@@ -83,6 +92,7 @@ def list_configs():
     image=image,
     volumes={str(HF_CACHE_PATH): hf_cache_volume},
     timeout=2 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Download the model to the HF cache volume."""
@@ -97,6 +107,7 @@ def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     image=image,
     volumes={str(DATA_PATH): data_volume},
     timeout=2 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Run the prepare_data() to populate the data volume."""
@@ -111,6 +122,14 @@ def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
     volumes=modal_volumes,
     timeout=4 * 60 * 60,
+    experimental_options={"efa_enabled": True},
+)
+@(
+    modal.experimental.clustered(
+        get_checkpoint_conversion_policy(slime_cfg)[0], rdma=True
+    )
+    if slime_cfg
+    else lambda fn: fn
 )
 def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw."""
@@ -127,108 +146,49 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
 
     hf_path = snapshot_download(slime_cfg.hf_checkpoint, local_files_only=True)
     save_path = str(slime_cfg.ref_load)
-    tp = getattr(slime_cfg, "tensor_model_parallel_size", 1)
-    pp = getattr(slime_cfg, "pipeline_model_parallel_size", 1)
-    decoder_first = getattr(slime_cfg, "decoder_first_pipeline_num_layers", None)
-    decoder_last = getattr(slime_cfg, "decoder_last_pipeline_num_layers", None)
-    mtp_num_layers = getattr(slime_cfg, "mtp_num_layers", None)
+    num_nodes, nproc_per_node, extra_args = get_checkpoint_conversion_policy(slime_cfg)
+    node_rank, master_addr, _, nnodes = get_modal_cluster_context(num_nodes)
 
-    extra_args = []
-    if tp > 1:
-        nproc = tp * pp
-        extra_args += [
-            f"--tensor-model-parallel-size {tp}",
-            f"--pipeline-model-parallel-size {pp}",
+    torchrun_args = [f"--nproc-per-node={nproc_per_node}"]
+    if nnodes > 1:
+        torchrun_args += [
+            f"--nnodes={nnodes}",
+            f"--node-rank={node_rank}",
+            f"--master-addr={master_addr}",
+            "--master-port=12355",
         ]
-        if decoder_first:
-            extra_args.append(f"--decoder-first-pipeline-num-layers {decoder_first}")
-        if decoder_last:
-            extra_args.append(f"--decoder-last-pipeline-num-layers {decoder_last}")
-    else:
-        nproc = slime_cfg.actor_num_gpus_per_node
-    if mtp_num_layers:
-        extra_args.append(f"--mtp-num-layers {mtp_num_layers}")
+
+    # For multi-node, use our wrapper that honours SKIP_RELEASE_RENAME to
+    # prevent volume corruption (see modal_helpers/convert_hf_to_torch_dist.py).
+    # Single-node uses the upstream script directly.
+    import importlib.util
+    convert_script = (
+        importlib.util.find_spec("modal_helpers.convert_hf_to_torch_dist").origin
+        if num_nodes > 1
+        else f"{SLIME_ROOT}/tools/convert_hf_to_torch_dist.py"
+    )
 
     cmd = (
         f"source {SLIME_ROOT}/{slime_cfg.slime_model_script} && "
-        f"torchrun --nproc-per-node={nproc} {SLIME_ROOT}/tools/convert_hf_to_torch_dist.py "
+        f"torchrun {' '.join(torchrun_args)} {convert_script} "
         f"${{MODEL_ARGS[@]}} {' '.join(extra_args)} "
         f"--hf-checkpoint {shlex.quote(hf_path)} --save {shlex.quote(save_path)}"
     )
+
+    env = {**os.environ, **slime_cfg.environment}
+    if num_nodes > 1:
+        env["SKIP_RELEASE_RENAME"] = "1"
+
+    print(
+        f"Conversion layout for {experiment!r}: nodes={num_nodes}, "
+        f"nproc_per_node={nproc_per_node}, node_rank={node_rank}"
+    )
     print(f"Running: bash -c {cmd!r}")
-    subprocess.run(
-        ["bash", "-c", cmd], check=True, env={**os.environ, **slime_cfg.environment}
-    )
+    subprocess.run(["bash", "-c", cmd], check=True, env=env)
     checkpoints_volume.commit()
-    print(f"Saved torch_dist checkpoint to {save_path}")
 
-
-# ── Train ─────────────────────────────────────────────────────────────────────
-
-RAY_PORT = 6379
-RAY_DASHBOARD_PORT = 8265
-
-
-def _start_ray_head(my_ip: str, n_nodes: int) -> None:
-    """Start Ray head node and wait for all workers to join."""
-    subprocess.Popen(
-        [
-            "ray",
-            "start",
-            "--head",
-            f"--node-ip-address={my_ip}",
-            "--dashboard-host=0.0.0.0",
-        ]
-    )
-    for _ in range(30):
-        try:
-            ray.init(address="auto")
-            break
-        except ConnectionError:
-            time.sleep(1)
-    else:
-        raise RuntimeError("Ray head node failed to start")
-
-    for _ in range(60):
-        alive = [n for n in ray.nodes() if n["Alive"]]
-        print(f"Waiting for workers: {len(alive)}/{n_nodes} alive")
-        if len(alive) == n_nodes:
-            break
-        time.sleep(1)
-    else:
-        raise RuntimeError(f"Timed out waiting for all {n_nodes} Ray nodes to join")
-
-
-def _prepare_slime_cfg(slime_cfg, tmpdir: str) -> None:
-    """Resolve HF repo IDs to local paths and materialize inline YAML configs to temp files."""
-    from huggingface_hub import snapshot_download
-    import yaml
-
-    for attr in ("hf_checkpoint", "load", "ref_load", "critic_load"):
-        if (val := getattr(slime_cfg, attr, None)) and not str(val).startswith("/"):
-            setattr(slime_cfg, attr, snapshot_download(val, local_files_only=True))
-
-    for field in YAML_CONFIG_FIELDS:
-        if isinstance(val := getattr(slime_cfg, field, None), dict):
-            path = os.path.join(tmpdir, f"{field}.yaml")
-            with open(path, "w") as f:
-                yaml.dump(val, f)
-            print(f"Materialized {field} → {path}")
-            setattr(slime_cfg, field, path)
-
-
-def _build_train_cmd(slime_cfg) -> str:
-    """Build the Ray job entrypoint, sourcing model arch args if slime_model_script is set."""
-    train_script = (
-        f"{SLIME_ROOT}/{'train_async.py' if slime_cfg.async_mode else 'train.py'}"
-    )
-    if slime_cfg.slime_model_script:
-        inner = (
-            f"source {SLIME_ROOT}/{slime_cfg.slime_model_script} && "
-            f"python3 {train_script} ${{MODEL_ARGS[@]}} {shlex.join(slime_cfg.cli_args())}"
-        )
-        return f"bash -c {shlex.quote(inner)}"
-    return f"python3 {train_script} {shlex.join(slime_cfg.cli_args())}"
+    if node_rank == 0:
+        print(f"Saved torch_dist checkpoint to {save_path}")
 
 
 @app.function(
@@ -245,23 +205,22 @@ def _build_train_cmd(slime_cfg) -> str:
     else lambda fn: fn
 )
 async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    await asyncio.gather(hf_cache_volume.reload.aio(), data_volume.reload.aio())
+    await asyncio.gather(
+        hf_cache_volume.reload.aio(),
+        data_volume.reload.aio(),
+        checkpoints_volume.reload.aio(),
+    )
     exp_mod = get_module(experiment)
     slime_cfg = exp_mod.slime
     modal_cfg = exp_mod.modal
 
-    if slime_cfg.total_nodes() > 1:
-        info = modal.experimental.get_cluster_info()
-        rank, master_addr, my_ip = (
-            info.rank,
-            info.container_ipv4_ips[0],
-            info.container_ipv4_ips[info.rank],
-        )
-        n_nodes = len(info.container_ipv4_ips)
-    else:
-        rank, master_addr, my_ip, n_nodes = 0, "127.0.0.1", "127.0.0.1", 1
+    rank, master_addr, my_ip, n_nodes = get_modal_cluster_context(
+        slime_cfg.total_nodes()
+    )
 
     os.environ["SLIME_HOST_IP"] = my_ip
+    os.environ["SGLANG_HOST_IP"] = my_ip
+    os.environ["HOST_IP"] = my_ip
 
     if rank != 0:
         # Worker node: join the Ray cluster and keep the container alive.
@@ -278,15 +237,15 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
             await asyncio.sleep(10)
 
     # Head node: start Ray, prepare config, submit job, stream logs.
-    _start_ray_head(my_ip, n_nodes)
-    _prepare_slime_cfg(slime_cfg, tempfile.mkdtemp())
+    start_ray_head(my_ip, n_nodes)
+    prepare_slime_config(slime_cfg, tempfile.mkdtemp())
 
     if (wandb_key := os.environ.get("WANDB_API_KEY", "")) and getattr(
         slime_cfg, "use_wandb", False
     ):
         slime_cfg.wandb_key = wandb_key
 
-    cmd = _build_train_cmd(slime_cfg)
+    cmd = build_train_cmd(slime_cfg, SLIME_ROOT)
     runtime_env = {
         "env_vars": {
             "no_proxy": f"127.0.0.1,{master_addr}",
