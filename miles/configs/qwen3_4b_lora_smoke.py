@@ -6,7 +6,7 @@ Corresponds to nan_wonderland/miles/examples/lora/run-qwen3-4b-megatron-lora-res
 
 from configs.base import ModalConfig, MilesConfig, DATA_PATH
 
-modal = ModalConfig(gpu="H200")
+modal = ModalConfig(gpu="H100")
 
 
 class _Miles(MilesConfig):
@@ -25,7 +25,7 @@ class _Miles(MilesConfig):
 
     # ── Infrastructure ────────────────────────────────────────────────────────
     actor_num_nodes = 1
-    actor_num_gpus_per_node = 4
+    actor_num_gpus_per_node = 8
     colocate = True
     calculate_per_token_loss = True
     use_miles_router = True
