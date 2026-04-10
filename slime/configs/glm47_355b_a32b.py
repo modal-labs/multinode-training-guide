@@ -39,7 +39,7 @@ class _Slime(SlimeConfig):
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     num_rollout = 3000
-    rollout_batch_size = 32
+    rollout_batch_size = 64
     rollout_max_response_len = 8192
     rollout_temperature = 1.0
     n_samples_per_prompt = 8

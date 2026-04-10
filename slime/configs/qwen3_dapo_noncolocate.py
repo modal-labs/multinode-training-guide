@@ -8,15 +8,7 @@ run-qwen3-30B-A3B.sh defaults and the guide docs.
 from configs import qwen3_dapo as _base
 from configs.base import CHECKPOINTS_PATH, ModalConfig
 
-modal = ModalConfig(
-    gpu="H200",
-    # local_slime="/home/ec2-user/nan_wonderland/slime",
-    # patch_files=["/home/ec2-user/nan_wonderland/delta_sync_history_20260331/patches/sglang_delta_compression_working_non_colocate.patch"],
-    # image_run_commands=[
-    #     "uv pip install --system zstandard",
-    #     "cd /sgl-workspace/sglang && patch -p1 < /tmp/sglang_delta_compression_working_non_colocate.patch && cd /root/slime",
-    # ],
-)
+modal = ModalConfig(gpu="H200")
 
 
 class _Slime(_base._Slime):
