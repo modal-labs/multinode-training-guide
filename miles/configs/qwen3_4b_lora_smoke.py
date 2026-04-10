@@ -87,15 +87,19 @@ class _Miles(MilesConfig):
 
     def prepare_data(self) -> None:
         """Download dapo-math-17k and aime-2024 datasets."""
+        import os
         from huggingface_hub import snapshot_download
 
+        os.makedirs(f"{DATA_PATH}/dapo-math-17k", exist_ok=True)
+        os.makedirs(f"{DATA_PATH}/aime-2024", exist_ok=True)
+
         snapshot_download(
-            repo_id="BytedTsinghua/dapo-math-17k",
+            repo_id="zhuzilin/dapo-math-17k",
             repo_type="dataset",
             local_dir=f"{DATA_PATH}/dapo-math-17k",
         )
         snapshot_download(
-            repo_id="AI-MO/aime-2024",
+            repo_id="zhuzilin/aime-2024",
             repo_type="dataset",
             local_dir=f"{DATA_PATH}/aime-2024",
         )
