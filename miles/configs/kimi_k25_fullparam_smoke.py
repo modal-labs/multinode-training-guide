@@ -5,7 +5,6 @@ Run: EXPERIMENT_CONFIG=kimi_k25_fullparam_smoke modal run -d miles/modal_train.p
 
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
 
-_MILES_PR896_SHA = "6ff48d526f35278a6161f57957fc8cf6ab18c525"
 _SGLANG_SYNC_SHA = "6d79c609954585c5e40d5f2b24dc5eb30d1fe41a"
 _MEGATRON_BRIDGE_SHA = "d2ee05178d382414bec006fb94dc415483ec6cda"
 
@@ -18,21 +17,23 @@ modal = ModalConfig(
         "patches/megatron_bridge_kimi_vl.patch",
     ],
     image_run_commands=[
-        # Remove pip nvidia-cudnn: TE loads via absolute paths, pip version has H200 symbol mismatch
+        # Remove pip nvidia-cudnn — TE loads system cuDNN via absolute paths and
+        # the pip version has H200 symbol mismatches.
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
-        # Merge upstream SGLang commits (up to PR #22381)
+        # Merge upstream SGLang to pick up K2.5 language_only + compressed-tensors
+        # MoE support (PR #22381 and friends).
         "cd /sgl-workspace/sglang && git config user.email 'miles@local' && git config user.name 'miles'",
         "cd /sgl-workspace/sglang && git fetch --unshallow origin && git fetch origin main",
         f"cd /sgl-workspace/sglang && git merge {_SGLANG_SYNC_SHA} --no-edit -X theirs",
         "cd /sgl-workspace/sglang && git apply /tmp/sglang_lora_bias_22402.patch",
-        # K2.5 SGLang patches
+        # ReplicatedLinear.weight_loader doesn't shard; patch deepseek_weight_loader
+        # to fuse q_a_proj + kv_a_proj_with_mqa manually (slime's approach).
         "python /root/miles/patches/sglang_fused_qkv_weight_fix.py",
-        "python /root/miles/patches/sglang_pynccl_nonfatal.patch.py",
-        # Install Megatron-Bridge 0.4.0 (has official KimiK2Bridge)
+        # Install radixark's Megatron-Bridge 0.4.0 (official KimiK2Bridge).
         f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{_MEGATRON_BRIDGE_SHA}",
-        # Add KimiK25VL bridge from fzyzcjy/Megatron-Bridge PR #7 (handles language_model prefix + VL model)
+        # Layer KimiK25VLBridge on top (based on fzyzcjy/Megatron-Bridge PR #7).
         "cd $(python -c 'import megatron.bridge; import os; p=megatron.bridge.__file__; print(os.path.dirname(os.path.dirname(os.path.dirname(p))))') && patch -p1 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
-        # Bridges registered at runtime via megatron_utils/__init__.py
+        # Bridges registered at runtime via megatron_utils/__init__.py.
     ],
 )
 
@@ -94,7 +95,8 @@ class _Miles(MilesConfig):
     context_parallel_size = 1
     expert_model_parallel_size = 8
     expert_tensor_parallel_size = 1
-    decoder_last_pipeline_num_layers = 4  # (61 - 4) / 3 = 19 layers per middle stage
+    # (61 total layers - 4 in last stage) / 3 middle stages = 19 layers each
+    decoder_last_pipeline_num_layers = 4
 
     recompute_granularity = "full"
     recompute_method = "uniform"
@@ -128,17 +130,7 @@ class _Miles(MilesConfig):
     wandb_group = "kimi-k25-fullparam-smoke"
     disable_wandb_random_suffix = True
 
-    def __init__(self):
-        super().__init__()
-        # Disable INT4 fake QAT for smoke test — saves memory on dequant buffers.
-        # Re-enable for production training with INT4 weights.
-        # self.environment.update({
-        #     "OPEN_TRAINING_INT4_FAKE_QAT_FLAG": "1",
-        #     "OPEN_TRAINING_INT4_GROUP_SIZE": "32",
-        # })
-
     def prepare_data(self) -> None:
-        import json
         import os
         from huggingface_hub import snapshot_download
 
@@ -148,9 +140,6 @@ class _Miles(MilesConfig):
             repo_type="dataset",
             local_dir=f"{DATA_PATH}/dapo-math-17k",
         )
-
-        # K2.5 config: keep quantization_config (compressed-tensors needed for memory)
-        # The weight update path must handle compressed-tensors param names.
 
 
 miles = _Miles()
