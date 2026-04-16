@@ -1,9 +1,10 @@
 """Kimi-K2.5 LoRA training — 8x H200, colocated.
 
-Phase 1 scope: LoRA on MLA projections only (5 modules × 60 layers = 300 adapters).
-MoE expert LoRA (linear_fc1/linear_fc2) is intentionally excluded here — sparse
-expert + compressed-tensors + LoRA is the shakiest code path and should be
-added in a follow-up once MLA LoRA is validated end-to-end.
+Covers MLA attention + MLP (dense, shared experts, sparse experts). This is
+the general-case LoRA target set; if it works end-to-end, narrower scopes
+(attention-only, MLP-only) follow trivially. Per
+https://thinkingmachines.ai/blog/lora/ MLP matters more than attention for
+LoRA, so we want the MLP path exercised here.
 
 Run: EXPERIMENT_CONFIG=kimi_k25_lora modal run -d miles/modal_train.py::train
 """
@@ -21,7 +22,7 @@ class _Miles(_FullParamMiles):
     target_modules = (
         "linear_q_down_proj,linear_q_up_proj,"
         "linear_kv_down_proj,linear_kv_up_proj,"
-        "linear_proj"
+        "linear_proj,linear_fc1,linear_fc2"
     )
 
     lr = 1e-5
