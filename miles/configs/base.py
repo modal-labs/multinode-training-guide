@@ -44,6 +44,7 @@ class ModalConfig:
     """Modal infrastructure configuration — GPU provisioning and image setup only."""
 
     gpu: GPUType = "H200"
+    memory: tuple[int, int] | None = None  # per-container memory in MiB; None = Modal default
     local_miles: str | None = None  # path to local miles repo for dev overlay
     patch_files: list[
         str
@@ -51,6 +52,7 @@ class ModalConfig:
     image_run_commands: list[
         str
     ] = []  # commands to run during image build (e.g. git apply /tmp/my.patch)
+    image_env: dict[str, str] = {}  # environment variables baked into the image (Modal .env())
 
     def __init__(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():

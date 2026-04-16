@@ -24,7 +24,7 @@ MILES_ROOT = "/root/miles"
 
 image = (
     modal.Image.from_registry(
-        "radixark/miles:dev-202604101227"
+        "radixark/miles:dev"
     )
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
@@ -44,6 +44,8 @@ if modal_cfg:
         )
     if modal_cfg.image_run_commands:
         image = image.run_commands(*modal_cfg.image_run_commands)
+    # Ensure system libraries (cuDNN, NCCL) take precedence over pip versions
+    image = image.env({"LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"})
 
 with image.imports():
     from ray.job_submission import JobSubmissionClient
@@ -115,6 +117,46 @@ def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     data_volume.reload()
     miles_cfg.prepare_data()
     data_volume.commit()
+
+
+@app.function(
+    image=image,
+    gpu="H200:1",
+    volumes=modal_volumes,
+    timeout=4 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def convert_kimi_int4_to_bf16(
+    model: str = "moonshotai/Kimi-K2.5",
+    output_dir: str = str(CHECKPOINTS_PATH / "Kimi-K2.5-bf16"),
+):
+    """Convert Kimi native INT4 weights to BF16 for INT4 QAT training.
+
+    The BF16 checkpoint is used as --hf-checkpoint with INT4 QAT env vars
+    (OPEN_TRAINING_INT4_FAKE_QAT_FLAG=1, OPEN_TRAINING_INT4_GROUP_SIZE=32).
+
+    Run: modal run modal_train.py::convert_kimi_int4_to_bf16
+    """
+    from huggingface_hub import snapshot_download
+
+    hf_cache_volume.reload()
+    checkpoints_volume.reload()
+
+    if model.startswith("/"):
+        model_dir = model
+    else:
+        model_dir = snapshot_download(model, local_files_only=True)
+    print(f"Source: {model_dir}")
+
+    print(f"\n=== INT4 → BF16: {output_dir} ===")
+    subprocess.run(
+        ["python", f"{MILES_ROOT}/tools/convert_k2_thinking_int4_to_bf16.py",
+         "--model-dir", model_dir, "--output-dir", output_dir],
+        check=True,
+    )
+
+    checkpoints_volume.commit()
+    print(f"\n=== Done: {output_dir} ===")
 
 
 @app.function(
@@ -194,6 +236,7 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
 @app.function(
     image=image,
     gpu=f"{modal_cfg.gpu}:{miles_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
+    memory=modal_cfg.memory if modal_cfg and modal_cfg.memory else None,
     volumes=modal_volumes,
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,
