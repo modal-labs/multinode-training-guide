@@ -162,6 +162,7 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
     # prevent volume corruption (see modal_helpers/convert_hf_to_torch_dist.py).
     # Single-node uses the upstream script directly.
     import importlib.util
+
     convert_script = (
         importlib.util.find_spec("modal_helpers.convert_hf_to_torch_dist").origin
         if num_nodes > 1
@@ -194,6 +195,9 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
 @app.function(
     image=image,
     gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
+    memory=modal_cfg.memory if modal_cfg and modal_cfg.memory else None,
+    cloud=modal_cfg.cloud if modal_cfg and modal_cfg.cloud else None,
+    region=modal_cfg.region if modal_cfg and modal_cfg.region else None,
     volumes=modal_volumes,
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,

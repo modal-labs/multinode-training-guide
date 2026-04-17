@@ -1,14 +1,14 @@
-"""GLM-4.7-355B-A32B GSPO on DAPO-Math-17k — 4-node actor + 4-node rollout.
+"""GLM-4.7-355B-A32B GSPO on DAPO-Math-17k — non-colocated: 4 actor + 4 rollout nodes.
 
-Scaled-down non-colocated variant: TP=8, PP=4 on 4 actor nodes (32 GPUs),
-no context parallelism needed. EP reduced from 16→8 to fit 8 GPUs per PP stage.
-Uses the same TP=8,PP=4 checkpoint as the 8-node colocated config.
+Same model, TP=8, PP=4, and EP=16 as the base 8-node colocated config; this
+variant splits actor and rollout across separate node pools (64 rollout GPUs)
+instead of co-locating them on the same GPUs. Inherits the 2 TiB memory
+reservation from the base config's ModalConfig.
 """
 
 from configs import glm47_355b_a32b as _base
-from configs.base import ModalConfig
 
-modal = ModalConfig(gpu="H200")
+modal = _base.modal
 
 
 class _Slime(_base._Slime):
