@@ -6,7 +6,7 @@ Checkpoint conversion uses 4 nodes x 8 GPUs for tp=8, pp=4.
 
 from configs.base import ModalConfig, SlimeConfig, DATA_PATH, CHECKPOINTS_PATH
 
-modal = ModalConfig(gpu="H200")
+modal = ModalConfig(gpu="H200", memory=(1024, int(2 * 1024 * 1024)))  # 2 TiB in MiB
 
 
 class _Slime(SlimeConfig):
