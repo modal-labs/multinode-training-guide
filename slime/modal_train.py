@@ -3,6 +3,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from pathlib import Path
 
 import modal
 import modal.experimental
@@ -21,23 +22,50 @@ slime_cfg = exp_mod.slime if exp_mod else None
 # ── Image ─────────────────────────────────────────────────────────────────────
 
 SLIME_ROOT = "/root/slime"
+_LOCAL_SLIME_DIR = Path(__file__).resolve().parent
+_LOCAL_REPO_ROOT = _LOCAL_SLIME_DIR.parent
+_LOCAL_CONFIGS_DIR = _LOCAL_SLIME_DIR / "configs"
+_LOCAL_MODAL_HELPERS_DIR = _LOCAL_SLIME_DIR / "modal_helpers"
+
+
+def _resolve_local_path(path: str) -> str:
+    path_obj = Path(path).expanduser()
+    if path_obj.is_absolute():
+        return str(path_obj)
+    for base in (_LOCAL_SLIME_DIR, _LOCAL_REPO_ROOT):
+        candidate = (base / path_obj).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str((_LOCAL_SLIME_DIR / path_obj).resolve())
 
 image = (
     modal.Image.from_registry(
         "slimerl/slime:nightly-dev-20260329a"
     )  # Please check https://hub.docker.com/r/slimerl/slime/tags for the latest version
     .entrypoint([])
-    .add_local_python_source("configs", copy=True)
-    .add_local_python_source("modal_helpers", copy=True)
+    .add_local_dir(
+        _LOCAL_CONFIGS_DIR,
+        remote_path="/root/configs",
+        copy=True,
+        ignore=["**/__pycache__", "**/*.pyc"],
+    )
+    .add_local_dir(
+        _LOCAL_MODAL_HELPERS_DIR,
+        remote_path="/root/modal_helpers",
+        copy=True,
+        ignore=["**/__pycache__", "**/*.pyc"],
+    )
 )
 if modal_cfg:
     for patch in modal_cfg.patch_files:
+        patch_path = _resolve_local_path(patch)
         image = image.add_local_file(
-            patch, f"/tmp/{os.path.basename(patch)}", copy=True
+            patch_path, f"/tmp/{os.path.basename(patch_path)}", copy=True
         )
     if modal_cfg.local_slime:
+        local_slime_path = _resolve_local_path(modal_cfg.local_slime)
         image = image.add_local_dir(
-            modal_cfg.local_slime,
+            local_slime_path,
             remote_path=SLIME_ROOT,
             copy=True,
             ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],

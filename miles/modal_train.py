@@ -24,6 +24,8 @@ miles_cfg = exp_mod.miles if exp_mod else None
 MILES_ROOT = "/root/miles"
 _LOCAL_MILES_DIR = Path(__file__).resolve().parent
 _LOCAL_REPO_ROOT = _LOCAL_MILES_DIR.parent
+_LOCAL_CONFIGS_DIR = _LOCAL_MILES_DIR / "configs"
+_LOCAL_MODAL_HELPERS_DIR = _LOCAL_MILES_DIR / "modal_helpers"
 
 
 def _resolve_local_path(path: str) -> str:
@@ -41,8 +43,18 @@ image = (
         "radixark/miles:dev-202604201238"
     )
     .entrypoint([])
-    .add_local_python_source("configs", copy=True)
-    .add_local_python_source("modal_helpers", copy=True)
+    .add_local_dir(
+        _LOCAL_CONFIGS_DIR,
+        remote_path="/root/configs",
+        copy=True,
+        ignore=["**/__pycache__", "**/*.pyc"],
+    )
+    .add_local_dir(
+        _LOCAL_MODAL_HELPERS_DIR,
+        remote_path="/root/modal_helpers",
+        copy=True,
+        ignore=["**/__pycache__", "**/*.pyc"],
+    )
 )
 if modal_cfg:
     for patch in modal_cfg.patch_files:
