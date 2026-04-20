@@ -1,0 +1,267 @@
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 9fb8aa14d..215ebc3aa 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -41,6 +41,8 @@ class BaseLayerWithLoRA(nn.Module):
+             self.weight = self.base_layer.weight
+         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+             self.bias = self.base_layer.bias
++        if hasattr(self.base_layer, "reduce_results"):
++            self.reduce_results = self.base_layer.reduce_results
+ 
+     def forward(self, x: torch.Tensor):
+         return self.base_layer.forward(x)
+@@ -460,9 +462,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+         return A
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative: DP-attention makes output_partition_sizes attn_tp-local while
++        # the caller passes global tp_rank.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.output_partition_sizes[0]
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         B = B[start_idx:end_idx, :]
+         return B
+ 
+@@ -510,10 +516,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+         # Since the outputs for both gate and up are identical, we use a random one.
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative under DP-attention.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.output_partition_sizes[0]
+         gate_size = self.base_layer.output_sizes[0]
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         return torch.concat(
+             (
+                 B[start_idx:end_idx, :],
+@@ -577,11 +586,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         q_proj_shard_size = base_layer.q_proj_shard_size
+         kv_proj_shard_size = base_layer.kv_proj_shard_size
+         num_kv_head_replicas = base_layer.num_kv_head_replicas
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative under DP-attention.
++        local_tp_rank = getattr(base_layer, "tp_rank", tp_rank)
+ 
+-        q_start_idx = q_proj_shard_size * tp_rank
++        q_start_idx = q_proj_shard_size * local_tp_rank
+         q_end_idx = q_start_idx + q_proj_shard_size
+ 
+-        kv_shard_id = tp_rank // num_kv_head_replicas
++        kv_shard_id = local_tp_rank // num_kv_head_replicas
+         kv_start_idx = kv_proj_shard_size * kv_shard_id
+         kv_end_idx = kv_start_idx + kv_proj_shard_size
+ 
+@@ -681,9 +693,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+         return output_, output_bias
+ 
+     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
++        # Use base_layer.tp_rank (not the argument) so the slicing rank matches
++        # the partition group the base layer was built on. For DeepSeek/Kimi MLA
++        # o_proj under DP-attention, base_layer.tp_rank is attn_tp_rank (0..1)
++        # while the caller passes the global tp_rank (0..7); input_size_per_partition
++        # is already attn_tp-sized, so using global tp_rank overshoots to empty.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.input_size_per_partition
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         A = A[:, start_idx:end_idx].contiguous()
+         return A
+ 
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 34444edfc..9fdf1f3b5 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -157,6 +157,53 @@ class LoRAMemoryPool:
+             or 1
+         )
+ 
++    def _row_parallel_shard_tp(
++        self, module_name: str, base_model: torch.nn.Module
++    ) -> int:
++        """How many ways the row-parallel *input* is partitioned for this module.
++
++        LoRAMemoryPool used to divide by global ``self.tp_size`` for every
++        ``o_proj`` / ``down_proj`` LoRA A buffer.  DeepSeek / Kimi build some
++        ``RowParallelLinear`` layers (notably ``o_proj``) on the **attention**
++        TP group (``attn_tp_size``), which can differ from tensor-parallel world
++        size when DP attention is on.  Then ``A_buffer``'s last dim no longer
++        matches the activation shard and ``chunked_sgmv_lora_shrink_forward``
++        asserts ``x.shape[-1] == K``.
++
++        Infer the real factor from ``input_size // input_size_per_partition`` on
++        the first matching base module; fall back to ``self.tp_size``.
++        """
++        cache = getattr(self, "_row_parallel_tp_cache", None)
++        if cache is None:
++            cache = {}
++            setattr(self, "_row_parallel_tp_cache", cache)
++        if module_name in cache:
++            return cache[module_name]
++
++        def _probe(m):
++            in_size = getattr(m, "input_size", None)
++            per_part = getattr(m, "input_size_per_partition", None)
++            if in_size is not None and per_part is not None and per_part > 0:
++                return max(1, in_size // per_part)
++            inner = getattr(m, "base_layer", None)
++            if inner is not None and inner is not m:
++                return _probe(inner)
++            return None
++
++        suffix = f".{module_name}"
++        found = None
++        for _name, module in base_model.named_modules():
++            if not _name.endswith(suffix):
++                continue
++            r = _probe(module)
++            if r is not None:
++                found = r
++                break
++
++        out = found if found is not None else self.tp_size
++        cache[module_name] = out
++        return out
++
+     def _get_standard_shape(
+         self,
+         module_name: str,
+@@ -169,8 +216,9 @@ class LoRAMemoryPool:
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+         c = get_stacked_multiply(module_name)
+-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+-            input_dim = divide(input_dim, self.tp_size)
++        row_tp = self._row_parallel_shard_tp(module_name, base_model)
++        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
++            input_dim = divide(input_dim, row_tp)
+         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+ 
+     def get_lora_A_shape(
+@@ -191,12 +239,13 @@ class LoRAMemoryPool:
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+         c = get_stacked_multiply(module_name)
++        row_tp = self._row_parallel_shard_tp(module_name, base_model)
+         if (
+-            self.tp_size > 1
++            row_tp > 1
+             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+             and module_name not in REPLICATED_LINEAR_LORA_NAMES
+         ):
+-            input_dim = divide(input_dim, self.tp_size)
++            input_dim = divide(input_dim, row_tp)
+ 
+         if self.is_moe_module(module_name):
+             num_experts = self._get_num_experts(base_model)
+diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+index 9ff683a7e..ca846c1f2 100644
+--- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+@@ -95,6 +95,24 @@ T = TypeVar("T")
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
++    """Aggregate LoRAUpdateOutput responses from `dp_size` first-rank schedulers.
++
++    Every DP rank processes the same broadcast request with identical tensors and
++    converges to the same `lora_refs` dict, so `loaded_adapters` agrees across
++    ranks. Still AND `success` so a rank-local backend failure cannot be masked
++    by DP-0 succeeding.
++    """
++    all_success = all(r.success for r in results)
++    errors = [r.error_message for r in results if not r.success and r.error_message]
++    merged_error = " | ".join(errors) if errors else None
++    return LoRAUpdateOutput(
++        success=all_success,
++        error_message=merged_error,
++        loaded_adapters=results[0].loaded_adapters if results else None,
++    )
++
++
+ class _Communicator(Generic[T]):
+     """Note: The communicator now only run up to 1 in-flight request at any time."""
+ 
+@@ -665,7 +683,9 @@ class TokenizerCommunicatorMixin:
+         # Initiate the actual unloading operation at the backend processes only after all
+         # ongoing requests using this LoRA adapter are finished.
+         await self.lora_registry.wait_for_unload(lora_id)
+-        result = (await self.update_lora_adapter_communicator(obj))[0]
++        result = _merge_lora_update_results(
++            await self.update_lora_adapter_communicator(obj)
++        )
+ 
+         return result
+ 
+@@ -682,11 +702,9 @@ class TokenizerCommunicatorMixin:
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                 )
+ 
+-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+-            # with dp_size > 1.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter. Lora name=%s, path=%s",
+                 obj.lora_name,
+@@ -703,7 +721,9 @@ class TokenizerCommunicatorMixin:
+ 
+                 # Trigger the actual loading operation at the backend processes.
+                 obj.lora_id = new_adapter.lora_id
+-                result = (await self.update_lora_adapter_communicator(obj))[0]
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
+ 
+                 # Register the LoRA adapter only after loading is successful.
+                 if result.success:
+@@ -761,8 +781,8 @@ class TokenizerCommunicatorMixin:
+                 )
+ 
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter from tensors. Lora name=%s",
+                 obj.lora_name,
+@@ -775,7 +795,9 @@ class TokenizerCommunicatorMixin:
+                     pinned=obj.pinned,
+                 )
+                 obj.lora_id = new_adapter.lora_id
+-                result = (await self.update_lora_adapter_communicator(obj))[0]
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
+ 
+                 if result.success:
+                     await self.lora_registry.register(new_adapter)
+@@ -834,11 +856,9 @@ class TokenizerCommunicatorMixin:
+                 obj.lora_name is not None
+             ), "lora_name must be provided to unload LoRA adapter"
+ 
+-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+-            # with dp_size > 1.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start unload Lora adapter. Lora name=%s",
+                 obj.lora_name,

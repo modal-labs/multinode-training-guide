@@ -1,12 +1,37 @@
-"""Kimi-K2.5 LoRA training — 8x H200, colocated.
+"""Kimi-K2.5 LoRA (standard ``LoRA``, not CanonicalLoRA) — 8x H200, colocated.
 
-Covers MLA attention + MLP (dense, shared experts, sparse experts). This is
-the general-case LoRA target set; if it works end-to-end, narrower scopes
-(attention-only, MLP-only) follow trivially. Per
-https://thinkingmachines.ai/blog/lora/ MLP matters more than attention for
-LoRA, so we want the MLP path exercised here.
+``target_modules`` is a comma-separated list. Each token may be **HF-style** (what
+you see in ``weight_map`` suffixes) or **Megatron** (``linear_*``); Miles
+``lora_utils.convert_target_modules_to_megatron`` normalizes before PEFT. See
+``nan_wonderland/miles/miles/backends/megatron_utils/lora_utils.py``.
 
-Run: EXPERIMENT_CONFIG=kimi_k25_lora modal run -d miles/modal_train.py::train
+**Decoder — MLA attention (pick any subset):**
+
+  HF token                 Megatron equivalent
+  -----------------------  ---------------------
+  ``q_a_proj``             ``linear_q_down_proj``
+  ``q_b_proj``             ``linear_q_up_proj``
+  ``kv_a_proj_with_mqa``   ``linear_kv_down_proj``
+  ``kv_b_proj``            ``linear_kv_up_proj``
+  ``o_proj``               ``linear_proj``
+
+**Decoder — MoE / MLP FFN:**
+
+  HF tokens ``gate_proj``, ``up_proj``, ``down_proj`` map to Megatron
+  ``linear_fc1`` (fused SwiGLU gate+up) and ``linear_fc2`` (down). Listing
+  ``gate_proj`` and ``up_proj`` still yields one ``linear_fc1`` adapter each
+  place that leaf exists (routed experts under ``mlp.experts.*`` and shared
+  under ``mlp.shared_experts.*``). The **router** is ``mlp.gate`` in HF
+  (``…mlp.gate.weight``), not ``gate_proj``; there is no default token for it.
+
+**Not covered here:** vision tower / ``mm_projector`` weights (separate subtree
+in the checkpoint). Use ``modal run modal_hf_inspect.py`` from ``miles/`` for
+exact key templates.
+
+**SGLang colocation:** rollout config may drop ``q_b_proj`` / ``kv_b_proj`` if
+default ``get_hidden_dim`` lacks them (``target_modules_hf_for_sglang_rollout``).
+
+Run: ``EXPERIMENT_CONFIG=kimi_k25_lora modal run -d miles/modal_train.py::train``
 """
 
 from configs.kimi_k25_fullparam_smoke import _Miles as _FullParamMiles, modal  # noqa: F401
@@ -19,25 +44,10 @@ class _Miles(_FullParamMiles):
     lora_rank = 32
     lora_alpha = 32
     lora_dropout = 0.0
-    target_modules = (
-        "linear_q_down_proj,linear_q_up_proj,"
-        "linear_kv_down_proj,linear_kv_up_proj,"
-        "linear_proj,linear_fc1,linear_fc2"
-    )
+    # Subset of MLA attention (see module docstring for full list).
+    target_modules = "q_a_proj,kv_a_proj_with_mqa,o_proj"
 
     lr = 1e-5
     wandb_group = "kimi-k25-lora"
-
-    def __init__(self):
-        super().__init__()
-        # Keep base expert weights in fake INT4 during forward so training
-        # numerics match SGLang's INT4 inference. LoRA adapters train in bf16;
-        # base is frozen so optimizer state stays tiny and the dequant scratch
-        # fits in H200 memory.
-        self.environment.update({
-            "OPEN_TRAINING_INT4_FAKE_QAT_FLAG": "1",
-            "OPEN_TRAINING_INT4_GROUP_SIZE": "32",
-        })
-
 
 miles = _Miles()

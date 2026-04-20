@@ -13,21 +13,15 @@ modal = ModalConfig(
     memory=(1024, int(2 * 1024 * 1024)),
     local_miles="/home/ec2-user/nan_wonderland/miles",
     patch_files=[
-        "patches/sglang_lora_bias_22402.patch",
+        "patches/sglang_lora.patch",
         "patches/megatron_bridge_kimi_vl.patch",
     ],
     image_run_commands=[
         # Remove pip nvidia-cudnn — TE loads system cuDNN via absolute paths and
         # the pip version has H200 symbol mismatches.
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
-        # Merge upstream SGLang to pick up K2.5 language_only + compressed-tensors
-        # MoE support (PR #22381 and friends).
-        # "cd /sgl-workspace/sglang && git config user.email 'miles@local' && git config user.name 'miles'",
-        # "cd /sgl-workspace/sglang && git fetch --unshallow origin && git fetch origin main",
-        # f"cd /sgl-workspace/sglang && git merge {_SGLANG_SYNC_SHA} --no-edit -X theirs",
-
         "cd /sgl-workspace/sglang && git fetch origin pull/23065/head:pr-23065 && git checkout pr-23065",
-        # "cd /sgl-workspace/sglang && git apply /tmp/sglang_lora_bias_22402.patch",
+        "cd /sgl-workspace/sglang && git update-index --refresh && git apply --3way /tmp/sglang_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
         f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{_MEGATRON_BRIDGE_SHA}",
         "cd /usr/local/lib/python3.12/dist-packages && patch -p2 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
     ],
@@ -37,6 +31,13 @@ modal = ModalConfig(
 class _Miles(MilesConfig):
     miles_model_script = "scripts/models/kimi-k2-thinking.sh"
 
+    environment = {
+        "PYTHONPATH": "/root/Megatron-LM/",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "NCCL_NVLS_ENABLE": "1",
+        "OPEN_TRAINING_INT4_FAKE_QAT_FLAG": "1",
+        "OPEN_TRAINING_INT4_GROUP_SIZE": "32",
+    }
     hf_checkpoint = "moonshotai/Kimi-K2.5"
     ref_load = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
     megatron_to_hf_mode = "bridge"
@@ -98,7 +99,7 @@ class _Miles(MilesConfig):
     recompute_num_layers = 1
 
     use_dynamic_batch_size = True
-    max_tokens_per_gpu = 4096
+    max_tokens_per_gpu = 2048
 
     attention_dropout = 0.0
     hidden_dropout = 0.0
@@ -109,7 +110,7 @@ class _Miles(MilesConfig):
     moe_token_dispatcher_type = "alltoall"
 
     rollout_num_gpus_per_engine = 8
-    sglang_mem_fraction_static = 0.7
+    sglang_mem_fraction_static = 0.65
     sglang_enable_dp_attention = True
     sglang_dp_size = 4
     sglang_moe_dense_tp_size = 1
