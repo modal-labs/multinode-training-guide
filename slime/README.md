@@ -167,7 +167,7 @@ To inject local patch files into the image (e.g. to patch SGLang), use `patch_fi
 ```python
 modal = ModalConfig(
     gpu="H200",
-    patch_files=["patches/sglang_fix.patch"],
+    patch_files=["miles/patches/sglang_fix.patch"],
     image_run_commands=["cd /sgl-workspace/sglang && git apply /tmp/sglang_fix.patch"],
 )
 ```

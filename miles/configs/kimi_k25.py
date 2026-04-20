@@ -13,9 +13,9 @@ modal = ModalConfig(
     gpu="H200",
     memory=(1024, int(2 * 1024 * 1024)),
     patch_files=[
-        "patches/megatron_bridge_kimi_vl.patch",
-        "patches/miles_lora.patch",
-        "patches/sglang_lora.patch",
+        "miles/patches/megatron_bridge_kimi_vl.patch",
+        "miles/patches/miles_lora.patch",
+        "miles/patches/sglang_lora.patch",
     ],
     image_run_commands=[
         # Remove pip nvidia-cudnn — TE loads system cuDNN via absolute paths and

@@ -13,7 +13,7 @@ image = (
         copy=True,
         ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
     )
-    .add_local_file("patches/megatron_bridge_kimi_vl.patch", "/tmp/megatron_bridge_kimi_vl.patch", copy=True)
+    .add_local_file("miles/patches/megatron_bridge_kimi_vl.patch", "/tmp/megatron_bridge_kimi_vl.patch", copy=True)
     .run_commands(
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
         "uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@d2ee05178d382414bec006fb94dc415483ec6cda",
