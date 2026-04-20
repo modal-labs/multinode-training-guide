@@ -24,6 +24,7 @@ modal = ModalConfig(
         "cd /sgl-workspace/sglang && git fetch origin pull/23065/head:pr-23065 && git checkout pr-23065",
         "cd /sgl-workspace/sglang && git update-index --refresh && git apply --3way /tmp/sglang_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
         f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{_MEGATRON_BRIDGE_SHA}",
+        "cd /usr/local/lib/python3.12/dist-packages && patch -p2 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
         f"cd /root/miles && git fetch && git checkout {_MILES_SHA} && git update-index --refresh && git apply --3way /tmp/miles_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
     ],
 )
