@@ -44,8 +44,9 @@ class _Miles(_FullParamMiles):
     lora_rank = 32
     lora_alpha = 32
     lora_dropout = 0.0
-    # Subset of MLA attention (see module docstring for full list).
-    target_modules = "q_a_proj,kv_a_proj_with_mqa,o_proj"
+    
+    # see module docstring for full list
+    target_modules = "q_a_proj,kv_a_proj_with_mqa,o_proj,gate_proj,up_proj,down_proj"
 
     lr = 1e-5
     wandb_group = "kimi-k25-lora"

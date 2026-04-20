@@ -101,7 +101,7 @@ class _Miles(MilesConfig):
     recompute_num_layers = 1
 
     use_dynamic_batch_size = True
-    max_tokens_per_gpu = 2048
+    max_tokens_per_gpu = 4096
 
     attention_dropout = 0.0
     hidden_dropout = 0.0
@@ -112,7 +112,7 @@ class _Miles(MilesConfig):
     moe_token_dispatcher_type = "alltoall"
 
     rollout_num_gpus_per_engine = 8
-    sglang_mem_fraction_static = 0.65
+    sglang_mem_fraction_static = 0.85
     sglang_enable_dp_attention = True
     sglang_dp_size = 4
     sglang_moe_dense_tp_size = 1
