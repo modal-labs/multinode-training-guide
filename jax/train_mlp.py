@@ -1,30 +1,17 @@
 import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # suppress GRPC errors
+
+import re
 import time
+
 import jax
 from jax.sharding import NamedSharding, PartitionSpec as P
 import optax
 import equinox as eqx
 import matplotlib.pyplot as plt
-import modal
-import modal.experimental
-import sys
-from model import MLP, BatchNormState
 
-CHECKPOINT_DIR = "/checkpoints"
-LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-cuda_version = "12.4.0"  # should be no greater than host CUDA version
-flavor = "devel"  #  includes full CUDA toolkit
-operating_sys = "ubuntu22.04"
-tag = f"{cuda_version}-{flavor}-{operating_sys}"
-
-image = (
-    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .pip_install("jax[cuda12]", "equinox", "matplotlib", "optax")
-    .add_local_dir(LOCAL_CODE_DIR, remote_path="/root")
-)
-app = modal.App("jax-mlp-training", image=image)
-volume = modal.Volume.from_name("jax-mlp-weights", create_if_missing=True)
+from models import MLP, BatchNormState
 
 
 def loss_fn(model, x, y_true, state):
@@ -42,15 +29,34 @@ def update(model, opt_state, x, y_true, optimizer, state):
     return model, opt_state, loss, state
 
 
-def save_checkpoint(model, epoch, path):
-    eqx.tree_serialise_leaves(os.path.join(path, f"model_epoch_{epoch}.eqx"), model)
+def save_checkpoint(model, state, epoch, path):
+    eqx.tree_serialise_leaves(
+        os.path.join(path, f"model_epoch_{epoch}.eqx"), (model, state)
+    )
 
 
-def load_checkpoint(model, filepath):
-    return eqx.tree_deserialise_leaves(filepath, model)
+def load_checkpoint(model, state, filepath):
+    return eqx.tree_deserialise_leaves(filepath, (model, state))
 
 
-def plot_losses(losses, save_path="loss_curve.png"):
+def find_latest_checkpoint(path: str):
+    """Return (filepath, epoch) of the highest-epoch checkpoint in `path`,
+    or (None, -1) if nothing is there yet."""
+    if not os.path.isdir(path):
+        return None, -1
+    pattern = re.compile(r"model_epoch_(\d+)\.eqx$")
+    best_file, best_epoch = None, -1
+    for fname in os.listdir(path):
+        m = pattern.match(fname)
+        if m:
+            epoch = int(m.group(1))
+            if epoch > best_epoch:
+                best_epoch = epoch
+                best_file = os.path.join(path, fname)
+    return best_file, best_epoch
+
+
+def plot_losses(losses, save_path):
     plt.figure(figsize=(10, 5))
     plt.plot(losses)
     plt.xlabel("Step")
@@ -64,33 +70,24 @@ def plot_losses(losses, save_path="loss_curve.png"):
     print(f"Loss curve saved to {save_path}")
 
 
-# TODO(atoniolo76): setup Jax mesh for distributed training
-@app.function(
-    gpu="H100:8",
-    volumes={
-        CHECKPOINT_DIR: volume,
-    },
-)
-@modal.experimental.clustered(size=2, rdma=True)
-def train(
-    learning_rate=3e-4,
-    batch_size=32,
-    epochs=25,
-    steps_per_epoch=100,
-    hidden_size=64,
-    seed=5678,
+def train_loop(
+    checkpoint_dir: str,
+    mesh,
+    nproc: int,
+    learning_rate: float = 3e-4,
+    batch_size: int = 32,
+    epochs: int = 25,
+    steps_per_epoch: int = 100,
+    hidden_size: int = 64,
+    seed: int = 5678,
 ):
-    cluster_info = modal.experimental.get_cluster_info()
-    node_rank = cluster_info.rank
-    master_addr = cluster_info.container_ipv4_ips[0]
-    nproc = len(cluster_info.container_ipv4_ips)
+    """Run the full MLP training loop. Assumes `jax.distributed` is already
+    initialized and `mesh` is a ready-to-use `jax.Mesh`.
 
-    jax.distributed.initialize(f"{master_addr}:12345", nproc, node_rank)
-
-    print(f"Number of devices: {len(jax.devices())}")
-
-    mesh = jax.make_mesh((8, nproc), ("i", "j"))
-    print(f"Mesh: {mesh}")
+    Writes per-epoch `(model, state)` checkpoints to `checkpoint_dir`, plus a
+    final `model_epoch_{epochs}.eqx` with finalized (inference-time) BatchNorm
+    running stats. Returns `(model, state)`.
+    """
     optimizer = optax.adam(learning_rate)
 
     key = jax.random.PRNGKey(seed)
@@ -98,13 +95,16 @@ def train(
     model = MLP(in_shape=4, hidden_dim=hidden_size, out_shape=4, key=model_key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    all_losses = []
-
     state = BatchNormState(
         training_time=True,
         mean=jax.numpy.zeros(hidden_size),
         var=jax.numpy.zeros(hidden_size),
     )
+
+    data_sharding = NamedSharding(mesh, P(("i", "j"), None))
+    weight_sharding = NamedSharding(mesh, P())
+
+    all_losses = []
 
     for epoch in range(epochs):
         average_t = 0
@@ -112,8 +112,6 @@ def train(
             key, batch_key = jax.random.split(key)
             x = jax.random.normal(batch_key, (batch_size, 4))
 
-            data_sharding = NamedSharding(mesh, P(("i", "j"), None))
-            weight_sharding = NamedSharding(mesh, P())
             global_x = jax.device_put(x, data_sharding)
             global_y_true = jax.device_put(global_x**2, data_sharding)
 
@@ -154,9 +152,11 @@ def train(
             all_losses.append(float(loss))
 
         print(
-            f"Epoch {epoch + 1}/{epochs}, Loss {all_losses[-1]:.6f}, Average time per step {average_t:.9f}s"
+            f"Epoch {epoch + 1}/{epochs}, Loss {all_losses[-1]:.6f}, "
+            f"Average time per step {average_t:.9f}s"
         )
-        save_checkpoint(model, epoch, CHECKPOINT_DIR)
+        if jax.process_index() == 0:
+            save_checkpoint(model, state, epoch, checkpoint_dir)
 
     state = BatchNormState(
         training_time=False,
@@ -164,26 +164,8 @@ def train(
         var=state.var / (steps_per_epoch * epochs),
     )
 
-    # Commit volume
-    volume.commit()
-
-    plot_losses(all_losses)
+    if jax.process_index() == 0:
+        # Final checkpoint carries the inference-ready BatchNorm stats.
+        save_checkpoint(model, state, epochs, checkpoint_dir)
+        plot_losses(all_losses, os.path.join(checkpoint_dir, "loss_curve_mlp.png"))
     return model, state
-
-
-@app.function(
-    gpu="H100:1",
-)
-def predict(x: jax.Array):
-    print("Starting training on two nodes...")
-    call = train.spawn()
-    model, state = call.get()
-    return model(x, state)
-
-
-@app.local_entrypoint()
-def main():
-    x = jax.random.normal(jax.random.PRNGKey(5678), (1, 4))
-    y, state = predict.remote(x)
-    print("Sample input: ", x)
-    print("Sample output: ", y)

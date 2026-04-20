@@ -72,7 +72,6 @@ class BatchNorm(eqx.Module):
         self.beta = jax.random.normal(bkey, out_shape)
         self.epsilon = 1e-5
 
-    # TODO(atoniolo76): add flag for inference time vs. training time
     def __call__(self, x, state: BatchNormState):
         if state.training_time:
             mean = jax.numpy.mean(x, axis=0)
@@ -108,3 +107,31 @@ class MLP(eqx.Module):
         x = jax.numpy.tanh(x)
         x = self.layers["output"](x)
         return x, state
+
+
+class RNN(eqx.Module):
+    weight_hidden: jax.Array
+    weight_input: jax.Array
+    weight_output: jax.Array
+
+    def __init__(self, in_shape, hidden_dim, out_shape, key):
+        hkey, ikey, okey = jax.random.split(key, 3)
+        self.weight_hidden = jax.random.normal(hkey, (hidden_dim, hidden_dim)) / sqrt(
+            hidden_dim
+        )
+        self.weight_input = jax.random.normal(ikey, (in_shape, hidden_dim)) / sqrt(
+            in_shape
+        )
+        self.weight_output = jax.random.normal(okey, (hidden_dim, out_shape)) / sqrt(
+            hidden_dim
+        )
+
+    # We need to keep the hidden state separate from the model parameters
+    # or else Jax will treat it as a parameter in the pytree and we wouldn't be able to
+    # update the hidden state in the __call__ method.
+    def init_hidden(self):
+        return jax.numpy.zeros(self.weight_hidden.shape[0])
+
+    def __call__(self, x, hidden):
+        hidden = jax.numpy.tanh(x @ self.weight_input + hidden @ self.weight_hidden)
+        return hidden @ self.weight_output, hidden
