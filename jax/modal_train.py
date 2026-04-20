@@ -1,12 +1,9 @@
+from __future__ import annotations
+
 import os
 
-import jax
 import modal
 import modal.experimental
-
-import train_mlp as mlp_lib
-import train_rnn as rnn_lib
-from models import MLP, BatchNormState, RNN
 
 
 CHECKPOINT_DIR = "/checkpoints"
@@ -19,9 +16,22 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .pip_install("jax[cuda12]", "equinox", "matplotlib", "optax")
+    .pip_install(
+        "jax[cuda12]==0.8.2",
+        "equinox==0.13.6",
+        "optax==0.2.6",
+        "matplotlib~=3.10.8",
+    )
     .add_local_dir(LOCAL_CODE_DIR, remote_path="/root")
 )
+
+with image.imports():
+    import jax
+
+    import train_mlp as mlp_lib
+    import train_rnn as rnn_lib
+    from models import MLP, BatchNormState, RNN
+
 app = modal.App("jax-training", image=image)
 
 mlp_volume = modal.Volume.from_name("jax-mlp-weights", create_if_missing=True)
@@ -78,8 +88,9 @@ def train_mlp(
     gpu="H100:1",
     volumes={CHECKPOINT_DIR: mlp_volume},
 )
-def predict_mlp(x: jax.Array, hidden_size: int = 64):
-    """Load the latest MLP checkpoint from the volume and run a forward pass.
+def predict_mlp(seed: int = 5678, hidden_size: int = 64):
+    """Load the latest MLP checkpoint from the volume and run a forward pass
+    on a random Gaussian input seeded with `seed`.
 
     `hidden_size` must match what the checkpoint was trained with.
     """
@@ -101,7 +112,10 @@ def predict_mlp(x: jax.Array, hidden_size: int = 64):
         var=jax.numpy.zeros(hidden_size),
     )
     model, state = mlp_lib.load_checkpoint(template_model, template_state, ckpt_path)
-    return model(x, state)
+
+    x = jax.random.normal(jax.random.PRNGKey(seed), (1, 4))
+    y, state = model(x, state)
+    return x, y
 
 
 @app.local_entrypoint()
@@ -115,8 +129,7 @@ def mlp_train():
 @app.local_entrypoint()
 def mlp_sample():
     """Load latest MLP checkpoint and run a single-sample forward pass."""
-    x = jax.random.normal(jax.random.PRNGKey(5678), (1, 4))
-    y, state = predict_mlp.remote(x)
+    x, y = predict_mlp.remote()
     print("Sample input:", x)
     print("Sample output:", y)
 
@@ -128,7 +141,7 @@ def mlp_sample():
 )
 @modal.experimental.clustered(size=2, rdma=True)
 def train_rnn(
-    dataset_path: str = rnn_lib.DATASET_PATH,
+    dataset_path: str | None = None,
     learning_rate: float = 3e-3,
     batch_size: int = 64,
     seq_len: int = 128,
@@ -137,6 +150,9 @@ def train_rnn(
     hidden_dim: int = 512,
     seed: int = 5678,
 ):
+    if dataset_path is None:
+        dataset_path = rnn_lib.DATASET_PATH
+
     mesh, nproc = _init_distributed_mesh()
     model, stoi, itos = rnn_lib.train_loop(
         checkpoint_dir=CHECKPOINT_DIR,
@@ -165,12 +181,15 @@ def predict_rnn(
     length: int = 500,
     seed: int = 0,
     hidden_dim: int = 512,
-    dataset_path: str = rnn_lib.DATASET_PATH,
+    dataset_path: str | None = None,
 ):
     """Load the latest RNN checkpoint from the volume and sample from it.
 
     `hidden_dim` must match what the checkpoint was trained with.
     """
+    if dataset_path is None:
+        dataset_path = rnn_lib.DATASET_PATH
+
     rnn_volume.reload()
     ckpt_path, epoch = rnn_lib.find_latest_checkpoint(CHECKPOINT_DIR)
     if ckpt_path is None:
