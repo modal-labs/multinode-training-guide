@@ -1,0 +1,15 @@
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 498ab113c6ce..55a05fa55b07 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -36,6 +36,10 @@ def __init__(
+         self.lora_backend: BaseLoRABackend = lora_backend
+         if hasattr(self.base_layer, "weight"):
+             self.weight = self.base_layer.weight
++        if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
++            self.bias = self.base_layer.bias
++        if hasattr(self.base_layer, "reduce_results"):
++            self.reduce_results = self.base_layer.reduce_results
+ 
+     def forward(self, x: torch.Tensor):
+         return self.base_layer.forward(x)

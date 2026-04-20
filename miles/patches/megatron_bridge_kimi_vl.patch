@@ -1,0 +1,2277 @@
+diff --git a/src/megatron/bridge/data/vlm_datasets/collate.py b/src/megatron/bridge/data/vlm_datasets/collate.py
+index eef2a2d2..bb4e0cbb 100644
+--- a/src/megatron/bridge/data/vlm_datasets/collate.py
++++ b/src/megatron/bridge/data/vlm_datasets/collate.py
+@@ -17,6 +17,7 @@ Collation utilities for building VLM training batches from conversation examples
+ """
+ 
+ import warnings
++from typing import Any
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -24,7 +25,7 @@ from PIL import Image  # noqa: F401  # may be used downstream by processors
+ 
+ from megatron.bridge.data.datasets.utils import IGNORE_INDEX
+ from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
+-from megatron.bridge.training.utils.visual_inputs import Qwen2_5_VLVisualInputs
++from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs, Qwen2_5_VLVisualInputs
+ 
+ 
+ # Local message used when optional qwen_vl_utils dependency is missing
+@@ -356,7 +357,9 @@ def nemotron_nano_v2_vl_collate_fn(examples: list, processor, start_of_response_
+         )
+ 
+     key = "pixel_values_videos" if is_video else "pixel_values"
+-    batch["pixel_values"] = batch[key].to(torch.bfloat16)
++    pv = batch[key].to(torch.bfloat16)
++    del batch[key]
++    batch["visual_inputs"] = GenericVisualInputs(pixel_values=pv)
+     # roll label by 1 and fill last token with IGNORE_INDEX
+     labels = batch["input_ids"].clone()[:, 1:]
+     labels = torch.cat([labels, IGNORE_INDEX * torch.ones_like(labels[:, :1])], dim=1)
+@@ -455,6 +458,13 @@ def ministral3_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+             torch.arange(seq_len, device=batch["input_ids"].device).unsqueeze(0).expand(batch_size, -1).clone()
+         )
+ 
++    # Wrap visual tensors in GenericVisualInputs so vlm_step.py picks them up
++    visual_kwargs = {}
++    for vk in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw", "image_sizes"):
++        if vk in batch:
++            visual_kwargs[vk] = batch.pop(vk)
++    batch["visual_inputs"] = GenericVisualInputs(**visual_kwargs) if visual_kwargs else None
++
+     return batch
+ 
+ 
+@@ -507,11 +517,246 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+     return batch
+ 
+ 
++def _expand_image_tokens(
++    input_ids: torch.Tensor,
++    attention_mask: torch.Tensor,
++    grid_thws: torch.Tensor,
++    media_token_id: int,
++    merge_kernel_size: tuple[int, int] = (2, 2),
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Expand image placeholder tokens to the correct count based on grid_thws.
++
++    For PP, this ensures the sequence length is fixed BEFORE the model forward pass,
++    eliminating dynamic sequence expansion inside the model.
++
++    Args:
++        input_ids: (seq_len,) tensor with one placeholder per image
++        attention_mask: (seq_len,) tensor
++        grid_thws: (num_images, 3) tensor with [t, h, w] for each image
++        media_token_id: Token ID of the image placeholder
++        merge_kernel_size: Vision tower's patch merge kernel, default (2, 2)
++
++    Returns:
++        expanded_input_ids: Input IDs with placeholder expanded to N tokens
++        expanded_attention_mask: Attention mask expanded accordingly
++    """
++    merge_h, merge_w = merge_kernel_size
++
++    # Calculate number of image tokens for each image: t * (h // merge_h) * (w // merge_w)
++    feature_counts = []
++    for grid_thw in grid_thws:
++        t, h, w = (int(x) for x in grid_thw.tolist())
++        feature_counts.append(t * (h // merge_h) * (w // merge_w))
++
++    # Find placeholder positions
++    placeholder_positions = (input_ids == media_token_id).nonzero(as_tuple=True)[0]
++    if len(placeholder_positions) == 0:
++        # No placeholder found, return as-is
++        return input_ids, attention_mask
++
++    if len(placeholder_positions) != len(feature_counts):
++        warnings.warn(
++            "Mismatch between image placeholder count and grid_thws rows during Kimi token expansion; "
++            "expanding as many placeholders as have corresponding grid metadata.",
++            stacklevel=2,
++        )
++
++    expanded_input_ids = []
++    expanded_attention_mask = []
++    feature_idx = 0
++
++    for token_id, mask_value in zip(input_ids.tolist(), attention_mask.tolist()):
++        if token_id == media_token_id and feature_idx < len(feature_counts):
++            expanded_input_ids.extend([media_token_id] * feature_counts[feature_idx])
++            expanded_attention_mask.extend([1] * feature_counts[feature_idx])
++            feature_idx += 1
++            continue
++
++        expanded_input_ids.append(token_id)
++        expanded_attention_mask.append(mask_value)
++
++    expanded_input_ids = torch.tensor(
++        expanded_input_ids,
++        dtype=input_ids.dtype,
++        device=input_ids.device,
++    )
++    expanded_attention_mask = torch.tensor(
++        expanded_attention_mask,
++        dtype=attention_mask.dtype,
++        device=attention_mask.device,
++    )
++
++    return expanded_input_ids, expanded_attention_mask
++
++
++def kimi_k25_vl_collate_fn(
++    examples: list[dict[str, Any]],
++    processor,
++    max_length: int | None = None,
++) -> dict[str, torch.Tensor]:
++    """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
++
++    For pipeline parallelism, this function:
++    1. Processes each sample to get input_ids with 1 placeholder per image
++    2. Pre-expands each placeholder to N tokens (N = t*(h//2)*(w//2) from grid_thws)
++    3. Pads all sequences to fixed max_length
++    This ensures the model forward pass doesn't change sequence length dynamically.
++    """
++    skipped_tokens = extract_skipped_token_ids(processor)
++    conversations = [example["conversation"] for example in examples]
++
++    # Get media token ID
++    media_token_id = getattr(processor, "media_placeholder_token_id", None)
++    if media_token_id is None and hasattr(processor, "tokenizer"):
++        media_token_id = processor.tokenizer.convert_tokens_to_ids("<|media_pad|>")
++    if media_token_id is None:
++        media_token_id = 163605  # Default for Kimi K2.5
++
++    pad_token_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
++
++    # Get actual merge_kernel_size from processor's vision config
++    merge_kernel_size = (2, 2)  # default fallback
++    if hasattr(processor, "config") and hasattr(processor.config, "vision_config"):
++        merge_kernel_size = getattr(processor.config.vision_config, "merge_kernel_size", (2, 2))
++    elif hasattr(processor, "vision_config"):
++        merge_kernel_size = getattr(processor.vision_config, "merge_kernel_size", (2, 2))
++
++    # Process each sample individually
++    all_expanded = []
++    all_pixel_values = []
++    all_grid_thws = []
++
++    for i, conversation in enumerate(conversations):
++        # Collect medias for this conversation
++        medias = []
++        for message in conversation:
++            content = message.get("content")
++            if isinstance(content, list):
++                for item in content:
++                    if isinstance(item, dict) and item.get("type") == "image":
++                        medias.append({"type": "image", "image": item.get("image")})
++
++        text = processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
++
++        processor_kwargs = {
++            "text": text,
++            "return_tensors": "pt",
++        }
++        if medias:
++            processor_kwargs["medias"] = medias
++
++        sample_batch = processor(**processor_kwargs)
++
++        input_ids = sample_batch["input_ids"][0]
++        attention_mask = sample_batch["attention_mask"][0]
++
++        # Pre-expand image tokens if we have grid_thws
++        if "grid_thws" in sample_batch and sample_batch["grid_thws"] is not None:
++            # print(f"using grid_thws: {sample_batch['grid_thws']} and pre-expand mode")
++            grid_thws = sample_batch["grid_thws"]
++            # print(f"before expand input_ids: {input_ids.shape}")
++
++            input_ids, attention_mask = _expand_image_tokens(
++                input_ids, attention_mask, grid_thws, media_token_id, merge_kernel_size
++            )
++            all_grid_thws.append(grid_thws)
++            # print(f"after expand input_ids: {input_ids.shape}")
++
++        if "pixel_values" in sample_batch:
++            all_pixel_values.append(sample_batch["pixel_values"])
++
++        all_expanded.append(
++            {
++                "input_ids": input_ids,
++                "attention_mask": attention_mask,
++            }
++        )
++
++    # Determine target length for padding
++    expanded_lens = [b["input_ids"].shape[0] for b in all_expanded]
++    batch_max = max(expanded_lens)
++
++    if max_length is not None:
++        target_len = max_length
++    else:
++        target_len = batch_max
++
++    # Pad/truncate to target_len
++    padded_input_ids = []
++    padded_attention_mask = []
++
++    for batch in all_expanded:
++        input_ids = batch["input_ids"]
++        attention_mask = batch["attention_mask"]
++        seq_len = input_ids.shape[0]
++
++        if seq_len < target_len:
++            # Pad
++            pad_len = target_len - seq_len
++            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
++            attention_mask = torch.cat([attention_mask, torch.zeros(pad_len, dtype=attention_mask.dtype)])
++        elif seq_len > target_len:
++            # Truncate
++            input_ids = input_ids[:target_len]
++            attention_mask = attention_mask[:target_len]
++
++        padded_input_ids.append(input_ids)
++        padded_attention_mask.append(attention_mask)
++
++    result = {
++        "input_ids": torch.stack(padded_input_ids),
++        "attention_mask": torch.stack(padded_attention_mask),
++    }
++
++    if all_pixel_values:
++        result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
++    if all_grid_thws:
++        result["grid_thws"] = torch.cat(all_grid_thws, dim=0)  # (N, 3) with [t, h, w]
++
++    labels = result["input_ids"].clone()[:, 1:].contiguous()
++    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
++    labels[torch.isin(labels, skipped_tokens)] = -100
++    result["labels"] = labels
++    # Ensure position_ids exist for the model
++    if "position_ids" not in result:
++        result_size, seq_len = result["input_ids"].shape
++        result["position_ids"] = (
++            torch.arange(seq_len, device=result["input_ids"].device)
++            .unsqueeze(0)
++            .expand(result_size, -1)
++            .clone()
++            .contiguous()
++        )
++    # Prefer general search-based masking using structured example content (not template-specific)
++    loss_masks = [
++        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
++        for example, input_ids in zip(examples, result["input_ids"])  # type: ignore[arg-type]
++    ]
++    loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=result["input_ids"].device)
++    # Shift loss mask to align with next-token labels timeline
++    loss_mask_t = torch.cat([loss_mask_t[:, 1:], torch.zeros_like(loss_mask_t[:, :1])], dim=1)
++    # Enforce label masking to match shifted loss_mask
++    result["labels"] = result["labels"].masked_fill(loss_mask_t == 0, -100)
++    result["loss_mask"] = loss_mask_t.contiguous()
++
++    # Build visual inputs object and attach to batch; remove raw keys.
++    # Kimi processor outputs "grid_thws" (N, 3); pass full [t, h, w] as image_grid_thw.
++    visual_inputs = Qwen2_5_VLVisualInputs(
++        pixel_values=result.get("pixel_values"),
++        image_grid_thw=result.get("grid_thws"),
++    )
++    for k in ("pixel_values", "grid_thws"):
++        result.pop(k, None)
++    result["visual_inputs"] = visual_inputs
++    return result
++
++
+ # Mapping of processor types to their collate functions
+ COLLATE_FNS = {
+     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
+     "Qwen3VLProcessor": qwen2_5_collate_fn,
+     "NemotronNanoVLV2Processor": nemotron_nano_v2_vl_collate_fn,
+     "PixtralProcessor": ministral3_collate_fn,  # Ministral3 uses PixtralProcessor
++    "KimiK25Processor": kimi_k25_vl_collate_fn,
+     "default": default_collate_fn,
+ }
+diff --git a/src/megatron/bridge/models/__init__.py b/src/megatron/bridge/models/__init__.py
+index 2400b55f..ceb3fc76 100644
+--- a/src/megatron/bridge/models/__init__.py
++++ b/src/megatron/bridge/models/__init__.py
+@@ -61,6 +61,14 @@ from megatron.bridge.models.gpt_oss import (
+     GPTOSSBridge,
+ )
+ from megatron.bridge.models.gpt_provider import GPTModelProvider
++from megatron.bridge.models.kimi import (
++    KimiK2Bridge,
++)
++from megatron.bridge.models.kimi_vl import (
++    KimiK25VLBridge,
++    KimiK25VLModel,
++    KimiK25VLModelProvider,
++)
+ from megatron.bridge.models.llama import (
+     LlamaBridge,
+ )
+@@ -70,6 +78,9 @@ from megatron.bridge.models.llama_nemotron import (
+ )
+ from megatron.bridge.models.mamba.mamba_provider import MambaModelProvider
+ from megatron.bridge.models.mimo.mimo_bridge import MimoBridge
++from megatron.bridge.models.minimax_m2 import (
++    MiniMaxM2Bridge,
++)
+ from megatron.bridge.models.ministral3 import (
+     Ministral3Bridge,
+     Ministral3Model,
+@@ -97,29 +108,10 @@ from megatron.bridge.models.olmoe import (
+     OlMoEBridge,
+     OlMoEModelProvider,
+ )
+-from megatron.bridge.models.qwen import (
+-    Qwen2ModelProvider,
+-    Qwen2ModelProvider1P5B,
+-    Qwen2ModelProvider7B,
+-    Qwen2ModelProvider72B,
+-    Qwen2ModelProvider500M,
+-    Qwen3ModelProvider,
+-    Qwen3ModelProvider1P7B,
+-    Qwen3ModelProvider4B,
+-    Qwen3ModelProvider8B,
+-    Qwen3ModelProvider14B,
+-    Qwen3ModelProvider32B,
+-    Qwen3ModelProvider600M,
+-    Qwen3MoEModelProvider,
+-    Qwen3MoEModelProvider30B_A3B,
+-    Qwen3MoEModelProvider235B_A22B,
+-    Qwen25ModelProvider1P5B,
+-    Qwen25ModelProvider3B,
+-    Qwen25ModelProvider7B,
+-    Qwen25ModelProvider14B,
+-    Qwen25ModelProvider32B,
+-    Qwen25ModelProvider72B,
+-    Qwen25ModelProvider500M,
++from megatron.bridge.models.qwen_audio import (
++    Qwen2AudioBridge,
++    Qwen2AudioModel,
++    Qwen2AudioModelProvider,
+ )
+ from megatron.bridge.models.qwen_omni import (
+     Qwen25OmniBridge,
+@@ -183,6 +175,10 @@ __all__ = [
+     "GPTModelProvider",
+     "GPTOSSBridge",
+     "T5ModelProvider",
++    "KimiK2Bridge",
++    "KimiK25VLModel",
++    "KimiK25VLBridge",
++    "KimiK25VLModelProvider",
+     "LlamaBridge",
+     "LlamaNemotronHeterogeneousProvider",
+     "LlamaNemotronBridge",
+@@ -195,35 +191,18 @@ __all__ = [
+     "Ministral3ModelProvider3B",
+     "Ministral3ModelProvider8B",
+     "Ministral3ModelProvider14B",
++    "MiniMaxM2Bridge",
+     "OlMoEBridge",
+     "OlMoEModelProvider",
+-    "Qwen2ModelProvider",
+-    "Qwen2ModelProvider500M",
+-    "Qwen2ModelProvider1P5B",
+-    "Qwen2ModelProvider7B",
+-    "Qwen2ModelProvider72B",
+-    "Qwen25ModelProvider500M",
+-    "Qwen25ModelProvider1P5B",
+-    "Qwen25ModelProvider3B",
+-    "Qwen25ModelProvider7B",
+-    "Qwen25ModelProvider14B",
+-    "Qwen25ModelProvider32B",
+-    "Qwen25ModelProvider72B",
+-    "Qwen3ModelProvider",
+-    "Qwen3ModelProvider600M",
+-    "Qwen3ModelProvider1P7B",
+-    "Qwen3ModelProvider4B",
+-    "Qwen3ModelProvider8B",
+-    "Qwen3ModelProvider14B",
+-    "Qwen3ModelProvider32B",
+-    "Qwen3MoEModelProvider",
+-    "Qwen3MoEModelProvider30B_A3B",
+-    "Qwen3MoEModelProvider235B_A22B",
+     "NemotronHBridge",
+     "MambaModelProvider",
+     "MimoBridge",
+     # Nemotron Models
+     "NemotronBridge",
++    # Audio-Language Models
++    "Qwen2AudioBridge",
++    "Qwen2AudioModel",
++    "Qwen2AudioModelProvider",
+     # VL Models
+     "Qwen25VLModel",
+     "Qwen25VLBridge",
+diff --git a/src/megatron/bridge/models/conversion/auto_bridge.py b/src/megatron/bridge/models/conversion/auto_bridge.py
+index f11f1081..4c95163e 100644
+--- a/src/megatron/bridge/models/conversion/auto_bridge.py
++++ b/src/megatron/bridge/models/conversion/auto_bridge.py
+@@ -15,6 +15,7 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import logging
+ from functools import cached_property, partial
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Generic, Iterable, List, Optional, Type, TypeVar, Union
+@@ -30,6 +31,7 @@ if TYPE_CHECKING:
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+ from modelopt.torch.quantization.utils import is_quantized
++from safetensors.torch import save_file
+ from transformers.configuration_utils import PretrainedConfig
+ from typing_extensions import Unpack
+ 
+@@ -47,6 +49,8 @@ from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource
+ from megatron.bridge.models.model_provider import GetModelKwargs, ModelParallelKwargs, ModelProviderMixin
+ 
+ 
++logger = logging.getLogger(__name__)
++
+ MegatronModelT = TypeVar("MegatronModelT", bound=MegatronModule)
+ DataclassT = TypeVar("DataclassT")
+ 
+@@ -119,6 +123,7 @@ class AutoBridge(Generic[MegatronModelT]):
+         if not isinstance(hf_pretrained, (PreTrainedCausalLM, PretrainedConfig)):
+             raise ValueError("hf_pretrained must be a PreTrainedCausalLM or PretrainedConfig instance")
+         self.hf_pretrained: PreTrainedCausalLM | PretrainedConfig = hf_pretrained
++        self.hf_model_id: Optional[str] = None
+ 
+     @classmethod
+     def list_supported_models(cls) -> list[str]:
+@@ -162,6 +167,63 @@ class AutoBridge(Generic[MegatronModelT]):
+             return False
+         return any(arch.endswith(SUPPORTED_HF_ARCHITECTURES) for arch in architectures)
+ 
++    @classmethod
++    def from_auto_config(cls, megatron_path: str, hf_model_id: str) -> "AutoBridge":
++        """
++        Create a config-only AutoBridge by synthesizing an HF config from a Megatron checkpoint.
++
++        This method creates a bridge instace from a Megatron checkpoint and reference hf_model_id,
++        without loading any weights. This enables exporting of:
++        - Custom small models of popular architectures
++        - Models pruned from a larger teacher model
++
++        Args:
++            megatron_path: Directory path where the Megatron checkpoint is stored
++            hf_model_id: HuggingFace model ID or path to model directory
++                Examples: "meta-llama/Meta-Llama-3-8B", "./my_model"
++
++        Returns:
++            AutoBridge: Bridge instance configured for the architecture
++
++        Raises:
++            FileNotFoundError: If run_config.yaml is not found in the Megatron path
++        """
++        from transformers import AutoConfig
++
++        from megatron.bridge.models.conversion.utils import conform_config_to_reference
++        from megatron.bridge.training.model_load_save import load_model_config
++
++        checkpoint_path = Path(megatron_path)
++        if not checkpoint_path.exists():
++            raise FileNotFoundError(f"Megatron checkpoint not found: {checkpoint_path}")
++
++        # Look for configuration files to determine the model type
++        run_config = checkpoint_path / "run_config.yaml"
++        if not run_config.exists():
++            iter_dirs = [d for d in checkpoint_path.iterdir() if d.is_dir() and d.name.startswith("iter_")]
++            if iter_dirs:
++                latest_iter = max(iter_dirs, key=lambda d: int(d.name.replace("iter_", "")))
++                run_config = latest_iter / "run_config.yaml"
++
++        if not run_config.exists():
++            raise FileNotFoundError(
++                f"Could not find run_config.yaml in {checkpoint_path}. Ensure this is a valid Megatron checkpoint."
++            )
++
++        # 1. Load config from both sides
++        megatron_cfg, _ = load_model_config(str(run_config.parent))
++        hf_cfg = AutoConfig.from_pretrained(hf_model_id, trust_remote_code=True)
++        # 2. Translate Megatron config -> HF, conforming to reference config
++        bridge = cls.from_hf_config(hf_cfg)
++        megatron_hf_cfg_dict = bridge._model_bridge.megatron_to_hf_config(megatron_cfg)
++        megatron_hf_cfg_dict = conform_config_to_reference(megatron_hf_cfg_dict, hf_cfg.to_dict())
++        # 3. Build final bridge from the synthesized config
++        synthesized_config = type(hf_cfg)(**megatron_hf_cfg_dict)
++        bridge = cls.from_hf_config(synthesized_config)
++        bridge.hf_model_id = hf_model_id
++
++        return bridge
++
+     @classmethod
+     def from_hf_config(cls, config: PretrainedConfig) -> "AutoBridge":
+         """
+@@ -546,6 +608,9 @@ class AutoBridge(Generic[MegatronModelT]):
+         modeling files (e.g., modeling_*.py, configuration_*.py) will be preserved
+         to ensure the saved model can be loaded properly.
+ 
++        Config-only bridges are supported when created via the auto-config
++        flow in convert_checkpoints.py.
++
+         Args:
+             model: Megatron model instance or list of instances
+             path: Directory path to save the model
+@@ -577,29 +642,58 @@ class AutoBridge(Generic[MegatronModelT]):
+             saves the configuration files, while weight saving is coordinated
+             across all ranks.
+         """
+-        if not isinstance(self.hf_pretrained, PreTrainedCausalLM):
+-            raise ValueError(
+-                "save_hf_pretrained requires a pretrained HuggingFace model. "
+-                "AutoBridge.from_hf_config() creates a config-only bridge; "
+-                "use AutoBridge.from_hf_pretrained(...) instead."
+-            )
+-
+-        # Get bridge-level ADDITIONAL_FILE_PATTERNS if configured
+-        additional_files = None
+-        if hasattr(self._model_bridge, "ADDITIONAL_FILE_PATTERNS") and self._model_bridge.ADDITIONAL_FILE_PATTERNS:
+-            additional_files = self._model_bridge.ADDITIONAL_FILE_PATTERNS
++        if not isinstance(self.hf_pretrained, (PreTrainedCausalLM, PretrainedConfig)):
++            raise ValueError("save_hf_pretrained requires a pretrained HuggingFace model or config.")
++        is_config_only = isinstance(self.hf_pretrained, PretrainedConfig)
++
++        def _save_artifacts():
++            if is_config_only:
++                import json
++
++                # Config-only path: write config.json and download modeling files from Hub.
++                Path(path).mkdir(parents=True, exist_ok=True)
++                config_dict = self.hf_pretrained.to_dict()
++                with open(Path(path) / "config.json", "w") as _f:
++                    json.dump(config_dict, _f, indent=2, sort_keys=True, allow_nan=True)
++
++                # Download custom modeling files so the output is loadable with from_pretrained().
++                hub_repo = self.hf_model_id
++                if hub_repo:
++                    try:
++                        from huggingface_hub import hf_hub_download, list_repo_files
++
++                        repo_files = list_repo_files(hub_repo)
++                        py_files = [f for f in repo_files if f.endswith(".py")]
++                        for py_file in py_files:
++                            hf_hub_download(
++                                repo_id=hub_repo,
++                                filename=py_file,
++                                local_dir=path,
++                            )
++                    except Exception as exc:
++                        logger.warning(
++                            "Could not download modeling files from %s: %s. "
++                            "This is expected for models that use standard transformers "
++                            "modeling classes and do not define custom .py files.",
++                            hub_repo,
++                            exc,
++                        )
+ 
+-        if dist.is_available() and dist.is_initialized():
+-            # Distributed training, only rank 0 saves artifacts
+-            if dist.get_rank() == 0:
++            else:
++                # Get bridge-level ADDITIONAL_FILE_PATTERNS if configured
++                mb = self._model_bridge
++                additional_files = None
++                if hasattr(mb, "ADDITIONAL_FILE_PATTERNS") and mb.ADDITIONAL_FILE_PATTERNS:
++                    additional_files = mb.ADDITIONAL_FILE_PATTERNS
+                 self.hf_pretrained.save_artifacts(
+                     path, original_source_path=source_path, additional_files=additional_files
+                 )
++
++        if dist.is_available() and dist.is_initialized():
++            if dist.get_rank() == 0:
++                _save_artifacts()
+         else:
+-            # No distributed training, save artifacts
+-            self.hf_pretrained.save_artifacts(
+-                path, original_source_path=source_path, additional_files=additional_files
+-            )
++            _save_artifacts()
+ 
+         self.save_hf_weights(
+             model,
+@@ -701,7 +795,34 @@ class AutoBridge(Generic[MegatronModelT]):
+                 save_every_n_ranks=save_every_n_ranks,
+             )
+         else:
+-            raise ValueError("The state source is not a SafeTensorsStateSource, cannot save in streaming mode.")
++            # Config-only path: shard and write safetensors directly
++            import json
++
++            from huggingface_hub import split_torch_state_dict_into_shards
++
++            # NOTE: Collects the full state dict into CPU memory before sharding.
++            # For very large models (>70B), this may require significant host RAM.
++            is_distributed = dist.is_available() and dist.is_initialized()
++            rank = dist.get_rank() if is_distributed else 0
++
++            if rank == 0:
++                state_dict = {name: tensor.contiguous().cpu() for name, tensor in generator}
++            else:
++                for _ in generator:
++                    pass
++                state_dict = None
++
++            if rank == 0:
++                plan = split_torch_state_dict_into_shards(state_dict)
++                safe_dir = Path(path)
++                safe_dir.mkdir(parents=True, exist_ok=True)
++                for filename, tensors in plan.filename_to_tensors.items():
++                    shard = {k: state_dict[k] for k in tensors}
++                    save_file(shard, safe_dir / filename)
++                if plan.is_sharded:
++                    index = {"metadata": plan.metadata, "weight_map": plan.tensor_to_filename}
++                    with open(safe_dir / "model.safetensors.index.json", "w") as f:
++                        json.dump(index, f, indent=2)
+ 
+         # Save quantizer/amax sidecar after the main generator is consumed (rank 0 only).
+         if quant_tensors:
+@@ -896,9 +1017,14 @@ class AutoBridge(Generic[MegatronModelT]):
+         megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
+ 
+         # Save as Megatron checkpoint
+-        hf_tokenizer_kwargs = None
++        hf_tokenizer_kwargs = {}
+         if hasattr(bridge._model_bridge, "get_hf_tokenizer_kwargs"):
+             hf_tokenizer_kwargs = bridge._model_bridge.get_hf_tokenizer_kwargs()
++        # Forward trust_remote_code to the tokenizer (needed for repos with custom code)
++        if kwargs.get("trust_remote_code"):
++            if hf_tokenizer_kwargs is None:
++                hf_tokenizer_kwargs = {}
++            hf_tokenizer_kwargs.setdefault("trust_remote_code", True)
+         bridge.save_megatron_model(
+             megatron_model,
+             megatron_path,
+@@ -921,8 +1047,9 @@ class AutoBridge(Generic[MegatronModelT]):
+         This is a convenience method that loads a Megatron checkpoint and
+         exports it to HuggingFace format. This is useful for sharing trained
+         models or deploying them with HuggingFace inference tools.
+-        Requires a bridge created with `from_hf_pretrained` so the tokenizer
+-        and other HuggingFace artifacts can be saved alongside the weights.
++
++        Also supports config-only bridges created via the auto-config
++        flow in convert_checkpoints.py.
+ 
+         Args:
+             megatron_path: Directory path where the Megatron checkpoint is stored
+@@ -941,7 +1068,6 @@ class AutoBridge(Generic[MegatronModelT]):
+             ...     "./megatron_checkpoints/my_model",
+             ...     "./hf_exports/my_model"
+             ... )
+-
+             >>> # Export with specific settings
+             >>> bridge.export_ckpt(
+             ...     "./megatron_checkpoints/my_model",
+@@ -953,12 +1079,6 @@ class AutoBridge(Generic[MegatronModelT]):
+             >>> from transformers import AutoModelForCausalLM
+             >>> hf_model = AutoModelForCausalLM.from_pretrained("./hf_exports/my_model")
+         """
+-        if not isinstance(self.hf_pretrained, PreTrainedCausalLM):
+-            raise ValueError(
+-                "export_ckpt requires a pretrained HuggingFace model. "
+-                "AutoBridge.from_hf_config() creates a config-only bridge; "
+-                "use AutoBridge.from_hf_pretrained(...) instead."
+-            )
+         try:
+             from megatron.bridge.training.model_load_save import temporary_distributed_context
+         except ImportError:
+diff --git a/src/megatron/bridge/models/conversion/model_bridge.py b/src/megatron/bridge/models/conversion/model_bridge.py
+index ddd3d31f..97e86455 100644
+--- a/src/megatron/bridge/models/conversion/model_bridge.py
++++ b/src/megatron/bridge/models/conversion/model_bridge.py
+@@ -34,9 +34,7 @@ from typing import (
+ )
+ 
+ import torch
+-import torch.nn.functional as F
+ from megatron.core import parallel_state
+-from megatron.core.activations import fast_gelu, squared_relu
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.transformer_config import TransformerConfig
+ from megatron.core.utils import (
+@@ -44,6 +42,7 @@ from megatron.core.utils import (
+     unwrap_model,
+ )
+ from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
++from transformers.configuration_utils import PretrainedConfig
+ from transformers.modeling_utils import PreTrainedModel
+ 
+ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+@@ -61,6 +60,7 @@ from megatron.bridge.models.conversion.utils import (
+ )
+ from megatron.bridge.models.decorators.dispatch import dispatch
+ from megatron.bridge.models.model_provider import ModelProviderMixin
++from megatron.bridge.utils.activation_map import ACTIVATION_FUNC_MAP
+ from megatron.bridge.utils.common_utils import print_rank_0
+ 
+ 
+@@ -277,6 +277,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+         ("num_experts_per_tok", "moe_router_topk"),
+         ("moe_intermediate_size", "moe_ffn_hidden_size"),
+         ("aux_loss_alpha", "moe_aux_loss_coeff"),
++        ("router_aux_loss_coef", "moe_aux_loss_coeff"),
+         ("scoring_func", "moe_router_score_function"),
+         ("n_routed_experts", "num_moe_experts"),
+         ("n_group", "moe_router_num_groups"),
+@@ -317,33 +318,23 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+         ("mscale_all_dim", "mscale_all_dim"),
+     ]
+ 
+-    # Common bidirectional activation function mapping: hf_name <-> megatron_func
+-    ACTIVATION_MAPPING = {
+-        "silu": F.silu,
+-        "gelu": F.gelu,
+-        "relu": F.relu,
+-        "relu2": squared_relu,
+-        "tanh": torch.tanh,
+-        "gelu_pytorch_tanh": fast_gelu,
+-    }
+-
+     @classmethod
+     def hf_to_megatron_activation(cls, hidden_act: str):
+         """Convert HF activation name string to Megatron activation function."""
+-        if hidden_act not in cls.ACTIVATION_MAPPING:
++        if hidden_act not in ACTIVATION_FUNC_MAP:
+             raise ValueError(
+-                f"Unsupported activation function: {hidden_act}. Supported: {list(cls.ACTIVATION_MAPPING.keys())}"
++                f"Unsupported activation function: {hidden_act}. Supported: {list(ACTIVATION_FUNC_MAP.keys())}"
+             )
+-        return cls.ACTIVATION_MAPPING[hidden_act]
++        return ACTIVATION_FUNC_MAP[hidden_act]
+ 
+     @classmethod
+     def megatron_to_hf_activation(cls, activation_func) -> str:
+         """Convert Megatron activation function to HF activation name string."""
+-        for hf_name, megatron_func in cls.ACTIVATION_MAPPING.items():
++        for hf_name, megatron_func in ACTIVATION_FUNC_MAP.items():
+             if activation_func is megatron_func:
+                 return hf_name
+         raise ValueError(
+-            f"Unsupported activation function: {activation_func}. Supported: {list(cls.ACTIVATION_MAPPING.values())}"
++            f"Unsupported activation function: {activation_func}. Supported: {list(ACTIVATION_FUNC_MAP.values())}"
+         )
+ 
+     def hf_config_to_provider_kwargs(self, hf_config) -> dict:
+@@ -373,7 +364,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+             else:
+                 value = getattr(hf_config, hf_name, None)
+                 has_value = hasattr(hf_config, hf_name)
+-            if has_value:
++            if has_value and megatron_name not in provider_kwargs:
+                 provider_kwargs[megatron_name] = value
+ 
+         # Extract rotary_base via compat function (handles both legacy rope_theta
+@@ -391,33 +382,41 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+         is_mla_provider = self.PROVIDER_CLASS is not None and issubclass(self.PROVIDER_CLASS, MLAModelProvider)
+         rope_scaling = getattr(hf_config, "rope_scaling", None)
+ 
+-        if rope_scaling is not None and isinstance(rope_scaling, dict):
++        rope_type = None
++        if rope_scaling is not None and isinstance(rope_scaling, dict) and rope_scaling != {}:
+             rope_type = rope_scaling.get("type") or rope_scaling.get("rope_type")
+-            if rope_type == "yarn":
+-                # Check if this is an MLA provider (uses direct field names)
+-                # or a GPT provider (uses yarn_ prefixed field names)
+-                if is_mla_provider:
+-                    # MLA models: use direct field names (mscale, rotary_scaling_factor, etc.)
+-                    mla_params = {}
+-                    for hf_key, megatron_key in self.MLA_ROPE_SCALING_MAPPING:
+-                        value = rope_scaling.get(hf_key)
+-                        if value is not None:
+-                            mla_params[megatron_key] = value
+-                    if mla_params:
+-                        provider_kwargs["_mla_rope_params"] = mla_params
+-                else:
+-                    # GPT models: use yarn_ prefixed field names (dataclass fields on GPTModelProvider)
+-                    provider_kwargs["position_embedding_type"] = "yarn"
+-                    for hf_key, megatron_key in self.YARN_ROPE_SCALING_MAPPING:
+-                        value = rope_scaling.get(hf_key)
+-                        if value is not None:
+-                            provider_kwargs[megatron_key] = value
+-                    if "truncate" in rope_scaling:
+-                        provider_kwargs["yarn_correction_range_round_to_int"] = rope_scaling["truncate"]
++
++        if rope_type == "yarn":
++            # Check if this is an MLA provider (uses direct field names)
++            # or a GPT provider (uses yarn_ prefixed field names)
++            if is_mla_provider:
++                # MLA models: use direct field names (mscale, rotary_scaling_factor, etc.)
++                mla_params = {}
++                for hf_key, megatron_key in self.MLA_ROPE_SCALING_MAPPING:
++                    value = rope_scaling.get(hf_key)
++                    if value is not None:
++                        mla_params[megatron_key] = value
++                if mla_params:
++                    provider_kwargs["_mla_rope_params"] = mla_params
++            else:
++                # GPT models: use yarn_ prefixed field names (dataclass fields on GPTModelProvider)
++                provider_kwargs["position_embedding_type"] = "yarn"
++                for hf_key, megatron_key in self.YARN_ROPE_SCALING_MAPPING:
++                    value = rope_scaling.get(hf_key)
++                    if value is not None:
++                        provider_kwargs[megatron_key] = value
++                if "truncate" in rope_scaling:
++                    provider_kwargs["yarn_correction_range_round_to_int"] = rope_scaling["truncate"]
+         elif is_mla_provider:
+-            # MLA provider without rope_scaling in HF config:
+-            # Override rotary_scaling_factor to 1.0 (no scaling) instead of
+-            # using MLATransformerConfig default of 40
++            if rope_type not in (None, "default"):
++                logger.warning(
++                    f"Unsupported {rope_type=} for MLA model; "
++                    "defaulting to no scaling (rotary_scaling_factor=1.0, mscale_all_dim=1.0). "
++                    "Add explicit handling for this rope_type if the model requires it."
++                )
++            # Fill in 1.0 for any missing keys to avoid Megatron's MLATransformerConfig defaults
++            # (rotary_scaling_factor=40, mscale_all_dim=0.0), which are hardcoded for DeepSeek-V3's
++            # YaRN config and are wrong for models without yarn scaling.
+             provider_kwargs["_mla_rope_params"] = {"rotary_scaling_factor": 1.0, "mscale_all_dim": 1.0}
+ 
+         # Handle vocab_size_divisible_by
+@@ -460,6 +459,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+             ModelProviderTarget: A configured model provider instance
+         """
+         from megatron.bridge.models.gpt_provider import GPTModelProvider
++        from megatron.bridge.models.mla_provider import MLAModelProvider
+ 
+         hf_config = hf_pretrained.config
+ 
+@@ -470,18 +470,25 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+ 
+         # Use specified provider class, defaulting to GPTModelProvider
+         provider_class = self.PROVIDER_CLASS if self.PROVIDER_CLASS is not None else GPTModelProvider
+-        provider = provider_class(**provider_kwargs)
+-
+-        # All models that flow through the base provider_bridge use RoPE.
+-        # YARN is already handled above (hf_config_to_provider_kwargs sets
+-        # position_embedding_type="yarn"), so we only need to guard against
+-        # overwriting it here.  Every other rope_type value (None, "default",
+-        # "llama3", "longrope", …) means plain RoPE.
++        is_mla_provider = issubclass(provider_class, MLAModelProvider)
++        # Filter kwargs to only fields the provider dataclass accepts, so that MLA-only None
++        # values (q_lora_rank, kv_lora_rank, …) are silently dropped for non-MLA providers
++        # while still being passed through for MLA providers that declare them as fields.
++        valid_fields = provider_class.__dataclass_fields__
++        provider = provider_class(**{k: v for k, v in provider_kwargs.items() if k in valid_fields})
++
++        # Determine position_embedding_type from HF rope_scaling.
++        # For GPT providers: rope_type=="yarn" → "yarn"; everything else → "rope".
++        # For MLA providers: always "rope" — YaRN scaling parameters are applied
++        # separately via mla_rope_params (rotary_scaling_factor, mscale, etc.) and
++        # position_embedding_type="yarn" is not a valid MLA config value.
+         hf_rope_scaling = getattr(hf_config, "rope_scaling", None)
+         rope_type = None
+         if hf_rope_scaling:
+             rope_type = hf_rope_scaling.get("type") or hf_rope_scaling.get("rope_type")
+-        if rope_type != "yarn":
++        if rope_type == "yarn" and not is_mla_provider:
++            provider.position_embedding_type = "yarn"
++        else:
+             provider.position_embedding_type = "rope"
+ 
+         # Apply MLA rope params via setattr (for MLA models like DeepSeek, Kimi)
+@@ -721,6 +728,70 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+         """
+         return converted_weights_dict
+ 
++    def _accumulate_grouped_export(
++        self,
++        task: "WeightConversionTask",
++        converted_weights_dict: Dict[str, torch.Tensor],
++        model_config,
++        grouped_buffers: Dict[str, Dict[int, torch.Tensor]],
++        hf_state_dict: Mapping[str, torch.Tensor],
++    ) -> Optional[Dict[str, torch.Tensor]]:
++        """Accumulate per-expert weights for grouped export, return merged result when complete.
++
++        For fused-expert MoE models where one HF tensor contains all experts, this method
++        collects individual expert weights produced by per-expert ``megatron_to_hf`` calls
++        and returns the stacked result once all experts have been accumulated.
++
++        Returns:
++            Merged weights dict when the group is complete, ``None`` otherwise.
++        """
++        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
++
++        group_key = task.mapping.group_key
++        if group_key not in grouped_buffers:
++            grouped_buffers[group_key] = {}
++
++        ep_size = parallel_state.get_expert_model_parallel_world_size()
++        num_experts = model_config.num_moe_experts
++        experts_per_rank = num_experts // ep_size
++
++        try:
++            local_expert_number = extract_expert_number_from_param(task.param_name) % experts_per_rank
++        except ValueError:
++            return None
++
++        for _, value in converted_weights_dict.items():
++            if ep_size == 1:
++                grouped_buffers[group_key][local_expert_number] = value
++            else:
++                if value.ndim > 0 and value.shape[0] == ep_size:
++                    for i in range(ep_size):
++                        global_expert_number = local_expert_number + (i * experts_per_rank)
++                        grouped_buffers[group_key][global_expert_number] = value[i]
++                else:
++                    grouped_buffers[group_key][local_expert_number] = value
++
++        if len(grouped_buffers[group_key]) == num_experts:
++            merged = torch.stack([grouped_buffers[group_key][i] for i in range(num_experts)], dim=0)
++
++            if getattr(task.mapping, "transpose_on_export", False):
++                if group_key in hf_state_dict:
++                    # Adaptive: only transpose when the stacked shape doesn't match the original HF
++                    # shape but the transposed shape does.  This handles configurations where the
++                    # per-expert weight is already in [out, in] (PyTorch) rather than [in, out]
++                    # (TE) layout — e.g. when explicit_expert_comm=False (etp=1, ep=1).
++                    expected = tuple(hf_state_dict[group_key].shape)
++                    transposed = merged.transpose(-1, -2).contiguous()
++                    if tuple(merged.shape) != expected and tuple(transposed.shape) == expected:
++                        merged = transposed
++                else:
++                    merged = merged.transpose(-1, -2).contiguous()
++
++            del grouped_buffers[group_key]
++            return {group_key: merged}
++
++        return None
++
+     def load_weights_hf_to_megatron(
+         self,
+         hf_pretrained: HFPreTrained,
+@@ -784,12 +855,20 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+         hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
+ 
+         description = f"Loading from {hf_pretrained.model_name_or_path}"
++        _hf_import_cache: Dict[str, torch.Tensor] = {}
+         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
+             # None means megatron module not on current rank, skip if this task is not going to happen
+             if task.megatron_module is None:
+                 continue
+-            # 1) Fetch source tensor(s) from HF state dict
+-            hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
++            # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
++            hf_param_key = str(task.mapping.hf_param)
++            is_grouped = getattr(task.mapping, "is_grouped_export", False)
++            if is_grouped and hf_param_key in _hf_import_cache:
++                hf_weights = _hf_import_cache[hf_param_key]
++            else:
++                hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
++                if is_grouped:
++                    _hf_import_cache[hf_param_key] = hf_weights
+ 
+             # 2) Delegate conversion & distribution to the bridge
+             converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+@@ -976,8 +1055,34 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+ 
+         hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
+ 
++        # Pre-compute expected expert counts for grouped export mappings
++        _grouped_task_counts: Dict[str, int] = {}
++        for task in megatron_to_hf_tasks:
++            if task is not None and getattr(task.mapping, "is_grouped_export", False):
++                gk = task.mapping.group_key
++                _grouped_task_counts[gk] = _grouped_task_counts.get(gk, 0) + 1
++        _grouped_buffers: Dict[str, Dict[int, torch.Tensor]] = {}
++
+         for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
+-            converted_weights_dict = task.mapping.megatron_to_hf(task.param_weight, task.megatron_module)
++            megatron_weights = task.param_weight
++            megatron_module = task.megatron_module
++            if self._should_skip_mtp_duplicate_embedding_export(task, megatron_model):
++                megatron_weights = None
++                megatron_module = None
++
++            converted_weights_dict = task.mapping.megatron_to_hf(megatron_weights, megatron_module)
++
++            # --- Grouped export path: accumulate per-expert weights, yield when complete ---
++            if getattr(task.mapping, "is_grouped_export", False):
++                merged_result = self._accumulate_grouped_export(
++                    task, converted_weights_dict, model_config, _grouped_buffers, hf_state_dict
++                )
++                if merged_result is not None:
++                    for hf_name, tensor in merged_result.items():
++                        yield HFWeightTuple(hf_name, tensor.cpu() if cpu else tensor, task.param_name)
++                continue
++
++            # --- Standard export path ---
+             converted_weights_dict = self.maybe_modify_converted_hf_weight(
+                 task,
+                 converted_weights_dict,
+@@ -1002,7 +1107,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+                 final_tensor = tensor.cpu() if cpu else tensor
+ 
+                 if not merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
+-                    hf_name = hf_name[: -len("weight")] + "base_layer.weight"
++                    suffix_pos = hf_name.rfind(".")
++                    if suffix_pos == -1:
++                        hf_name = hf_name + ".base_layer"
++                    else:
++                        hf_name = hf_name[:suffix_pos] + ".base_layer" + hf_name[suffix_pos:]
+ 
+                 # Handle tied embeddings case
+                 # TODO(yuya): fix this hard coded naming
+@@ -1015,6 +1124,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+                         expected_keys = hf_pretrained.state.source.get_all_keys()
+                         if "lm_head.weight" in expected_keys:
+                             yield HFWeightTuple("lm_head.weight", final_tensor.clone().detach(), task.param_name)
++                    elif isinstance(hf_pretrained, PretrainedConfig):
++                        # Always emit lm_head.weight for config-only
++                        yield HFWeightTuple("lm_head.weight", final_tensor.clone().detach(), task.param_name)
+                 elif embeddings_are_tied and hf_name == "lm_head.weight":
+                     # This should not happen when embeddings are tied - assert error
+                     raise ValueError(
+@@ -1063,8 +1175,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+     def dtype_from_str(self, dtype: str) -> torch.dtype:
+         """Convert a string precision identifier to equivalent torch dtype.
+ 
+-        This utility method handles various string representations of PyTorch
+-        data types, including common abbreviations and mixed precision formats.
++        Delegates to ``megatron.bridge.utils.activation_map.str_to_dtype``.
++        Defaults to ``torch.float32`` for unrecognized strings.
+ 
+         Args:
+             dtype (str): String representation of dtype (e.g., "float16", "fp16",
+@@ -1072,27 +1184,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+ 
+         Returns:
+             torch.dtype: Corresponding PyTorch dtype (defaults to float32 if unknown).
+-
+-        Supported formats:
+-            - float16/fp16/16/16-mixed → torch.float16
+-            - bfloat16/bf16-mixed → torch.bfloat16
+-            - Others → torch.float32 (default)
+-
+-        Example:
+-            .. code-block:: python
+-
+-                dtype = bridge.dtype_from_str("fp16")
+-                print(dtype)  # torch.float16
+-
+-                dtype = bridge.dtype_from_str("bf16-mixed")
+-                print(dtype)  # torch.bfloat16
+         """
+-        assert isinstance(dtype, str)
+-        if dtype in ["float16", "fp16", "16", "16-mixed"]:
+-            return torch.float16
+-        elif dtype in ["bfloat16", "bf16-mixed"]:
+-            return torch.bfloat16
+-        else:
++        from megatron.bridge.utils.activation_map import str_to_dtype
++
++        try:
++            return str_to_dtype(dtype)
++        except ValueError:
+             return torch.float32
+ 
+     def make_vocab_size_divisible_by(self, vocab_size: int) -> int:
+@@ -1194,6 +1291,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+                 if hasattr(unwrapped_model, "output_layer"):
+                     unwrapped_model.output_layer.weight.data.copy_(embd_weights)
+ 
++    def _should_skip_mtp_duplicate_embedding_export(
++        self,
++        task: WeightConversionTask,
++        megatron_model: List[MegatronModel],
++    ) -> bool:
++        """Treat duplicate MTP embedding copies as PP receivers during export."""
++        if task.vp_stage is None or not 0 <= task.vp_stage < len(megatron_model):
++            return False
++
++        if not task.global_param_name.endswith("embedding.word_embeddings.weight"):
++            return False
++
++        model_chunk = unwrap_model(megatron_model[task.vp_stage])
++        model_config = getattr(model_chunk, "config", None)
++        if getattr(model_config, "pipeline_model_parallel_size", 1) <= 1:
++            return False
++
++        if getattr(model_chunk, "pre_process", False):
++            return False
++
++        inner_model = getattr(model_chunk, "language_model", model_chunk)
++        return bool(getattr(inner_model, "mtp_process", False))
++
+     def build_conversion_tasks(
+         self,
+         hf_pretrained: HFPreTrained,
+@@ -1208,11 +1328,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+         populated.
+         """
+ 
+-        # Ensure hf_pretrained has the required state structure
+-        if not (hasattr(hf_pretrained, "state") and hasattr(hf_pretrained.state, "source")):
++        has_hf_state = hasattr(hf_pretrained, "state") and hasattr(hf_pretrained.state, "source")
++        if not isinstance(hf_pretrained, PretrainedConfig) and not has_hf_state:
+             raise ValueError("hf_pretrained.state.source is required for weight ordering")
+ 
+-        hf_keys: Iterable[str] = hf_pretrained.state.source.get_all_keys()
++        hf_keys: Optional[Iterable[str]] = hf_pretrained.state.source.get_all_keys() if has_hf_state else None
+ 
+         mapping_registry = self.mapping_registry()
+         unwrapped_model = unwrap_model(megatron_model)[0]
+@@ -1249,8 +1369,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+                     logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
+                     continue
+ 
+-                # ensure hf weights exist
+-                if not mapping.allow_hf_name_mismatch:
++                # Ensure hf weights exist (skip for config-only export where hf_keys is None)
++                if hf_keys is not None and not mapping.allow_hf_name_mismatch:
+                     if isinstance(mapping.hf_param, str):
+                         if mapping.hf_param not in hf_keys:
+                             logger.warning(f"WARNING: Can't find {mapping.hf_param} in hf_keys")
+@@ -1444,7 +1564,7 @@ def register_bridge_implementation(
+     ) -> Iterable[HFWeightTuple]:
+         bridge = bridge_class()
+ 
+-        # allow bridge to access model config (config-only shims or raw configs lack .config)
++        # Allow bridge to access model config (config-only shims or raw configs lack .config)
+         bridge.hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
+ 
+         return bridge.stream_weights_megatron_to_hf(
+diff --git a/src/megatron/bridge/models/hf_pretrained/vlm.py b/src/megatron/bridge/models/hf_pretrained/vlm.py
+index 06c96e57..0a45a2df 100644
+--- a/src/megatron/bridge/models/hf_pretrained/vlm.py
++++ b/src/megatron/bridge/models/hf_pretrained/vlm.py
+@@ -322,6 +322,17 @@ class PreTrainedVLM(PreTrainedBase, Generic[VLMType]):
+         """Return the model name or path."""
+         return self._model_name_or_path
+ 
++    @property
++    def auto_map_model_class(self) -> Optional[str]:
++        """Get the custom model class string from the config's auto_map."""
++        config = self.config
++        auto_map = getattr(config, "auto_map", None)
++        if auto_map:
++            for key in ("AutoModelForCausalLM", "AutoModel"):
++                if key in auto_map:
++                    return str(auto_map[key])
++        return None
++
+     @property
+     def model(self) -> VLMType:
+         """Lazy load and return the underlying model."""
+diff --git a/src/megatron/bridge/models/kimi_vl/__init__.py b/src/megatron/bridge/models/kimi_vl/__init__.py
+new file mode 100644
+index 00000000..f3a852e4
+--- /dev/null
++++ b/src/megatron/bridge/models/kimi_vl/__init__.py
+@@ -0,0 +1,24 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from megatron.bridge.models.kimi_vl.kimi_k25_vl_bridge import KimiK25VLBridge
++from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
++from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
++
++
++__all__ = [
++    "KimiK25VLModel",
++    "KimiK25VLBridge",
++    "KimiK25VLModelProvider",
++]
+diff --git a/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
+new file mode 100644
+index 00000000..1e5f4a57
+--- /dev/null
++++ b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
+@@ -0,0 +1,265 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from functools import partial
++from typing import Dict, List, Mapping
++
++import torch
++from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
++
++from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
++from megatron.bridge.models.conversion.param_mapping import (
++    AutoMapping,
++    GatedMLPMapping,
++    ReplicatedMapping,
++)
++from megatron.bridge.models.deepseek.common import get_common_mapping_list
++from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
++from megatron.bridge.models.kimi_vl.kimi_k25_vl_provider import KimiK25VLModelProvider
++from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
++from megatron.bridge.models.kimi_vl.utils import (
++    dequantize_int4,
++    quantize_to_int4,
++)
++
++
++try:
++    import transformer_engine  # type: ignore  # noqa: F401
++
++    HAVE_TE = True
++except (ImportError, ModuleNotFoundError):
++    HAVE_TE = False
++
++
++@MegatronModelBridge.register_bridge(
++    source="KimiK25ForConditionalGeneration",
++    target=KimiK25VLModel,
++    provider=KimiK25VLModelProvider,
++)
++class KimiK25VLBridge(MegatronModelBridge):
++    """
++    Megatron Bridge for Kimi K2.5 VL.
++
++    Converts HuggingFace Kimi K2.5 VL models (KimiK25ForConditionalGeneration)
++    to Megatron format (KimiK25VLModel) and vice versa.
++
++    The language backbone shares the same architecture as Kimi K2 (MoE with MLA).
++    """
++
++    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> KimiK25VLModelProvider:
++        hf_config = hf_pretrained.config
++        text_config = hf_config.text_config
++        vision_config = hf_config.vision_config
++
++        provider_kwargs = self.hf_config_to_provider_kwargs(text_config)
++        mla_rope_params = provider_kwargs.pop("_mla_rope_params", None)
++        valid_fields = KimiK25VLModelProvider.__dataclass_fields__
++        provider = KimiK25VLModelProvider(**{k: v for k, v in provider_kwargs.items() if k in valid_fields})
++        if mla_rope_params:
++            for key, value in mla_rope_params.items():
++                setattr(provider, key, value)
++
++        # --- Language model architecture defaults (MoE + MLA) ---
++        provider.transformer_layer_spec = partial(get_gpt_decoder_block_spec, use_transformer_engine=HAVE_TE)
++        provider.normalization = "RMSNorm"
++        provider.gated_linear_unit = True
++        provider.add_bias_linear = False
++        provider.share_embeddings_and_output_weights = False
++        provider.qk_layernorm = True
++        provider.multi_latent_attention = True
++        provider.position_embedding_type = "rope"
++
++        # MoE settings
++        provider.moe_grouped_gemm = True
++        provider.moe_router_pre_softmax = True
++        provider.moe_token_dispatcher_type = "alltoall"
++        provider.moe_router_load_balancing_type = "seq_aux_loss"
++        provider.moe_shared_expert_overlap = True
++        provider.moe_router_score_function = "sigmoid"
++        provider.moe_router_enable_expert_bias = True
++        provider.moe_router_dtype = "fp32"
++        provider.moe_permute_fusion = True
++        provider.moe_aux_loss_coeff = 1e-3
++        provider.moe_router_bias_update_rate = 1e-3
++        provider.moe_router_topk_scaling_factor = getattr(text_config, "routed_scaling_factor", 2.827)
++        provider.moe_shared_expert_intermediate_size = text_config.moe_intermediate_size * text_config.n_shared_experts
++        provider.moe_layer_freq = [0] * text_config.first_k_dense_replace + [1] * (
++            text_config.num_hidden_layers - text_config.first_k_dense_replace
++        )
++
++        # Fusions
++        provider.apply_rope_fusion = False
++        provider.bias_activation_fusion = True
++        provider.bias_dropout_fusion = True
++        provider.cross_entropy_fusion_impl = "te"
++        provider.cross_entropy_loss_fusion = True
++        provider.masked_softmax_fusion = True
++        provider.persist_layer_norm = True
++        provider.gradient_accumulation_fusion = True
++
++        # Misc
++        provider.hidden_dropout = 0.0
++        provider.attention_dropout = 0.0
++        provider.attention_softmax_in_fp32 = False
++        provider.make_vocab_size_divisible_by = 1280
++        provider.seq_length = 4096
++        provider.async_tensor_model_parallel_allreduce = True
++
++        # Precision
++        dtype = self.dtype_from_hf(hf_config, default=torch.float32)
++        provider.fp16 = dtype == torch.float16
++        provider.bf16 = dtype == torch.bfloat16
++        provider.params_dtype = dtype
++
++        # VL-specific overrides
++        provider.vision_config = vision_config
++        provider.hf_model_path = hf_pretrained._model_name_or_path
++        provider.generation_config = hf_pretrained.generation_config
++
++        # media_placeholder_token_id is on the top-level KimiK25Config, not on text_config
++        media_placeholder_token_id = getattr(hf_config, "media_placeholder_token_id", 163605)
++        provider.bos_token_id = getattr(text_config, "bos_token_id", 163584)
++        provider.eos_token_id = getattr(text_config, "eos_token_id", 163585)
++        provider.image_token_id = media_placeholder_token_id
++        provider.media_placeholder_token_id = media_placeholder_token_id
++        provider.pad_token_id = getattr(hf_config, "pad_token_id", 163839)
++        provider.ignore_index = getattr(hf_config, "ignore_index", -100)
++
++        return provider
++
++    def _load_and_dequantize(self, key: str, hf_state_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
++        """Load a weight, dequantizing INT4 packed tensors when present."""
++        base = key[:-7] if key.endswith(".weight") else key
++        packed_key = f"{base}.weight_packed"
++        if packed_key in hf_state_dict:
++            assert f"{base}.weight_scale" in hf_state_dict and f"{base}.weight_shape" in hf_state_dict, (
++                f"Missing weight scale or shape for quantized weight {key}"
++            )
++            weight = dequantize_int4(
++                hf_state_dict[packed_key],
++                hf_state_dict[f"{base}.weight_scale"],
++                hf_state_dict[f"{base}.weight_shape"],
++                device=hf_state_dict[packed_key].device,
++            )
++        else:
++            weight = hf_state_dict[key]
++        return weight
++
++    def maybe_modify_loaded_hf_weight(
++        self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
++    ) -> torch.Tensor:
++        """Load HF weights, dequantizing INT4 quantized tensors when present."""
++        if isinstance(hf_param, str):
++            return self._load_and_dequantize(hf_param, hf_state_dict)
++        return {k: self._load_and_dequantize(v, hf_state_dict) for k, v in hf_param.items()}
++
++    def _is_quantized_expert_key(self, key: str) -> bool:
++        if "mlp.experts." in key and ".weight" in key:
++            if "shared_experts" in key:
++                return False
++            if ".layers.0." in key:
++                return False
++            return True
++        return False
++
++    def maybe_modify_converted_hf_weight(
++        self,
++        task: WeightConversionTask,
++        converted_weights_dict: Dict[str, torch.Tensor],
++        hf_state_dict: Mapping[str, torch.Tensor],
++    ) -> Dict[str, torch.Tensor]:
++        """Re-quantize converted expert weights to INT4 format."""
++        result = {}
++        for fqn, tensor in converted_weights_dict.items():
++            if self._is_quantized_expert_key(fqn):
++                base = fqn[:-7] if fqn.endswith(".weight") else fqn
++                orig_scale_key = f"{base}.weight_scale"
++                scale_dtype = (
++                    hf_state_dict[orig_scale_key].dtype if orig_scale_key in hf_state_dict else torch.bfloat16
++                )
++                packed, scale, shape = quantize_to_int4(tensor, scale_dtype=scale_dtype)
++                result[f"{base}.weight_packed"] = packed
++                result[f"{base}.weight_scale"] = scale
++                result[f"{base}.weight_shape"] = shape
++            else:
++                result[fqn] = tensor
++        return result
++
++    def build_conversion_tasks(
++        self,
++        hf_pretrained,
++        megatron_model,
++    ) -> List:
++        """Override to synthesize virtual weight keys from INT4 quantized triplets.
++
++        The HF checkpoint stores quantized expert weights as triplets
++        (weight_packed, weight_scale, weight_shape) without a plain 'weight' key.
++        We synthesize virtual 'weight' keys so the mapping registry can find them,
++        then maybe_modify_loaded_hf_weight handles dequantization at load time.
++        """
++        original_get_all_keys = hf_pretrained.state.source.get_all_keys
++
++        def _get_all_keys_with_virtual():
++            keys = original_get_all_keys()
++            all_keys_set = set(keys)
++            virtual_keys = []
++            for key in keys:
++                if key.endswith("_packed"):
++                    base = key[:-7]  # e.g. "...weight_packed" -> "...weight"
++                    if f"{base}_scale" in all_keys_set and f"{base}_shape" in all_keys_set:
++                        virtual_keys.append(base)
++            return keys + virtual_keys
++
++        hf_pretrained.state.source.get_all_keys = _get_all_keys_with_virtual
++        try:
++            return super().build_conversion_tasks(hf_pretrained, megatron_model)
++        finally:
++            hf_pretrained.state.source.get_all_keys = original_get_all_keys
++
++    def mapping_registry(self) -> MegatronMappingRegistry:
++        mapping_list = get_common_mapping_list()
++        param_mappings = {
++            "decoder.layers.*.mlp.router.expert_bias": "model.layers.*.mlp.gate.e_score_correction_bias",
++        }
++
++        for megatron_param, hf_param in param_mappings.items():
++            mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
++
++        # In HF Kimi K2.5 VL models, the language component is nested under
++        # "language_model.model" instead of just "model", so we need to add the prefix.
++        for mapping in mapping_list:
++            if isinstance(mapping, AutoMapping):
++                mapping.hf_param = "language_model." + mapping.hf_param
++                mapping.megatron_param = "language_model." + mapping.megatron_param
++            elif isinstance(mapping, GatedMLPMapping):
++                mapping.megatron_param = mapping.megatron_param.replace("decoder", "language_model.decoder")
++                mapping.hf_param["gate"] = mapping.hf_param["gate"].replace("model", "language_model.model")
++                mapping.hf_param["up"] = mapping.hf_param["up"].replace("model", "language_model.model")
++
++        # Vision Tower and MM Projector use ReplicatedMapping because
++        # vision components are not sharded across tensor parallel ranks.
++        mapping_list.extend(
++            [
++                ReplicatedMapping(
++                    megatron_param="vision_tower.**",
++                    hf_param="vision_tower.**",
++                ),
++                ReplicatedMapping(
++                    megatron_param="mm_projector.**",
++                    hf_param="mm_projector.**",
++                ),
++            ]
++        )
++        return MegatronMappingRegistry(*mapping_list)
+diff --git a/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py
+new file mode 100644
+index 00000000..11b883e1
+--- /dev/null
++++ b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py
+@@ -0,0 +1,85 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from dataclasses import dataclass
++from typing import Any, Optional
++
++from megatron.core.models.gpt import GPTModel as MCoreGPTModel
++
++from megatron.bridge.models.mla_provider import MLAModelProvider
++
++
++@dataclass
++class KimiK25VLModelProvider(MLAModelProvider):
++    """
++    Model provider for Kimi K2.5 VL (Vision-Language) Models.
++
++    Inherits language model configuration from MLAModelProvider. Core architecture
++    parameters (num_layers, hidden_size, MoE config, MLA config, etc.) are
++    populated by ``provider_bridge`` in the bridge class via ``hf_config_to_provider_kwargs``.
++
++    Only VLM-specific fields (vision config, token IDs, freeze options, etc.)
++    that are NOT part of the language model are defined here.
++
++    The vision component (MoonViT3d + PatchMergerMLP) is dynamically loaded
++    from the HuggingFace model repository at runtime via ``trust_remote_code``.
++    """
++
++    # VL models shouldn't scatter embeddings across sequence parallel regions because
++    # the vision embeddings are going to be inserted into the language embeddings.
++    scatter_embedding_sequence_parallel: bool = False
++
++    # Vision configuration — raw HF KimiK25VisionConfig object, used to construct
++    # VisionTowerConfig and ProjectorConfig for the vision tower and mm_projector.
++    vision_config: Any = None
++
++    # Path to HuggingFace model directory (required for dynamic module loading
++    # of MoonViT3d, PatchMergerMLP, and other custom model classes).
++    hf_model_path: Optional[str] = None
++
++    # Token IDs (from Kimi K2.5 config.json)
++    bos_token_id: int = 163584
++    eos_token_id: int = 163585
++    image_token_id: int = 163605  # media_placeholder_token_id in HF config
++    # Fields needed by HF's _merge_input_ids_with_image_features (bound via MethodType)
++    media_placeholder_token_id: int = 163605
++    pad_token_id: int = 163839
++    ignore_index: int = -100
++
++    # Freeze options for fine-tuning scenarios
++    freeze_language_model: bool = False
++    freeze_vision_model: bool = False
++    freeze_vision_projection: bool = False
++
++    # Generation configuration
++    generation_config: Any | None = None
++
++    def provide(self, pre_process=None, post_process=None, vp_stage=None):
++        """Provide a KimiK25VL model instance with vision and language components."""
++        from megatron.bridge.models.kimi_vl.modeling_kimi_k25_vl import KimiK25VLModel
++
++        model = KimiK25VLModel(self, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
++
++        if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
++            model.freeze(
++                freeze_language_model=self.freeze_language_model,
++                freeze_vision_model=self.freeze_vision_model,
++                freeze_vision_projection=self.freeze_vision_projection,
++            )
++
++        return model
++
++    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None) -> MCoreGPTModel:
++        """Provide just the language model component (MoE with MLA) without vision."""
++        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+diff --git a/src/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/src/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
+new file mode 100644
+index 00000000..0b1d7e87
+--- /dev/null
++++ b/src/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
+@@ -0,0 +1,433 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++from typing import List, Optional
++
++import torch
++from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
++from megatron.core.transformer.module import MegatronModule
++from torch import Tensor
++from transformers.dynamic_module_utils import get_class_from_dynamic_module
++
++from megatron.bridge.models.gpt_provider import GPTModelProvider
++from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
++
++
++logger = logging.getLogger(__name__)
++
++
++class KimiK25VLModel(MegatronModule):
++    """
++    Kimi K2.5 Vision-Language (VL) model wrapper for Megatron.
++    Args:
++        config (GPTModelProvider): Model provider containing configuration for language and vision modules.
++        pre_process (bool, optional): Whether to construct the vision tower and projector. Default: True.
++        post_process (bool, optional): Whether to apply post-processing. Default: True.
++        vp_stage (Optional[int], optional): Pipeline stage for model parallelism. Default: None.
++
++    Attributes:
++        pre_process (bool): If True, enables vision and multimodal components.
++        post_process (bool): If True, enables post-processing.
++        vp_stage (Optional[int]): Pipeline stage for model parallelism.
++        vision_tower (nn.Module): Vision encoder (MoonViT3d vision backbone).
++        mm_projector (nn.Module): PatchMergerMLP that projects vision features to language model space.
++        language_model (nn.Module): The underlying Kimi K2 language model.
++        get_image_features (callable): Method to extract and project image features.
++
++    Forward Inputs:
++        input_ids (torch.LongTensor, optional): Tokenized input ids for the language model.
++        attention_mask (torch.Tensor, optional): Attention mask for the language model.
++        position_ids (torch.LongTensor, optional): Position ids for the language model.
++        inputs_embeds (torch.FloatTensor, optional): Precomputed input embeddings.
++        pixel_values (torch.Tensor, optional): Image tensor(s) for the vision tower.
++        labels (torch.Tensor, optional): Target labels for supervised training.
++        runtime_gather_output (bool, optional): If True, gather outputs across pipeline stages.
++        loss_mask (Tensor, optional): Mask for loss computation.
++
++    Returns:
++        Tensor: Model output (e.g., logits or loss, depending on mode).
++
++    Note:
++        - If `pre_process` is False, only the language model is constructed.
++        - The vision tower and projector are only active if `pre_process` is True.
++        - This class is intended for use within the Megatron-LM framework.
++    """
++
++    def __init__(
++        self,
++        config: GPTModelProvider,
++        pre_process: bool = True,
++        post_process: bool = True,
++        vp_stage: Optional[int] = None,
++    ) -> None:
++        super().__init__(config=config)
++
++        self.pre_process = pre_process
++        self.post_process = post_process
++        self.vp_stage = vp_stage
++
++        if config.hf_model_path is None:
++            raise ValueError("hf_model_path must be set.")
++
++        if pre_process:
++            # Load vision tower and projector classes from the custom HuggingFace model code
++            MoonViT3dPretrainedModel = get_class_from_dynamic_module(
++                "modeling_kimi_k25.MoonViT3dPretrainedModel",
++                config.hf_model_path,
++            )
++            # Patch MoonViT3dEncoder to add missing use_deterministic_attn attribute
++            import importlib
++
++            _vit_module = importlib.import_module(MoonViT3dPretrainedModel.__module__)
++            if not getattr(_vit_module.MoonViT3dEncoder, "_bridge_init_patched", False):
++                # Monkey patch MoonViT3dEncoder.__init__ to add missing use_deterministic_attn attribute
++                _orig_encoder_init = _vit_module.MoonViT3dEncoder.__init__
++
++                def _patched_encoder_init(self, *args, **kwargs):
++                    self.use_deterministic_attn = False
++                    _orig_encoder_init(self, *args, **kwargs)
++
++                _vit_module.MoonViT3dEncoder.__init__ = _patched_encoder_init
++                _vit_module.MoonViT3dEncoder._bridge_init_patched = True
++
++            PatchMergerMLP = get_class_from_dynamic_module(
++                "modeling_kimi_k25.PatchMergerMLP",
++                config.hf_model_path,
++            )
++            ProjectorConfig = get_class_from_dynamic_module(
++                "modeling_kimi_k25.ProjectorConfig",
++                config.hf_model_path,
++            )
++            VisionTowerConfig = get_class_from_dynamic_module(
++                "modeling_kimi_k25.VisionTowerConfig",
++                config.hf_model_path,
++            )
++
++            # load vision config from hf model path
++            from megatron.bridge.models.hf_pretrained.safe_config_loader import safe_load_config_with_retry
++
++            config.vision_config = safe_load_config_with_retry(
++                config.hf_model_path, trust_remote_code=True
++            ).vision_config
++
++            self.vision_tower_config = VisionTowerConfig(config.vision_config)
++            self.projector_config = ProjectorConfig(config.vision_config)
++
++            # Patch: some versions of MoonViT3dEncoder.__init__ reference
++            # self.use_deterministic_attn before setting it.  Inject a default
++            # via the class so the attribute lookup succeeds.
++            MoonViT3dEncoder = get_class_from_dynamic_module(
++                "modeling_kimi_k25.MoonViT3dEncoder",
++                config.hf_model_path,
++            )
++            if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
++                MoonViT3dEncoder.use_deterministic_attn = False
++
++            self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
++            self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector
++            # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.
++            hook_hf_module_setattr_for_tp_grad_sync(self.vision_tower)
++            hook_hf_module_setattr_for_tp_grad_sync(self.mm_projector)
++        self.language_model = self.config.provide_language_model(
++            pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
++        )
++
++        # Finalize grad requires these to be bound with module
++        self.share_embeddings_and_output_weights = config.share_embeddings_and_output_weights
++        self.shared_embedding_or_output_weight = self.language_model.shared_embedding_or_output_weight
++
++        # don't use huggingface's function for PP
++        self.media_placeholder_token_id = config.media_placeholder_token_id
++
++    def set_input_tensor(self, input_tensor) -> None:
++        """Set model chunk input tensor."""
++        self.language_model.set_input_tensor(input_tensor)
++
++    def _merge_input_ids_with_image_features(
++        self,
++        image_features: List[torch.Tensor],
++        inputs_embeds: torch.Tensor,
++        input_ids: torch.Tensor,
++        attention_mask: Optional[torch.Tensor] = None,
++        labels: Optional[torch.Tensor] = None,
++        target_seq_length: Optional[int] = None,
++    ):
++        """Merge image features into input embeddings.
++
++        Supports two modes:
++        1. Pre-expanded (PP mode): input_ids already has N placeholder tokens per image,
++           where N = number of image features. Does simple 1:1 replacement.
++        2. Dynamic expansion: input_ids has 1 placeholder per image, expands to N tokens.
++
++        Args:
++            image_features: List of image feature tensors, one per image
++            inputs_embeds: Text embeddings (batch_size, seq_len, embed_dim)
++            input_ids: Token IDs (batch_size, seq_len)
++            attention_mask: Attention mask (batch_size, seq_len)
++            labels: Optional labels for training
++            target_seq_length: Optional fixed output length for pipeline parallelism.
++        """
++        _, embed_dim = image_features[0].shape
++        feature_lengths = [x.shape[0] for x in image_features]
++        total_image_features = sum(feature_lengths)
++        image_features_cat = torch.cat(image_features, dim=0)
++        num_images = len(image_features)
++
++        image_token_index = self.media_placeholder_token_id
++        pad_token_id = self.config.pad_token_id
++        ignore_index = self.config.ignore_index
++
++        batch_size, sequence_length = input_ids.shape
++
++        # Count placeholder tokens in input_ids
++        num_placeholders = (input_ids == image_token_index).sum().item()
++
++        # Determine mode:
++        # - Pre-expanded: num_placeholders == total_image_features (exact match from collate)
++        # - Truncated pre-expanded: collate pre-expanded but seq_length cutoff removed some
++        #   placeholders. Detected by: more placeholders than images, but fewer than total features.
++        # - Dynamic expansion: 1 placeholder per image (inference), num_placeholders <= num_images.
++        is_pre_expanded = num_placeholders == total_image_features
++        is_truncated_pre_expanded = (
++            not is_pre_expanded and num_placeholders > num_images and num_placeholders < total_image_features
++        )
++
++        if is_pre_expanded or is_truncated_pre_expanded:
++            # Pre-expanded mode: 1:1 replacement of placeholders with image features.
++            # If truncated, first align features to surviving placeholders per sample.
++            if is_truncated_pre_expanded:
++                per_sample_placeholders = (input_ids == image_token_index).sum(dim=1)  # (B,)
++                truncated_parts = []
++                feat_idx = 0
++                for sample_idx in range(batch_size):
++                    remaining = per_sample_placeholders[sample_idx].item()
++                    while remaining > 0 and feat_idx < num_images:
++                        n_feat = image_features[feat_idx].shape[0]
++                        n_keep = min(n_feat, remaining)
++                        truncated_parts.append(image_features[feat_idx][:n_keep])
++                        remaining -= n_keep
++                        feat_idx += 1
++                image_features_cat = torch.cat(truncated_parts, dim=0)
++
++            final_embedding = inputs_embeds.clone()
++            image_mask = input_ids == image_token_index
++
++            # Replace placeholder embeddings with image features
++            final_embedding[image_mask] = image_features_cat.to(inputs_embeds.dtype)
++
++            # Attention mask and labels stay the same (no expansion)
++            if attention_mask is None:
++                attention_mask = (input_ids != pad_token_id).long()
++            final_attention_mask = attention_mask
++            position_ids = (attention_mask.cumsum(-1) - 1).masked_fill_((attention_mask == 0), 1)
++
++            if labels is not None:
++                # Mask out image positions in labels (don't compute loss on image tokens)
++                final_labels = labels.clone()
++                final_labels[image_mask] = ignore_index
++            else:
++                final_labels = None
++
++            return final_embedding, final_attention_mask, final_labels, position_ids
++
++        # Dynamic expansion mode (inference path: 1 placeholder per image -> N features)
++        if attention_mask is None:
++            attention_mask = (input_ids != pad_token_id).long()
++
++        left_padding = not torch.sum(input_ids[:, -1] == torch.tensor(pad_token_id))
++
++        # Create token occupation table
++        _token_occupation_table = torch.ones_like(input_ids.flatten())
++        _token_occupation_table[input_ids.flatten() == image_token_index] = torch.tensor(
++            feature_lengths, dtype=torch.long, device=input_ids.device
++        )
++        _token_occupation_table = _token_occupation_table.reshape(input_ids.shape)
++
++        # Calculate natural expanded length, but use target if provided (for PP)
++        natural_max_embed_dim = _token_occupation_table.sum(-1).max().item()
++        max_embed_dim = target_seq_length if target_seq_length is not None else natural_max_embed_dim
++
++        batch_indices, non_image_indices = torch.where(input_ids != image_token_index)
++
++        # Compute new positions for text tokens
++        new_token_positions = torch.cumsum(_token_occupation_table, -1) - 1
++        nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
++        if left_padding:
++            new_token_positions += nb_image_pad[:, None]
++        text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
++
++        # Create final embeddings (with target_seq_length for PP consistency)
++        final_embedding = torch.zeros(
++            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
++        )
++        final_attention_mask = torch.zeros(
++            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
++        )
++        if labels is not None:
++            final_labels = torch.full(
++                (batch_size, max_embed_dim), ignore_index, dtype=input_ids.dtype, device=input_ids.device
++            )
++
++        target_device = inputs_embeds.device
++        batch_indices = batch_indices.to(target_device)
++        non_image_indices = non_image_indices.to(target_device)
++        text_to_overwrite = text_to_overwrite.to(target_device)
++        attention_mask = attention_mask.to(target_device)
++
++        # Fill text embeddings
++        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
++        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
++        if labels is not None:
++            final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
++
++        # Fill image embeddings
++        image_to_overwrite = torch.full((batch_size, max_embed_dim), True, dtype=torch.bool, device=target_device)
++        image_to_overwrite[batch_indices, text_to_overwrite] = False
++        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None].to(target_device)
++
++        final_embedding[image_to_overwrite] = image_features_cat.contiguous().reshape(-1, embed_dim).to(target_device)
++        final_attention_mask |= image_to_overwrite
++        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
++
++        # Mask out padding positions
++        batch_indices_pad, pad_indices = torch.where(input_ids == pad_token_id)
++        indices_to_mask = new_token_positions[batch_indices_pad, pad_indices]
++        final_embedding[batch_indices_pad, indices_to_mask] = 0
++
++        if labels is None:
++            final_labels = None
++
++        return final_embedding, final_attention_mask, final_labels, position_ids
++
++    def _extract_image_features(self, pixel_values, grid_thws):
++        """Extract and project image features."""
++        image_features = self.vision_tower(pixel_values, grid_thws)
++        return self.mm_projector(image_features)
++
++    def forward(
++        self,
++        input_ids: torch.LongTensor = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        inputs_embeds: Optional[torch.FloatTensor] = None,
++        pixel_values: Optional[torch.Tensor] = None,
++        image_grid_thw: Optional[torch.Tensor] = None,
++        labels: Optional[torch.Tensor] = None,
++        runtime_gather_output: Optional[bool] = None,
++        *,
++        loss_mask: Optional[Tensor] = None,
++        packed_seq_params: PackedSeqParams = None,
++    ) -> Tensor:
++        r"""
++        Args:
++            input_ids: Tokenized input ids for the language model.
++            attention_mask: Attention mask for the language model.
++            position_ids: Position ids for the language model.
++            inputs_embeds: Precomputed input embeddings.
++            pixel_values: Image tensor for the vision tower.
++            image_grid_thw: Tensor of shape ``(num_images, 3)`` containing ``[temporal, height, width]``
++                for each image's grid dimensions in the LLM. This corresponds to ``grid_thws`` in
++                the HF Kimi K2.5 processor output.
++            labels: Target labels for supervised training.
++            runtime_gather_output: If True, gather outputs across pipeline stages.
++            loss_mask: Mask for loss computation.
++
++        NOTE:
++            For _merge_input_ids_with_image_features, there are two modes for processing input_ids:
++            1. Pre-expanded (PP mode): input_ids already has N placeholder tokens per image,
++               where N = number of image features. Does simple 1:1 replacement.
++            2. Dynamic expansion: input_ids has 1 placeholder per image, expands to N tokens.
++        """
++        if self.pre_process:
++            if inputs_embeds is None:
++                inputs_embeds = self.language_model.embedding(
++                    input_ids=input_ids, position_ids=None
++                )  # [seq_len, batch, hidden]
++                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # [batch, seq_len, hidden]
++
++            # Process vision features only on the first pipeline stage
++            has_pixels = pixel_values is not None and pixel_values.size(0) > 0
++            not_generation = input_ids is not None and input_ids.shape[1] != 1
++
++            if has_pixels and not_generation:
++                pixel_values = pixel_values.to(self.vision_tower.dtype)
++                image_features = self._extract_image_features(pixel_values, image_grid_thw)
++                inputs_embeds = inputs_embeds.to(image_features[0].dtype)
++
++                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
++                    image_features,
++                    inputs_embeds,
++                    input_ids,
++                    attention_mask,
++                    labels,
++                )
++
++                # For THD format, override position_ids with per-sample reset positions
++                if position_ids is None and packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
++                    cu_seqlens = packed_seq_params.cu_seqlens_q  # [num_samples + 1]
++                    total_len = inputs_embeds.shape[1]
++                    position_ids = torch.zeros(1, total_len, dtype=torch.long, device=inputs_embeds.device)
++                    for i in range(len(cu_seqlens) - 1):
++                        start, end = cu_seqlens[i], cu_seqlens[i + 1]
++                        position_ids[0, start:end] = torch.arange(end - start, device=inputs_embeds.device)
++
++                # Don't need attention mask for causal attention.
++                attention_mask = None
++
++            # Transpose back to (T, B, D) for Megatron language model
++            inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
++
++            if self.config.sequence_parallel:
++                inputs_embeds = scatter_to_sequence_parallel_region(inputs_embeds)
++
++        outputs = self.language_model.forward(
++            input_ids=None,
++            position_ids=position_ids,
++            attention_mask=attention_mask,  # (B, 1, T, T)
++            decoder_input=inputs_embeds,  # (T, B, D)
++            labels=labels,  # (B, T)
++            loss_mask=loss_mask,
++            runtime_gather_output=runtime_gather_output,
++            packed_seq_params=packed_seq_params,
++        )
++        return outputs
++
++    def freeze(self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool):
++        """Freeze model modules.
++
++        Make specific modules non-trainable by setting requires_grad to False.
++
++        Args:
++            freeze_language_model (bool): Freeze the language model module.
++            freeze_vision_model (bool): Freeze the vision model module (patch_embed and blocks).
++            freeze_vision_projection (bool): Freeze the vision projection module (merger).
++        """
++        modules = []
++
++        if freeze_language_model and hasattr(self, "language_model") and self.language_model is not None:
++            modules.append(self.language_model)
++
++        if freeze_vision_model and hasattr(self, "vision_tower") and self.vision_tower is not None:
++            # Vision model consists of patch_embed and blocks
++            modules.append(self.vision_tower)
++
++        if freeze_vision_projection and hasattr(self, "mm_projector") and self.mm_projector is not None:
++            # Vision projection is the merger module
++            modules.append(self.mm_projector)
++
++        for module in modules:
++            for param in module.parameters():
++                param.requires_grad = False
+diff --git a/src/megatron/bridge/models/kimi_vl/utils.py b/src/megatron/bridge/models/kimi_vl/utils.py
+new file mode 100644
+index 00000000..0e318a49
+--- /dev/null
++++ b/src/megatron/bridge/models/kimi_vl/utils.py
+@@ -0,0 +1,141 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++import torch
++
++
++def dequantize_int4(
++    weight_packed: torch.Tensor,
++    weight_scale: torch.Tensor,
++    weight_shape: torch.Tensor,
++    group_size: int = 32,
++    device: str | torch.device | None = None,
++) -> torch.Tensor:
++    """Dequantize INT4 packed weights to bfloat16.
++
++    Extracts local tensors from DTensors before unpacking (bitwise ops don't work on DTensor).
++    Both weight_packed and weight_scale should have matching sharding so .to_local() gives
++    corresponding slices automatically.
++
++    Args:
++        weight_packed: INT4 packed weights [out_features, in_features // 8], may be DTensor
++        weight_scale: Per-group scales [out_features, num_groups], should be DTensor with same sharding
++        weight_shape: Original shape [2], stores global dimensions
++        group_size: Elements per scale group (default 32)
++        device: Target device for computation
++    """
++
++    local_out, local_packed_in = weight_packed.shape
++    local_in = local_packed_in * 8  # 8 INT4 values per int32
++
++    target_device = weight_packed.device if device is None else torch.device(device)
++    use_cuda = target_device.type == "cuda" and torch.cuda.is_available()
++
++    if use_cuda:
++        weight_packed = weight_packed.to(target_device)
++        weight_scale = weight_scale.to(target_device)
++
++    # Unpack INT4: [out, packed_in] -> [out, packed_in, 8] -> [out, in_features]
++    shifts = torch.arange(8, device=weight_packed.device) * 4
++
++    packed_unsqueezed = weight_packed.unsqueeze(-1)
++    unpacked = ((packed_unsqueezed >> shifts) & 0xF).float()
++    unpacked = unpacked.reshape(local_out, local_in)
++
++    # Convert unsigned 4-bit (0-15) to signed (-8 to 7) using OFFSET BINARY
++    # This matches compressed-tensors library which packs as: value + 8
++    # So unpack as: value - 8
++    unpacked = unpacked - 8
++
++    # Apply scale - both are now local tensors with corresponding slices
++    scale = weight_scale.float()
++    if scale.ndim == 1:
++        local_num_groups = scale.numel() // local_out
++        scale = scale.view(local_out, local_num_groups)
++    else:
++        scale = scale.view(local_out, -1)
++
++    local_num_groups = scale.shape[1]
++    elements_per_group = local_in // local_num_groups
++
++    # repeat_interleave expands [local_out, local_num_groups] -> [local_out, local_in]
++    scale_expanded = scale.repeat_interleave(elements_per_group, dim=1)
++
++    if scale_expanded.shape[1] < local_in:
++        # Pad if needed
++        scale_expanded = torch.nn.functional.pad(
++            scale_expanded, (0, local_in - scale_expanded.shape[1]), value=scale_expanded[:, -1:].mean()
++        )
++    scale_expanded = scale_expanded[:, :local_in]
++    result = unpacked * scale_expanded
++
++    result = result.to(torch.bfloat16)
++
++    return result
++
++
++def quantize_to_int4(
++    weight: torch.Tensor,
++    group_size: int = 32,
++    scale_dtype: torch.dtype = torch.bfloat16,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Quantize bfloat16/float16 weights to INT4 packed format.
++
++    Returns:
++        weight_packed: INT4 values packed into int32 (8 values per int32)
++        weight_scale: Per-group scale factors in ``scale_dtype``
++        weight_shape: Original tensor shape (int32)
++    """
++    out_features, in_features = weight.shape
++    weight_shape = torch.tensor(
++        [out_features, in_features], dtype=torch.int32, device=weight.device
++    )
++
++    # Convert to float32 for computation
++    w = weight.float()
++
++    # Compute per-group scales (group along in_features dimension)
++    num_groups = (in_features + group_size - 1) // group_size
++    w_grouped = w.view(out_features, num_groups, -1)
++
++    # Symmetric quantization: scale = max(abs(w)) / 7
++    group_max = w_grouped.abs().amax(dim=-1)
++    scale = group_max / 7.0
++    scale = scale.clamp(min=1e-10)  # Avoid division by zero
++
++    # Quantize: w_q = round(w / scale), clamp to [-8, 7]
++    scale_expanded = scale.unsqueeze(-1).expand_as(w_grouped)
++    w_q = (w_grouped / scale_expanded).round().clamp(-8, 7)
++
++    # Convert signed [-8, 7] to unsigned [0, 15] using offset binary
++    w_q = w_q.view(out_features, -1)[:, :in_features]
++    w_q = (w_q + 8).to(torch.uint8)
++
++    # Pack 8 INT4 values into each int32 along the in_features dimension
++    # HF format: [out_features, in_features//8] - 2D packed tensor
++    assert in_features % 8 == 0, f"in_features must be divisible by 8, got {in_features}"
++
++    # Reshape to [out_features, in_features//8, 8] for packing along dim 1
++    w_q_grouped = w_q.view(out_features, in_features // 8, 8).to(torch.int32)
++
++    # Pack 8 nibbles into 1 int32
++    packed = torch.zeros(out_features, in_features // 8, dtype=torch.int32, device=weight.device)
++    for i in range(8):
++        packed |= (w_q_grouped[:, :, i] & 0xF) << (i * 4)
++
++    weight_packed = packed
++    weight_scale = scale.to(scale_dtype)
++
++    return weight_packed, weight_scale, weight_shape
+diff --git a/src/megatron/bridge/utils/activation_map.py b/src/megatron/bridge/utils/activation_map.py
+new file mode 100644
+index 00000000..db32ed32
+--- /dev/null
++++ b/src/megatron/bridge/utils/activation_map.py
+@@ -0,0 +1,133 @@
++# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Shared bidirectional mapping between activation function names and callables.
++
++Used by:
++- ``omegaconf_utils`` for CLI override serialization/deserialization
++- ``ModelBridge`` for HuggingFace <-> Megatron activation conversion
++"""
++
++import importlib
++import logging
++from typing import Callable
++
++import torch
++import torch.nn.functional as F
++from megatron.core.activations import fast_gelu, squared_relu
++
++
++logger = logging.getLogger(__name__)
++
++# Canonical name -> callable.
++# Short names come first; fully-qualified aliases are added below.
++ACTIVATION_FUNC_MAP: dict[str, Callable] = {
++    "gelu": F.gelu,
++    "relu": F.relu,
++    "silu": F.silu,
++    "sigmoid": F.sigmoid,
++    "tanh": torch.tanh,
++    "relu2": squared_relu,  # alias; canonical is squared_relu (below)
++    "squared_relu": squared_relu,
++    "gelu_pytorch_tanh": fast_gelu,  # alias; canonical is fast_gelu (below)
++    "fast_gelu": fast_gelu,
++}
++
++# Add fully-qualified torch.nn.functional aliases
++ACTIVATION_FUNC_MAP.update(
++    {
++        "torch.nn.functional.gelu": F.gelu,
++        "torch.nn.functional.relu": F.relu,
++        "torch.nn.functional.silu": F.silu,
++        "torch.nn.functional.sigmoid": F.sigmoid,
++    }
++)
++
++# Reverse map: callable id -> canonical short name (used during serialization).
++# Only short names (no dots) are used as canonical representations.
++_ACTIVATION_FUNC_TO_STR: dict[int, str] = {id(fn): name for name, fn in ACTIVATION_FUNC_MAP.items() if "." not in name}
++
++
++def callable_to_str(fn: Callable) -> str | None:
++    """Convert a known activation callable to its short string name.
++
++    Returns ``None`` if the callable is not in the registry.
++    """
++    return _ACTIVATION_FUNC_TO_STR.get(id(fn))
++
++
++def str_to_callable(name: str) -> Callable:
++    """Resolve an activation function name to its callable.
++
++    Accepts short names (``"silu"``), fully-qualified names
++    (``"torch.nn.functional.silu"``), or arbitrary dotted import paths.
++
++    Raises:
++        ValueError: If the name cannot be resolved.
++    """
++    if name in ACTIVATION_FUNC_MAP:
++        return ACTIVATION_FUNC_MAP[name]
++
++    # Fallback: try to import the dotted path
++    parts = name.rsplit(".", 1)
++    if len(parts) == 2:
++        try:
++            module = importlib.import_module(parts[0])
++            resolved = getattr(module, parts[1])
++            if callable(resolved):
++                return resolved
++        except (ImportError, AttributeError):
++            pass
++
++    known_names = sorted(n for n in ACTIVATION_FUNC_MAP if "." not in n)
++    raise ValueError(f"Unknown activation function: '{name}'. Known names: {known_names}")
++
++
++# Short name -> torch.dtype
++DTYPE_MAP: dict[str, torch.dtype] = {
++    "fp32": torch.float32,
++    "float32": torch.float32,
++    "32": torch.float32,
++    "32-true": torch.float32,
++    "fp16": torch.float16,
++    "float16": torch.float16,
++    "16": torch.float16,
++    "16-mixed": torch.float16,
++    "bf16": torch.bfloat16,
++    "bfloat16": torch.bfloat16,
++    "bf16-mixed": torch.bfloat16,
++    "fp8": torch.float8_e4m3fn,
++    "float8_e4m3fn": torch.float8_e4m3fn,
++    "float8_e5m2": torch.float8_e5m2,
++}
++
++# Add "torch.<name>" aliases for canonical (non-numeric, non-mixed) names
++DTYPE_MAP.update(
++    {f"torch.{k}": v for k, v in DTYPE_MAP.items() if "." not in k and not k[0].isdigit() and "-" not in k}
++)
++
++
++def str_to_dtype(name: str) -> torch.dtype:
++    """Resolve a dtype string to a ``torch.dtype``.
++
++    Accepts short names (``"bf16"``), canonical names (``"bfloat16"``), or
++    fully-qualified names (``"torch.bfloat16"``).
++
++    Raises:
++        ValueError: If the name cannot be resolved.
++    """
++    if name in DTYPE_MAP:
++        return DTYPE_MAP[name]
++    known = sorted(n for n in DTYPE_MAP if "." not in n)
++    raise ValueError(f"Unknown dtype: '{name}'. Known names: {known}")

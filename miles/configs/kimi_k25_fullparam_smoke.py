@@ -5,8 +5,8 @@ Run: EXPERIMENT_CONFIG=kimi_k25_fullparam_smoke modal run -d miles/modal_train.p
 
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
 
-_SGLANG_SYNC_SHA = "6d79c609954585c5e40d5f2b24dc5eb30d1fe41a"
-_MEGATRON_BRIDGE_SHA = "d2ee05178d382414bec006fb94dc415483ec6cda"
+_SGLANG_SYNC_SHA = "4839cecbb0d304ed17e86eca897321f3d2b78648"
+_MEGATRON_BRIDGE_SHA = "d1232659282474c70e5233fbb6f29a5527f22bb0"
 
 modal = ModalConfig(
     gpu="H200",
@@ -22,28 +22,23 @@ modal = ModalConfig(
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
         # Merge upstream SGLang to pick up K2.5 language_only + compressed-tensors
         # MoE support (PR #22381 and friends).
-        "cd /sgl-workspace/sglang && git config user.email 'miles@local' && git config user.name 'miles'",
-        "cd /sgl-workspace/sglang && git fetch --unshallow origin && git fetch origin main",
-        f"cd /sgl-workspace/sglang && git merge {_SGLANG_SYNC_SHA} --no-edit -X theirs",
-        "cd /sgl-workspace/sglang && git apply /tmp/sglang_lora_bias_22402.patch",
-        # ReplicatedLinear.weight_loader doesn't shard; patch deepseek_weight_loader
-        # to fuse q_a_proj + kv_a_proj_with_mqa manually (slime's approach).
-        "python /root/miles/patches/sglang_fused_qkv_weight_fix.py",
-        # Install radixark's Megatron-Bridge 0.4.0 (official KimiK2Bridge).
+        # "cd /sgl-workspace/sglang && git config user.email 'miles@local' && git config user.name 'miles'",
+        # "cd /sgl-workspace/sglang && git fetch --unshallow origin && git fetch origin main",
+        # f"cd /sgl-workspace/sglang && git merge {_SGLANG_SYNC_SHA} --no-edit -X theirs",
+
+        "cd /sgl-workspace/sglang && git fetch origin pull/23065/head:pr-23065 && git checkout pr-23065",
+        # "cd /sgl-workspace/sglang && git apply /tmp/sglang_lora_bias_22402.patch",
         f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{_MEGATRON_BRIDGE_SHA}",
-        # Layer KimiK25VLBridge on top (based on fzyzcjy/Megatron-Bridge PR #7).
-        "cd $(python -c 'import megatron.bridge; import os; p=megatron.bridge.__file__; print(os.path.dirname(os.path.dirname(os.path.dirname(p))))') && patch -p1 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
-        # Bridges registered at runtime via megatron_utils/__init__.py.
+        "cd /usr/local/lib/python3.12/dist-packages && patch -p2 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
     ],
 )
 
 
 class _Miles(MilesConfig):
-    miles_model_script = "scripts/models/kimi-k2.5.sh"
+    miles_model_script = "scripts/models/kimi-k2-thinking.sh"
 
-    hf_checkpoint = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
-    save = f"{CHECKPOINTS_PATH}/Kimi-K2.5-fullparam-ckpt"
-    save_interval = 1
+    hf_checkpoint = "moonshotai/Kimi-K2.5"
+    ref_load = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
     megatron_to_hf_mode = "bridge"
 
     only_train_params_name_list = ["layers\\.60\\."]

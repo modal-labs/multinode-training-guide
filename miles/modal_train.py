@@ -150,7 +150,7 @@ def convert_kimi_int4_to_bf16(
 
     print(f"\n=== INT4 → BF16: {output_dir} ===")
     subprocess.run(
-        ["python", f"{MILES_ROOT}/tools/convert_k2_thinking_int4_to_bf16.py",
+        ["python", f"{MILES_ROOT}/tools/convert_kimi_int4_to_bf16.py",
          "--model-dir", model_dir, "--output-dir", output_dir],
         check=True,
     )
