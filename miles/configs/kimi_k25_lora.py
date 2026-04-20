@@ -34,7 +34,7 @@ default ``get_hidden_dim`` lacks them (``target_modules_hf_for_sglang_rollout``)
 Run: ``EXPERIMENT_CONFIG=kimi_k25_lora modal run -d miles/modal_train.py::train``
 """
 
-from configs.kimi_k25_fullparam_smoke import _Miles as _FullParamMiles, modal  # noqa: F401
+from configs.kimi_k25 import _Miles as _FullParamMiles, modal  # noqa: F401
 
 
 class _Miles(_FullParamMiles):

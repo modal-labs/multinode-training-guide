@@ -24,7 +24,7 @@ MILES_ROOT = "/root/miles"
 
 image = (
     modal.Image.from_registry(
-        "radixark/miles:dev"
+        "radixark/miles:dev-202604201238"
     )
     .entrypoint([])
     .add_local_python_source("configs", copy=True)

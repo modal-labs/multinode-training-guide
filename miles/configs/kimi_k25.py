@@ -1,20 +1,21 @@
 """Kimi-K2.5 full-param smoke test — 8x H200, colocated, freeze most layers.
 
-Run: EXPERIMENT_CONFIG=kimi_k25_fullparam_smoke modal run -d miles/modal_train.py::train
+Run: EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
 """
 
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
 
 _SGLANG_SYNC_SHA = "4839cecbb0d304ed17e86eca897321f3d2b78648"
 _MEGATRON_BRIDGE_SHA = "d1232659282474c70e5233fbb6f29a5527f22bb0"
+_MILES_SHA = "9a003644739f4e6dd509e2e8337e8ae7e571941c"
 
 modal = ModalConfig(
     gpu="H200",
     memory=(1024, int(2 * 1024 * 1024)),
-    local_miles="/home/ec2-user/nan_wonderland/miles",
     patch_files=[
-        "patches/sglang_lora.patch",
         "patches/megatron_bridge_kimi_vl.patch",
+        "patches/miles_lora.patch",
+        "patches/sglang_lora.patch",
     ],
     image_run_commands=[
         # Remove pip nvidia-cudnn — TE loads system cuDNN via absolute paths and
@@ -23,7 +24,7 @@ modal = ModalConfig(
         "cd /sgl-workspace/sglang && git fetch origin pull/23065/head:pr-23065 && git checkout pr-23065",
         "cd /sgl-workspace/sglang && git update-index --refresh && git apply --3way /tmp/sglang_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
         f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{_MEGATRON_BRIDGE_SHA}",
-        "cd /usr/local/lib/python3.12/dist-packages && patch -p2 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
+        f"cd /root/miles && git fetch && git checkout {_MILES_SHA} && git update-index --refresh && git apply --3way /tmp/miles_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
     ],
 )
 
@@ -42,7 +43,7 @@ class _Miles(MilesConfig):
     ref_load = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
     megatron_to_hf_mode = "bridge"
 
-    only_train_params_name_list = ["layers\\.60\\."]
+    # only_train_params_name_list = ["layers\\.60\\."]
 
     actor_num_nodes = 8
     actor_num_gpus_per_node = 8
