@@ -3,6 +3,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+from pathlib import Path
 
 import modal
 import modal.experimental
@@ -21,6 +22,19 @@ miles_cfg = exp_mod.miles if exp_mod else None
 # ── Image ─────────────────────────────────────────────────────────────────────
 
 MILES_ROOT = "/root/miles"
+_LOCAL_MILES_DIR = Path(__file__).resolve().parent
+_LOCAL_REPO_ROOT = _LOCAL_MILES_DIR.parent
+
+
+def _resolve_local_path(path: str) -> str:
+    path_obj = Path(path).expanduser()
+    if path_obj.is_absolute():
+        return str(path_obj)
+    for base in (_LOCAL_MILES_DIR, _LOCAL_REPO_ROOT):
+        candidate = (base / path_obj).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str((_LOCAL_MILES_DIR / path_obj).resolve())
 
 image = (
     modal.Image.from_registry(
@@ -32,12 +46,14 @@ image = (
 )
 if modal_cfg:
     for patch in modal_cfg.patch_files:
+        patch_path = _resolve_local_path(patch)
         image = image.add_local_file(
-            patch, f"/tmp/{os.path.basename(patch)}", copy=True
+            patch_path, f"/tmp/{os.path.basename(patch_path)}", copy=True
         )
     if modal_cfg.local_miles:
+        local_miles_path = _resolve_local_path(modal_cfg.local_miles)
         image = image.add_local_dir(
-            modal_cfg.local_miles,
+            local_miles_path,
             remote_path=MILES_ROOT,
             copy=True,
             ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],

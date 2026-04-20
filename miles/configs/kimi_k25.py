@@ -3,19 +3,23 @@
 Run: EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
 """
 
+from pathlib import Path
+
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
 
 _SGLANG_SYNC_SHA = "1ca33e4e95dda7d5afc9e461fa3924ea2f57e126"
 _MEGATRON_BRIDGE_SHA = "d1232659282474c70e5233fbb6f29a5527f22bb0"
 _MILES_SHA = "9a003644739f4e6dd509e2e8337e8ae7e571941c"
+_MILES_DIR = Path(__file__).resolve().parents[1]
+_PATCHES_DIR = _MILES_DIR / "patches"
 
 modal = ModalConfig(
     gpu="H200",
     memory=(1024, int(2 * 1024 * 1024)),
     patch_files=[
-        "miles/patches/megatron_bridge_kimi_vl.patch",
-        "miles/patches/miles_lora.patch",
-        "miles/patches/sglang_lora.patch",
+        str(_PATCHES_DIR / "megatron_bridge_kimi_vl.patch"),
+        str(_PATCHES_DIR / "miles_lora.patch"),
+        str(_PATCHES_DIR / "sglang_lora.patch"),
     ],
     image_run_commands=[
         # Remove pip nvidia-cudnn — TE loads system cuDNN via absolute paths and
