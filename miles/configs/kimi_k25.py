@@ -124,7 +124,7 @@ class _Miles(MilesConfig):
 
     use_wandb = True
     wandb_project = "miles-kimi-k25"
-    wandb_group = "kimi-k25-fullparam-smoke"
+    wandb_group = "kimi-k25"
     disable_wandb_random_suffix = True
 
     def prepare_data(self) -> None:
