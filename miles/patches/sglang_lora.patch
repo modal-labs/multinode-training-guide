@@ -1,5 +1,21 @@
+diff --git a/python/sglang/srt/lora/backend/base_backend.py b/python/sglang/srt/lora/backend/base_backend.py
+index 17b7bef1b..a519bb47e 100644
+--- a/python/sglang/srt/lora/backend/base_backend.py
++++ b/python/sglang/srt/lora/backend/base_backend.py
+@@ -19,6 +19,11 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
+     def __init__(self, max_loras_per_batch: int, device: torch.device):
+         self.max_loras_per_batch = max_loras_per_batch
+         self.device = device
++        # None until prepare_lora_batch populates it for a forward. When None,
++        # layer `forward` methods skip LoRA apply — this matters for DP-attention
++        # idle forwards (padded batches on DP ranks with no real tokens), where
++        # the MLP runs for collective sync but no LoRA prep has fired.
++        self.batch_info = None
+         self.init_lm_head_config()
+ 
+     def run_lora_a_embedding(
 diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
-index 9fb8aa14d..afc510d7b 100644
+index 9fb8aa14d..502ca5bba 100644
 --- a/python/sglang/srt/lora/layers.py
 +++ b/python/sglang/srt/lora/layers.py
 @@ -41,6 +41,8 @@ class BaseLayerWithLoRA(nn.Module):
@@ -11,7 +27,39 @@ index 9fb8aa14d..afc510d7b 100644
  
      def forward(self, x: torch.Tensor):
          return self.base_layer.forward(x)
-@@ -460,9 +462,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -200,8 +202,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
+         ):
+             base_output = self.extra_token_embedding(input_, base_output)
+ 
+-        # Apply LoRA if configured
+-        if self.set_lora:
++        # Apply LoRA if configured. Skip if no batch_info (DP-attention idle
++        # forward): the base path is correct because no real tokens need LoRA.
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             # The backend's run_lora_a_embedding now handles both regular
+             # and extra tokens efficiently with CUDA graph support
+             base_output = self.apply_lora(base_output, input_, batch_info)
+@@ -361,8 +364,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
+             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
+         )
+ 
+-        # Apply LoRA if set
+-        if self.set_lora:
++        # Apply LoRA if set. Skip in DP-attention idle forward (batch_info unset).
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             base_output = self.apply_lora(base_output, hidden_states)
+ 
+         return base_output
+@@ -446,7 +449,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+             self.base_layer, input_, bias
+         )
+ 
+-        if self.set_lora:
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             output_parallel = self.apply_lora(output_parallel, input_)
+ 
+         if self.base_layer.gather_output:
+@@ -460,9 +463,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
          return A
  
      def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
@@ -27,7 +75,7 @@ index 9fb8aa14d..afc510d7b 100644
          B = B[start_idx:end_idx, :]
          return B
  
-@@ -510,10 +516,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -510,10 +517,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
  
      def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
          # Since the outputs for both gate and up are identical, we use a random one.
@@ -43,7 +91,7 @@ index 9fb8aa14d..afc510d7b 100644
          return torch.concat(
              (
                  B[start_idx:end_idx, :],
-@@ -577,11 +586,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -577,11 +587,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
          q_proj_shard_size = base_layer.q_proj_shard_size
          kv_proj_shard_size = base_layer.kv_proj_shard_size
          num_kv_head_replicas = base_layer.num_kv_head_replicas
@@ -60,7 +108,27 @@ index 9fb8aa14d..afc510d7b 100644
          kv_start_idx = kv_proj_shard_size * kv_shard_id
          kv_end_idx = kv_start_idx + kv_proj_shard_size
  
-@@ -681,9 +693,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -657,7 +670,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+             and not skip_all_reduce
+         )
+ 
+-        if self.set_lora and should_reduce:
++        # LoRA skipped when batch_info is None (DP-attention idle forward).
++        have_batch_info = self.lora_backend.batch_info is not None
++        if self.set_lora and have_batch_info and should_reduce:
+             lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                 input_parallel, self.A_buffer
+             )
+@@ -670,7 +685,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+                 base_output=output_,
+             )
+         else:
+-            if self.set_lora:
++            if self.set_lora and have_batch_info:
+                 output_parallel = self.apply_lora(output_parallel, input_parallel)
+             if should_reduce:
+                 output_ = tensor_model_parallel_all_reduce(output_parallel)
+@@ -681,9 +696,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
          return output_, output_bias
  
      def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
@@ -78,7 +146,16 @@ index 9fb8aa14d..afc510d7b 100644
          A = A[:, start_idx:end_idx].contiguous()
          return A
  
-@@ -817,7 +835,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+@@ -767,7 +788,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
+     def forward(self, x: torch.Tensor):
+         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+-        if self.set_lora:
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             output = self.apply_lora(output, x)
+         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+         return output, output_bias
+@@ -817,7 +838,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
          from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
          from sglang.srt.layers.moe.utils import get_moe_runner_backend
  
@@ -92,7 +169,7 @@ index 9fb8aa14d..afc510d7b 100644
          global_backend = get_moe_runner_backend()
          if not global_backend.is_auto():
              runner_backend = global_backend
-@@ -826,6 +849,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+@@ -826,6 +852,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
              and base_layer.quant_method.runner is not None
          ):
              runner_backend = base_layer.quant_method.runner.runner_backend
@@ -105,18 +182,32 @@ index 9fb8aa14d..afc510d7b 100644
          else:
              runner_backend = MoeRunnerBackend.TRITON
  
+@@ -919,6 +951,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         2. After down projection, before final reduction
+         """
+ 
++        # DP-attention idle forward: padded batch with no real tokens, no
++        # prepare_lora_batch fired, so batch_info is None. Fall back to the
++        # base MoE forward — the output is only used for collective sync.
++        if self.lora_backend.batch_info is None:
++            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
++
+         # Build LoRA info for this batch
+         lora_info = self._get_lora_info()
+ 
 diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
-index 34444edfc..9fdf1f3b5 100644
+index 34444edfc..d67f359ab 100644
 --- a/python/sglang/srt/lora/mem_pool.py
 +++ b/python/sglang/srt/lora/mem_pool.py
-@@ -157,6 +157,53 @@ class LoRAMemoryPool:
+@@ -157,6 +157,66 @@ class LoRAMemoryPool:
              or 1
          )
  
 +    def _row_parallel_shard_tp(
-+        self, module_name: str, base_model: torch.nn.Module
++        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
 +    ) -> int:
-+        """How many ways the row-parallel *input* is partitioned for this module.
++        """How many ways the row-parallel *input* is partitioned for this module
++        within ``layer_idx``.
 +
 +        LoRAMemoryPool used to divide by global ``self.tp_size`` for every
 +        ``o_proj`` / ``down_proj`` LoRA A buffer.  DeepSeek / Kimi build some
@@ -126,15 +217,24 @@ index 34444edfc..9fdf1f3b5 100644
 +        matches the activation shard and ``chunked_sgmv_lora_shrink_forward``
 +        asserts ``x.shape[-1] == K``.
 +
++        The factor can also differ **across layers** under the same module_name
++        — e.g. in K2.5 with ``enable_moe_dense_fully_dp=True``, the first
++        ``first_k_dense_replace`` dense layers put ``mlp.down_proj`` on tp_size=1
++        while MoE layers put ``mlp.shared_experts.down_proj`` on the global TP
++        group (tp_size=8). A single global cache produced the wrong size for one
++        of the two groups. Probe and cache per ``(module_name, layer_idx)``.
++
 +        Infer the real factor from ``input_size // input_size_per_partition`` on
-+        the first matching base module; fall back to ``self.tp_size``.
++        the first matching base module *within the target layer*; fall back to
++        ``self.tp_size`` if no match.
 +        """
 +        cache = getattr(self, "_row_parallel_tp_cache", None)
 +        if cache is None:
 +            cache = {}
 +            setattr(self, "_row_parallel_tp_cache", cache)
-+        if module_name in cache:
-+            return cache[module_name]
++        key = (module_name, layer_idx)
++        if key in cache:
++            return cache[key]
 +
 +        def _probe(m):
 +            in_size = getattr(m, "input_size", None)
@@ -147,9 +247,12 @@ index 34444edfc..9fdf1f3b5 100644
 +            return None
 +
 +        suffix = f".{module_name}"
++        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
 +        found = None
 +        for _name, module in base_model.named_modules():
 +            if not _name.endswith(suffix):
++                continue
++            if not any(marker in _name for marker in layer_markers):
 +                continue
 +            r = _probe(module)
 +            if r is not None:
@@ -157,29 +260,29 @@ index 34444edfc..9fdf1f3b5 100644
 +                break
 +
 +        out = found if found is not None else self.tp_size
-+        cache[module_name] = out
++        cache[key] = out
 +        return out
 +
      def _get_standard_shape(
          self,
          module_name: str,
-@@ -169,8 +216,9 @@ class LoRAMemoryPool:
+@@ -169,8 +229,9 @@ class LoRAMemoryPool:
              module_name, self.base_hf_config, base_model, layer_idx
          )
          c = get_stacked_multiply(module_name)
 -        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
 -            input_dim = divide(input_dim, self.tp_size)
-+        row_tp = self._row_parallel_shard_tp(module_name, base_model)
++        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
 +        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
 +            input_dim = divide(input_dim, row_tp)
          return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
  
      def get_lora_A_shape(
-@@ -191,12 +239,13 @@ class LoRAMemoryPool:
+@@ -191,12 +252,13 @@ class LoRAMemoryPool:
              module_name, self.base_hf_config, base_model, layer_idx
          )
          c = get_stacked_multiply(module_name)
-+        row_tp = self._row_parallel_shard_tp(module_name, base_model)
++        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
          if (
 -            self.tp_size > 1
 +            row_tp > 1
