@@ -1,3 +1,16 @@
+diff --git a/.github/CODEOWNERS b/.github/CODEOWNERS
+index fade5e455..b91331c93 100644
+--- a/.github/CODEOWNERS
++++ b/.github/CODEOWNERS
+@@ -6,6 +6,6 @@
+ /miles/backends/sglang_utils/ @fzyzcjy @yueming-yuan @maocheng23 @yushengsu-thu
+ /miles/ray/ @fzyzcjy @yueming-yuan @maocheng23
+ /miles/rollout/ @fzyzcjy @yueming-yuan @guapisolo
+-/miles/rollout/session/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23
++/miles/rollout/session/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23 @jybsuper
+ /miles/router/ @fzyzcjy @yueming-yuan @guapisolo
+-/miles/utils/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23
++/miles/utils/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23 @jybsuper
 diff --git a/examples/lora/dev.sh b/examples/lora/dev.sh
 new file mode 100644
 index 000000000..cd6e4da3d
@@ -162,6 +175,177 @@ index 000000000..cd6e4da3d
 +   ${SGLANG_ARGS[@]} \
 +   ${MISC_ARGS[@]} \
 +   ${ROLLOUT_ARGS[@]}
+\ No newline at end of file
+diff --git a/examples/lora/run-gpt-oss-20B-megatron-moe-lora.sh b/examples/lora/run-gpt-oss-20B-megatron-moe-lora.sh
+new file mode 100644
+index 000000000..f349f2922
+--- /dev/null
++++ b/examples/lora/run-gpt-oss-20B-megatron-moe-lora.sh
+@@ -0,0 +1,164 @@
++pkill -9 sglang
++sleep 3
++ray stop --force
++pkill -9 ray
++pkill -9 python
++sleep 3
++pkill -9 ray
++pkill -9 python
++
++set -ex
++
++# will prevent ray from buffering stdout/stderr
++export PYTHONBUFFERED=16
++export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
++GPUS_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
++
++# Load model architecture config
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
++source "${SCRIPT_DIR}/../../scripts/models/gpt-oss-20b.sh"
++
++CKPT_ARGS=(
++   --hf-checkpoint /root/models/gpt-oss-20b
++   --megatron-to-hf-mode bridge
++   # --save $BASE_DIR/gpt-oss-20b-BF16
++   # --save-interval 50
++)
++
++LORA_ARGS=(
++   --lora-rank 32                    # LoRA rank (typical values: 8, 16, 32, 64)
++   --lora-alpha 32                   # LoRA alpha (usually 2x rank)
++   --lora-dropout 0.0                # LoRA dropout (0.0 for RL training)
++   --target-modules "gate_proj,up_proj,down_proj"
++   --sglang-lora-backend triton      # !!! must for moe-lora !!!, else display "Current LoRA backend does not support LoRA on MoE layers; skipping MoE layer"
++)
++
++ROLLOUT_ARGS=(
++   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
++   --input-key prompt
++   --label-key label
++   --apply-chat-template
++   --rollout-shuffle
++   --rm-type math
++   --num-rollout 1
++   --rollout-batch-size 32
++   --n-samples-per-prompt 8
++   --rollout-max-response-len 4096
++   --rollout-temperature 1.0
++
++   --global-batch-size 8
++)
++
++EVAL_ARGS=(
++   --eval-interval 10
++   --eval-prompt-data gsm8k /root/gsm8k/test.parquet
++   --eval-input-key messages
++   --n-samples-per-eval-prompt 1
++   --eval-max-response-len 4096
++   --eval-top-k 1
++)
++
++PERF_ARGS=(
++   # Parallelism: TP=4, EP=1, PP=1, CP=1
++   --tensor-model-parallel-size 4
++   --sequence-parallel
++   --pipeline-model-parallel-size 1
++   --context-parallel-size 1
++   --expert-model-parallel-size 1
++   --expert-tensor-parallel-size 1
++
++   # Recomputation: full recompute needed to fit optimizer states in 80GB
++   --recompute-granularity full
++   --recompute-method uniform
++   --recompute-num-layers 1
++
++   # Batch size settings
++   # Note: --use-dynamic-batch-size is not supported with --qkv-format bshd
++   --micro-batch-size 1
++   --max-tokens-per-gpu 4096
++)
++
++GRPO_ARGS=(
++   --advantage-estimator grpo
++   # TODO: need gpt oss ckpt conversion.
++   # --use-kl-loss
++   # --kl-loss-coef 0.00
++   # --kl-loss-type low_var_kl
++   # --kl-coef 0.00
++   --entropy-coef 0.00
++   --eps-clip 0.2
++   --eps-clip-high 0.28
++)
++
++OPTIMIZER_ARGS=(
++   --optimizer adam
++   --lr 1e-5
++   --lr-decay-style constant
++   --weight-decay 0.1
++   --adam-beta1 0.9
++   --adam-beta2 0.98
++   # CPU offload optimizer states (fp32 master weights + Adam moments) to free ~30GB GPU memory
++   --optimizer-cpu-offload
++   --overlap-cpu-optimizer-d2h-h2d
++   --use-precision-aware-optimizer
++)
++
++SGLANG_ARGS=(
++   # TP size for sglang inference engine
++   --rollout-num-gpus-per-engine 4
++   --sglang-dtype bfloat16
++   --sglang-decode-log-interval 1000
++   --sglang-mem-fraction-static 0.2
++   # Note: need to use bf16 ckpt when enable triton moe backend, eg, lmsys/gpt-oss-20b-bf16
++   # mxfp4 currently not supported
++   --sglang-moe-runner-backend triton
++)
++
++WANDB_ARGS=(
++   --use-wandb
++   --wandb-project miles-gpt-oss
++   --wandb-group "gpt-oss-20b-moe-lora"
++)
++
++MISC_ARGS=(
++   # default dropout in megatron is 0.1
++   --attention-dropout 0.0
++   --hidden-dropout 0.0
++   # Sink attention (sliding window + learnable softmax) in TE only supports BSHD/SBHD, not THD.
++   # Must use --qkv-format bshd for the fused backend to work with this model's attention pattern.
++   --qkv-format bshd
++   --attention-backend fused
++   --update-weight-buffer-size 536870912 # 512MB
++)
++
++
++# launch the master node of ray in container
++export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
++ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus $GPUS_PER_NODE --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
++
++# Build the runtime environment JSON with proper variable substitution
++RUNTIME_ENV_JSON="{
++  \"env_vars\": {
++    \"PYTHONPATH\": \"/root/Megatron-LM/\",
++    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
++    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
++  }
++}"
++
++ray job submit --address="http://127.0.0.1:8265" \
++   --runtime-env-json="${RUNTIME_ENV_JSON}" \
++   -- python3 train.py \
++   --actor-num-nodes 1 \
++   --actor-num-gpus-per-node $GPUS_PER_NODE \
++   --colocate \
++   ${MODEL_ARGS[@]} \
++   ${LORA_ARGS[@]} \
++   ${CKPT_ARGS[@]} \
++   ${ROLLOUT_ARGS[@]} \
++   ${OPTIMIZER_ARGS[@]} \
++   ${GRPO_ARGS[@]} \
++   ${WANDB_ARGS[@]} \
++   ${PERF_ARGS[@]} \
++   ${EVAL_ARGS[@]} \
++   ${SGLANG_ARGS[@]} \
++   ${MISC_ARGS[@]}
 \ No newline at end of file
 diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
 index 2cfd373f4..0f7b3d67a 100644
@@ -887,7 +1071,7 @@ index ecdba3c8c..4e97d6c30 100644
  
          for megatron_local_param_infos in tqdm(
 diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
-index 86073d5ab..fdd4e3d68 100644
+index 86073d5ab..6397d2b28 100644
 --- a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
 +++ b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
 @@ -54,8 +54,6 @@ class UpdateWeightFromTensor:
@@ -912,8 +1096,20 @@ index 86073d5ab..fdd4e3d68 100644
          # Create IPC gather groups within megatron.
          for start_rank in range(0, dist.get_world_size(), self.args.rollout_num_gpus_per_engine):
              end_rank = start_rank + self.args.rollout_num_gpus_per_engine
-@@ -189,20 +190,36 @@ class UpdateWeightFromTensor:
+@@ -187,25 +188,59 @@ class UpdateWeightFromTensor:
+                 )
+         dist.barrier(group=get_gloo_group())
  
++        # Release allocator-cached blocks before streaming weights. The
++        # preceding `restore_weights_before_load` resizes SGLang-side
++        # quantized params from Marlin layout back to loading layout, freeing
++        # the larger Marlin buffers; those blocks sit in the torch allocator
++        # cache until we evict them. Empty_cache here prevents fragmentation
++        # from compounding across the update path and gives the upcoming
++        # `post_process_weights` (Marlin repack) room for its transient
++        # 2x allocations.
++        torch.cuda.empty_cache()
++
          megatron_local_weights = self.weights_getter()
  
 -        sync_chunk_count = 0
@@ -962,7 +1158,18 @@ index 86073d5ab..fdd4e3d68 100644
  
          dist.barrier(group=get_gloo_group())
  
-@@ -218,61 +235,46 @@ class UpdateWeightFromTensor:
++        # Drop cached blocks held by the weight-streaming path (flattened
++        # tensor buckets, IPC staging buffers, etc.) before SGLang runs its
++        # Marlin repack. `process_weights_after_loading` allocates a full
++        # new tensor for each weight before an in-place resize+copy, so peak
++        # memory temporarily doubles per weight; returning freed cache to
++        # the driver here prevents those transients from OOMing.
++        torch.cuda.empty_cache()
++
+         if rank == 0:
+             # `post_process_quantization` is related to the `process_weights_after_loading`
+             # in the sglang rollout side, which should always be invoked after weight
+@@ -218,61 +253,46 @@ class UpdateWeightFromTensor:
              ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
          dist.barrier(group=get_gloo_group())
  

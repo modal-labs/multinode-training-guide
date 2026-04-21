@@ -148,6 +148,12 @@ class MilesConfig:
                 out += [flag, str(val)]
         return out
 
+    def prepare_model(self) -> None:
+        """Populate the HF cache and apply any model-specific local fixes."""
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(self.hf_checkpoint)
+
     def prepare_data(self) -> None:
         raise NotImplementedError(f"{type(self).__name__} has no prepare_data()")
 

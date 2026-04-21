@@ -655,7 +655,7 @@ index f11f1081..4c95163e 100644
              from megatron.bridge.training.model_load_save import temporary_distributed_context
          except ImportError:
 diff --git a/src/megatron/bridge/models/conversion/model_bridge.py b/src/megatron/bridge/models/conversion/model_bridge.py
-index ddd3d31f..97e86455 100644
+index ddd3d31f..70b411d4 100644
 --- a/src/megatron/bridge/models/conversion/model_bridge.py
 +++ b/src/megatron/bridge/models/conversion/model_bridge.py
 @@ -34,9 +34,7 @@ from typing import (
@@ -943,7 +943,7 @@ index ddd3d31f..97e86455 100644
  
              # 2) Delegate conversion & distribution to the bridge
              converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
-@@ -976,8 +1055,34 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -976,15 +1055,38 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
  
          hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
  
@@ -957,6 +957,12 @@ index ddd3d31f..97e86455 100644
 +
          for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
 -            converted_weights_dict = task.mapping.megatron_to_hf(task.param_weight, task.megatron_module)
+-            converted_weights_dict = self.maybe_modify_converted_hf_weight(
+-                task,
+-                converted_weights_dict,
+-                hf_state_dict,
+-            )  # dict will be none except for one expert;
+-            # All ranks get the full tensor
 +            megatron_weights = task.param_weight
 +            megatron_module = task.megatron_module
 +            if self._should_skip_mtp_duplicate_embedding_export(task, megatron_model):
@@ -974,12 +980,27 @@ index ddd3d31f..97e86455 100644
 +                    for hf_name, tensor in merged_result.items():
 +                        yield HFWeightTuple(hf_name, tensor.cpu() if cpu else tensor, task.param_name)
 +                continue
-+
+ 
 +            # --- Standard export path ---
-             converted_weights_dict = self.maybe_modify_converted_hf_weight(
-                 task,
-                 converted_weights_dict,
-@@ -1002,7 +1107,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
++            # Merge LoRA adapters into the base weight BEFORE any HF-side
++            # modification (e.g. per-expert INT4 re-quantization). Quantizing
++            # first would leave the base in a packed form that cannot absorb a
++            # full-precision `linear_out @ linear_in` delta.
+             adapter_tasks = None
+             if merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
+                 task_global_base_prefix, _, _ = task.global_param_name.partition(".to_wrap.weight")
+@@ -998,11 +1100,22 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+                     adapter_weights,
+                 )
+ 
++            converted_weights_dict = self.maybe_modify_converted_hf_weight(
++                task,
++                converted_weights_dict,
++                hf_state_dict,
++            )  # dict will be none except for one expert;
++            # All ranks get the full tensor
++
+             for hf_name, tensor in converted_weights_dict.items():
                  final_tensor = tensor.cpu() if cpu else tensor
  
                  if not merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
@@ -992,7 +1013,7 @@ index ddd3d31f..97e86455 100644
  
                  # Handle tied embeddings case
                  # TODO(yuya): fix this hard coded naming
-@@ -1015,6 +1124,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1015,6 +1128,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                          expected_keys = hf_pretrained.state.source.get_all_keys()
                          if "lm_head.weight" in expected_keys:
                              yield HFWeightTuple("lm_head.weight", final_tensor.clone().detach(), task.param_name)
@@ -1002,7 +1023,7 @@ index ddd3d31f..97e86455 100644
                  elif embeddings_are_tied and hf_name == "lm_head.weight":
                      # This should not happen when embeddings are tied - assert error
                      raise ValueError(
-@@ -1063,8 +1175,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1063,8 +1179,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
      def dtype_from_str(self, dtype: str) -> torch.dtype:
          """Convert a string precision identifier to equivalent torch dtype.
  
@@ -1013,7 +1034,7 @@ index ddd3d31f..97e86455 100644
  
          Args:
              dtype (str): String representation of dtype (e.g., "float16", "fp16",
-@@ -1072,27 +1184,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1072,27 +1188,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
  
          Returns:
              torch.dtype: Corresponding PyTorch dtype (defaults to float32 if unknown).
@@ -1046,7 +1067,7 @@ index ddd3d31f..97e86455 100644
              return torch.float32
  
      def make_vocab_size_divisible_by(self, vocab_size: int) -> int:
-@@ -1194,6 +1291,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1194,6 +1295,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                  if hasattr(unwrapped_model, "output_layer"):
                      unwrapped_model.output_layer.weight.data.copy_(embd_weights)
  
@@ -1076,7 +1097,7 @@ index ddd3d31f..97e86455 100644
      def build_conversion_tasks(
          self,
          hf_pretrained: HFPreTrained,
-@@ -1208,11 +1328,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1208,11 +1332,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
          populated.
          """
  
@@ -1091,7 +1112,7 @@ index ddd3d31f..97e86455 100644
  
          mapping_registry = self.mapping_registry()
          unwrapped_model = unwrap_model(megatron_model)[0]
-@@ -1249,8 +1369,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1249,8 +1373,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                      logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
                      continue
  
@@ -1102,7 +1123,7 @@ index ddd3d31f..97e86455 100644
                      if isinstance(mapping.hf_param, str):
                          if mapping.hf_param not in hf_keys:
                              logger.warning(f"WARNING: Can't find {mapping.hf_param} in hf_keys")
-@@ -1444,7 +1564,7 @@ def register_bridge_implementation(
+@@ -1444,7 +1568,7 @@ def register_bridge_implementation(
      ) -> Iterable[HFWeightTuple]:
          bridge = bridge_class()
  
@@ -1111,6 +1132,95 @@ index ddd3d31f..97e86455 100644
          bridge.hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
  
          return bridge.stream_weights_megatron_to_hf(
+diff --git a/src/megatron/bridge/models/conversion/peft_bridge.py b/src/megatron/bridge/models/conversion/peft_bridge.py
+index 6f0ebe43..9ac79d9c 100644
+--- a/src/megatron/bridge/models/conversion/peft_bridge.py
++++ b/src/megatron/bridge/models/conversion/peft_bridge.py
+@@ -701,6 +701,25 @@ class MegatronPeftBridge:
+ 
+                             lin_in = current_linear_in_tensor.unsqueeze(0) if is_grouped_expert else current_linear_in_tensor
+                             lin_out = current_linear_out_tensor.unsqueeze(0) if is_grouped_expert else current_linear_out_tensor
++                            # Fire only on the first grouped-MoE emission so
++                            # we capture the shape that SGLang's MoE LoRA
++                            # buffer path receives (the dense fc1 emission
++                            # already works, it's the (1, 64, 7168)-style
++                            # moe adapter that's suspected).
++                            if is_grouped_expert and not getattr(self, "_lora_emit_dbg_logged", False):
++                                import logging as _logging
++                                self._lora_emit_dbg_logged = True
++                                _logging.getLogger(__name__).warning(
++                                    "[LORA_EMIT_DBG] fused base_name=%s is_grouped_expert=%s "
++                                    "lin_in_shape=%s lin_out_shape=%s "
++                                    "linear_in_hf=%s linear_out_hf=%s",
++                                    base_name,
++                                    is_grouped_expert,
++                                    tuple(lin_in.shape),
++                                    tuple(lin_out.shape),
++                                    linear_in_hf_names[index],
++                                    linear_out_hf_names[index],
++                                )
+                             yield HFWeightTuple(linear_in_hf_names[index], lin_in, megatron_linear_in_name)
+                             yield HFWeightTuple(linear_out_hf_names[index], lin_out, megatron_linear_out_name)
+                         continue
+@@ -829,9 +848,23 @@ class MegatronPeftBridge:
+                     raise ValueError(f"Unknown weight name: {hf_name}")
+                 current_linear_out_weight = qkv_linear_out_weights[projection_key]
+ 
+-            merged_weight = self._merge_single_adapter_weight(
+-                base_weight, alpha, dim, current_linear_in_weight, current_linear_out_weight
+-            )
++            try:
++                merged_weight = self._merge_single_adapter_weight(
++                    base_weight, alpha, dim, current_linear_in_weight, current_linear_out_weight
++                )
++            except RuntimeError as e:
++                import torch.distributed as _dist
++                _rank = _dist.get_rank() if _dist.is_initialized() else -1
++                print(
++                    f"[LORA_MERGE_DEBUG rank={_rank}] hf_name={hf_name} "
++                    f"global_base_prefix={adapter_weight.global_base_prefix} "
++                    f"adapter_key={adapter_weight.adapter_key} "
++                    f"base={tuple(base_weight.shape)} "
++                    f"linear_in={tuple(current_linear_in_weight.shape)} "
++                    f"linear_out={tuple(current_linear_out_weight.shape)}",
++                    flush=True,
++                )
++                raise
+             converted_weights_dict[hf_name] = merged_weight
+ 
+         return converted_weights_dict
+@@ -856,13 +889,24 @@ class MegatronPeftBridge:
+         base_device = base_weight.device
+         linear_out_on_base = linear_out_weight.to(device=base_device, dtype=torch.float32)
+         linear_in_on_base = linear_in_weight.to(device=base_device, dtype=torch.float32)
+-        merged = merger.merge(
+-            base_weight.float(),
+-            linear_out_on_base,
+-            linear_in_on_base,
+-            alpha,
+-            dim,
+-        )
++        try:
++            merged = merger.merge(
++                base_weight.float(),
++                linear_out_on_base,
++                linear_in_on_base,
++                alpha,
++                dim,
++            )
++        except RuntimeError as e:
++            import torch.distributed as _dist
++            _rank = _dist.get_rank() if _dist.is_initialized() else -1
++            print(
++                f"[LORA_MERGE_DEBUG rank={_rank}] merge failure: "
++                f"base={tuple(base_weight.shape)} linear_in={tuple(linear_in_on_base.shape)} "
++                f"linear_out={tuple(linear_out_on_base.shape)} alpha={alpha} dim={dim} err={e}",
++                flush=True,
++            )
++            raise
+         return merged.to(orig_dtype)
+ 
+     def _merge_canonical_adapter_from_weights(
 diff --git a/src/megatron/bridge/models/hf_pretrained/vlm.py b/src/megatron/bridge/models/hf_pretrained/vlm.py
 index 06c96e57..0a45a2df 100644
 --- a/src/megatron/bridge/models/hf_pretrained/vlm.py

@@ -96,12 +96,11 @@ def list_configs():
     timeout=2 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Download the model to the HF cache volume."""
-    from huggingface_hub import snapshot_download
-
+def prepare_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run the experiment's prepare_model() against the HF cache volume."""
     miles_cfg = get_module(experiment).miles
-    _ = snapshot_download(repo_id=miles_cfg.hf_checkpoint)
+    hf_cache_volume.reload()
+    miles_cfg.prepare_model()
     hf_cache_volume.commit()
 
 
@@ -111,7 +110,7 @@ def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     timeout=2 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+def prepare_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     """Run the prepare_data() to populate the data volume."""
     miles_cfg = get_module(experiment).miles
     data_volume.reload()

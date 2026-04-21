@@ -7,7 +7,7 @@ Thin Modal launcher that runs [Miles](https://github.com/radixark/miles) RL trai
 - Modal CLI installed and authenticated
 - Set your Modal environment: `export MODAL_ENVIRONMENT=<your-env>`
 - Modal secrets:
-  - `huggingface-secret` — required for `download_model` and `prepare_dataset`
+  - `huggingface-secret` — required for `prepare_model` and `prepare_data`
   - `wandb-secret` — required only for experiments with `use_wandb = True`
 
 ## Running an experiment
@@ -20,21 +20,21 @@ All commands take the experiment name via `EXPERIMENT_CONFIG`. Run from the repo
 modal run miles/modal_train.py::list_configs
 ```
 
-### 2. Download model (one-time)
+### 2. Prepare model (one-time)
 
-Downloads the experiment's HF checkpoint to the `huggingface-cache` volume.
+Downloads the experiment's HF checkpoint to the `huggingface-cache` volume and applies any experiment-specific model fixes.
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::download_model
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_model
 ```
 
-### 3. Prepare dataset (one-time)
+### 3. Prepare data (one-time)
 
 Downloads and preprocesses the training dataset to the `miles-data` volume.
 Only required if the experiment defines a `prepare_data()` function (see [Adding an experiment](#adding-an-experiment)).
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_dataset
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_data
 ```
 
 ### 4. Convert checkpoint (one-time, raw mode only)
@@ -131,7 +131,18 @@ miles = _Miles()
 Every attribute on `_Miles` (except `environment`, `async_mode`, `miles_model_script`) is forwarded to
 Miles as a CLI argument: `field_name` → `--field-name`. See `configs/base.py` for full rules.
 
-### 2. Add a `prepare_data()` method (if needed)
+### 2. Add `prepare_model()` / `prepare_data()` methods (if needed)
+
+Override `prepare_model()` if your experiment needs model-specific preparation beyond a plain HF download.
+The base implementation already calls `snapshot_download(self.hf_checkpoint)`.
+
+```python
+class _Miles(MilesConfig):
+    ...
+    def prepare_model(self) -> None:
+        super().prepare_model()
+        # apply model-specific local patches if needed
+```
 
 If your experiment needs to download or preprocess a dataset, override `prepare_data()` on `_Miles`.
 It runs inside the Modal container with the `miles-data` volume mounted at `DATA_PATH`.
@@ -151,15 +162,15 @@ class _Miles(MilesConfig):
         )
 ```
 
-If `prepare_data()` is not overridden, `prepare_dataset` will raise `NotImplementedError` — simply skip that step.
+If `prepare_data()` is not overridden, `prepare_data` will raise `NotImplementedError` — simply skip that step.
 
 ### 3. Run the workflow
 
 `EXPERIMENT_CONFIG` is the config filename without `.py`:
 
 ```bash
-EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::download_model
-EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_dataset  # if prepare_data() defined
+EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_model
+EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_data  # if prepare_data() defined
 EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
 EXPERIMENT_CONFIG=my_experiment modal run -d miles/modal_train.py::train
 ```

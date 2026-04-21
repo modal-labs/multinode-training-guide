@@ -46,7 +46,12 @@ class _Miles(_FullParamMiles):
     lora_dropout = 0.0
     
     # see module docstring for full list
-    target_modules = "q_a_proj,kv_a_proj_with_mqa,o_proj,gate_proj,up_proj,down_proj"
+    target_modules = "q_a_proj,kv_a_proj_with_mqa"#,o_proj,gate_proj,up_proj,down_proj"
+
+    sglang_mem_fraction_static = 0.75
+
+    sglang_lora_backend = "triton"
+    sglang_lora_use_virtual_experts = True
 
     lr = 1e-5
     wandb_group = "kimi-k25-lora"

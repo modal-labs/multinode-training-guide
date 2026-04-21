@@ -1,5 +1,40 @@
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py
+index 82f421ac9..acb5886d1 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16_moe.py
+@@ -331,6 +331,14 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
+                 requires_grad=False,
+             )
+ 
++        # Each `gptq_marlin_moe_repack` / `marlin_moe_permute_scales` below
++        # allocates a fresh Marlin-layout tensor via `torch.empty(...)` before
++        # `replace_tensor` resizes and copies into the existing storage. On
++        # models with many MoE layers, the freed pre-repack blocks stay in the
++        # PyTorch allocator cache across layers and fragment; the next layer's
++        # `torch.empty` then OOMs even though the total free memory fits.
++        # Returning cached blocks to the driver between steps here keeps the
++        # working set bounded to "one repack transient" instead of compounding.
+         marlin_w13_qweight = gptq_marlin_moe_repack(
+             layer.w13_weight_packed,
+             layer.w13_g_idx_sort_indices,
+@@ -339,6 +347,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
+             self.num_bits,
+         )
+         replace_tensor("w13_weight_packed", marlin_w13_qweight)
++        torch.cuda.empty_cache()
+         marlin_w2_qweight = gptq_marlin_moe_repack(
+             layer.w2_weight_packed,
+             layer.w2_g_idx_sort_indices,
+@@ -347,6 +356,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
+             self.num_bits,
+         )
+         replace_tensor("w2_weight_packed", marlin_w2_qweight)
++        torch.cuda.empty_cache()
+         # Repack scales
+         marlin_w13_scales = marlin_moe_permute_scales(
+             layer.w13_weight_scale,
 diff --git a/python/sglang/srt/lora/backend/base_backend.py b/python/sglang/srt/lora/backend/base_backend.py
-index 17b7bef1b..a519bb47e 100644
+index 17b7bef1b..fdcdc590a 100644
 --- a/python/sglang/srt/lora/backend/base_backend.py
 +++ b/python/sglang/srt/lora/backend/base_backend.py
 @@ -19,6 +19,11 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
@@ -14,20 +49,51 @@ index 17b7bef1b..a519bb47e 100644
          self.init_lm_head_config()
  
      def run_lora_a_embedding(
+@@ -176,10 +181,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
+         """
+         base = moe_layer.base_layer
+         top_k = base.top_k
+-        qinfo = moe_layer._quant_info
+-        E, N, _ = qinfo.w13_weight.shape
+-        hidden_dim = qinfo.w2_weight.shape[1]
+-        device = qinfo.w13_weight.device
++        # Derive dims from the base FusedMoE rather than quant-specific tensors,
++        # so this works for any scheme (FP, WNA16, Marlin-packed, etc.).
++        E = base.num_local_experts
++        hidden_dim = base.hidden_size
++        N = 2 * base.intermediate_size_per_partition
++        device = next(base.parameters()).device
+         dtype = compute_dtype
+         num_experts = base.num_experts
+ 
 diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
-index 9fb8aa14d..502ca5bba 100644
+index 9fb8aa14d..4003d444f 100644
 --- a/python/sglang/srt/lora/layers.py
 +++ b/python/sglang/srt/lora/layers.py
-@@ -41,6 +41,8 @@ class BaseLayerWithLoRA(nn.Module):
+@@ -41,6 +41,22 @@ class BaseLayerWithLoRA(nn.Module):
              self.weight = self.base_layer.weight
          if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
              self.bias = self.base_layer.bias
 +        if hasattr(self.base_layer, "reduce_results"):
 +            self.reduce_results = self.base_layer.reduce_results
++        # Alias any other directly-registered parameters of the base layer onto
++        # the wrapper. Without this, `self.base_layer = base_layer` nests params
++        # at `<wrapper_path>.base_layer.<name>`, one level deeper than the
++        # external names SGLang's weight loaders use (e.g.
++        # `experts.w13_weight_packed` for FusedMoE's packed quant params).
++        # Aliasing puts each Parameter on the wrapper directly so
++        # `named_parameters(remove_duplicate=True)` yields it at the outer path
++        # and dedupes the inner copy. The alias is the same tensor object, so
++        # in-place writes (e.g. Marlin repack's resize_/copy_) still hit the
++        # one underlying storage. `weight` / `bias` are already handled above
++        # and `hasattr` skips re-aliasing them.
++        for _name, _param in base_layer.named_parameters(recurse=False):
++            if not hasattr(self, _name):
++                setattr(self, _name, _param)
  
      def forward(self, x: torch.Tensor):
          return self.base_layer.forward(x)
-@@ -200,8 +202,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
+@@ -200,8 +216,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
          ):
              base_output = self.extra_token_embedding(input_, base_output)
  
@@ -39,7 +105,7 @@ index 9fb8aa14d..502ca5bba 100644
              # The backend's run_lora_a_embedding now handles both regular
              # and extra tokens efficiently with CUDA graph support
              base_output = self.apply_lora(base_output, input_, batch_info)
-@@ -361,8 +364,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
+@@ -361,8 +378,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
              hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
          )
  
@@ -50,7 +116,7 @@ index 9fb8aa14d..502ca5bba 100644
              base_output = self.apply_lora(base_output, hidden_states)
  
          return base_output
-@@ -446,7 +449,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -446,7 +463,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
              self.base_layer, input_, bias
          )
  
@@ -59,7 +125,7 @@ index 9fb8aa14d..502ca5bba 100644
              output_parallel = self.apply_lora(output_parallel, input_)
  
          if self.base_layer.gather_output:
-@@ -460,9 +463,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -460,9 +477,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
          return A
  
      def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
@@ -75,7 +141,7 @@ index 9fb8aa14d..502ca5bba 100644
          B = B[start_idx:end_idx, :]
          return B
  
-@@ -510,10 +517,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -510,10 +531,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
  
      def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
          # Since the outputs for both gate and up are identical, we use a random one.
@@ -91,7 +157,7 @@ index 9fb8aa14d..502ca5bba 100644
          return torch.concat(
              (
                  B[start_idx:end_idx, :],
-@@ -577,11 +587,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+@@ -577,11 +601,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
          q_proj_shard_size = base_layer.q_proj_shard_size
          kv_proj_shard_size = base_layer.kv_proj_shard_size
          num_kv_head_replicas = base_layer.num_kv_head_replicas
@@ -108,7 +174,7 @@ index 9fb8aa14d..502ca5bba 100644
          kv_start_idx = kv_proj_shard_size * kv_shard_id
          kv_end_idx = kv_start_idx + kv_proj_shard_size
  
-@@ -657,7 +670,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -657,7 +684,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
              and not skip_all_reduce
          )
  
@@ -119,7 +185,7 @@ index 9fb8aa14d..502ca5bba 100644
              lora_a_output = self.lora_backend.run_lora_a_sgemm(
                  input_parallel, self.A_buffer
              )
-@@ -670,7 +685,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -670,7 +699,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                  base_output=output_,
              )
          else:
@@ -128,7 +194,7 @@ index 9fb8aa14d..502ca5bba 100644
                  output_parallel = self.apply_lora(output_parallel, input_parallel)
              if should_reduce:
                  output_ = tensor_model_parallel_all_reduce(output_parallel)
-@@ -681,9 +696,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+@@ -681,9 +710,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
          return output_, output_bias
  
      def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
@@ -146,7 +212,7 @@ index 9fb8aa14d..502ca5bba 100644
          A = A[:, start_idx:end_idx].contiguous()
          return A
  
-@@ -767,7 +788,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
+@@ -767,7 +802,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
      def forward(self, x: torch.Tensor):
          bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
          output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
@@ -155,7 +221,26 @@ index 9fb8aa14d..502ca5bba 100644
              output = self.apply_lora(output, x)
          output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
          return output, output_bias
-@@ -817,7 +838,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+@@ -801,7 +836,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+ 
+         self.experts_shared_outer_loras: bool = False
+         self.lora_use_virtual_experts: bool = False
++        # Forward `quant_method` / `scheme` so the model's forward path (e.g.
++        # `DeepseekV2MoE.forward_normal_dual_stream` checks
++        # `self.experts.quant_method`) can dispatch correctly. We explicitly do
++        # NOT want quant post-processing iterators (e.g.
++        # `ModelRunner.post_process_weights`) to treat the wrapper as if it
++        # owned packed parameters — those iterators filter out LoRA wrappers
++        # via `isinstance(module, BaseLayerWithLoRA)` and let the inner
++        # `FusedMoE` (yielded separately by `named_modules()`) handle its own
++        # post-processing.
+         self.quant_method = base_layer.quant_method
++        if hasattr(base_layer, "scheme"):
++            self.scheme = base_layer.scheme
+ 
+         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
+         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
+@@ -817,7 +863,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
          from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
          from sglang.srt.layers.moe.utils import get_moe_runner_backend
  
@@ -169,7 +254,7 @@ index 9fb8aa14d..502ca5bba 100644
          global_backend = get_moe_runner_backend()
          if not global_backend.is_auto():
              runner_backend = global_backend
-@@ -826,6 +852,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+@@ -826,6 +877,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
              and base_layer.quant_method.runner is not None
          ):
              runner_backend = base_layer.quant_method.runner.runner_backend
@@ -182,7 +267,7 @@ index 9fb8aa14d..502ca5bba 100644
          else:
              runner_backend = MoeRunnerBackend.TRITON
  
-@@ -919,6 +951,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+@@ -919,6 +976,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
          2. After down projection, before final reduction
          """
  
@@ -195,8 +280,76 @@ index 9fb8aa14d..502ca5bba 100644
          # Build LoRA info for this batch
          lora_info = self._get_lora_info()
  
+@@ -945,6 +1008,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+ 
+         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
+         quant_info = self._quant_info
++        # Refresh `expert_map` from the dispatcher every forward, matching the
++        # non-LoRA `CompressedTensorsWNA16MoE.apply_weights` path. `quant_info`
++        # was captured in `FusedMoEWithLoRA.__init__` before any dispatch had
++        # run, so `dispatcher.local_expert_mapping` was still the lazy `None`
++        # and the field was never populated. Without this, the Marlin runner's
++        # `is_ep = quant_info.expert_map is not None` check incorrectly returns
++        # False under EP, the kernel skips the EP handling, and `expert_ids`
++        # slots left uninitialized by `moe_align_block_size` get dereferenced
++        # as expert indices → MMU fault on `w13_qweight[garbage]`.
++        quant_info.expert_map = getattr(
++            base_layer.dispatcher, "local_expert_mapping", None
++        )
+ 
+         # Run the only lora moe runner (Triton)
+         combine_input = self._lora_runner.run(
+diff --git a/python/sglang/srt/lora/lora_moe_runner_marlin.py b/python/sglang/srt/lora/lora_moe_runner_marlin.py
+index 58ee9ed01..23d01aa47 100644
+--- a/python/sglang/srt/lora/lora_moe_runner_marlin.py
++++ b/python/sglang/srt/lora/lora_moe_runner_marlin.py
+@@ -139,7 +139,6 @@ class MarlinLoraRunnerCore:
+             use_fp32_reduce=True,
+             is_zp_float=False,
+         )
+-
+         # Hook: after gate_up
+         if hooks.after_gate_up:
+             intermediate_cache1_3d = intermediate_cache1.view(M, topk, 2 * N)
+diff --git a/python/sglang/srt/lora/lora_moe_runners.py b/python/sglang/srt/lora/lora_moe_runners.py
+index 983064154..9d82731fe 100644
+--- a/python/sglang/srt/lora/lora_moe_runners.py
++++ b/python/sglang/srt/lora/lora_moe_runners.py
+@@ -313,7 +313,18 @@ def _compute_token_lora_mapping(
+     hidden_states: torch.Tensor,
+     lora_info: LoRAInfo,
+ ) -> torch.Tensor:
+-    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
++    """Map each token to its LoRA adapter index (-1 for no LoRA).
++
++    In DP-attention mode, `hidden_states` at MoE entry is the full gathered
++    batch (this DP rank's tokens plus padding/tokens from other ranks for
++    MLP collective sync). `lora_info.seg_indptr` / `req_to_lora` are built
++    from only the local request tokens (see triton_backend.prepare_lora_batch
++    where seg_indptr[-1] = sum(extend_seq_lens) for THIS rank). For token
++    positions beyond the last local segment, `searchsorted(..., right=True)`
++    returns `bs = len(seg_indptr[1:])` which would overflow `req_to_lora`.
++    Pad with a -1 sentinel so the index stays in bounds; those foreign/padded
++    tokens' LoRA outputs are discarded by the DP-attention scatter anyway.
++    """
+     token_positions = torch.arange(
+         hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
+     )
+@@ -322,7 +333,11 @@ def _compute_token_lora_mapping(
+         token_positions,
+         right=True,
+     )
+-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
++    req_to_lora = lora_info.req_to_lora.to(torch.int32)
++    req_to_lora_padded = torch.cat(
++        [req_to_lora, req_to_lora.new_full((1,), -1)], dim=0
++    )
++    return req_to_lora_padded[req_indices]
+ 
+ 
+ def _compute_lora_alignment(
 diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
-index 34444edfc..d67f359ab 100644
+index 34444edfc..a5f9d2920 100644
 --- a/python/sglang/srt/lora/mem_pool.py
 +++ b/python/sglang/srt/lora/mem_pool.py
 @@ -157,6 +157,66 @@ class LoRAMemoryPool:
@@ -294,6 +447,48 @@ index 34444edfc..d67f359ab 100644
  
          if self.is_moe_module(module_name):
              num_experts = self._get_num_experts(base_model)
+@@ -508,6 +570,10 @@ class LoRAMemoryPool:
+         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+     ):
++        # Mutable holder so the inner closure can see the outer-loop target
++        # module name at the moment it runs. Updated before every call below.
++        _load_ctx = {"name": None, "path": None}
++
+         def load_lora_weight_tensor(
+             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
+         ):
+@@ -518,7 +584,11 @@ class LoRAMemoryPool:
+             else:
+                 assert (
+                     buffer_view.shape == weight.shape
+-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
++                ), (
++                    f"LoRA buffer shape {buffer_view.shape} does not match "
++                    f"weight shape {weight.shape}. "
++                    f"target_module={_load_ctx['name']!r} path={_load_ctx['path']!r}"
++                )
+                 buffer_view.copy_(weight, non_blocking=True)
+ 
+         if uid is None:
+@@ -662,6 +732,8 @@ class LoRAMemoryPool:
+                 c = get_stacked_multiply(name)
+                 max_r = self.max_lora_rank
+                 target_buffer = self.A_buffer[name][layer_id]
++                _load_ctx["name"] = name
++                _load_ctx["path"] = "A_buffer"
+ 
+                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
+                     if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
+@@ -767,6 +839,8 @@ class LoRAMemoryPool:
+ 
+             for name, weights in temp_B_buffer.items():
+                 target_buffer = self.B_buffer[name][layer_id]
++                _load_ctx["name"] = name
++                _load_ctx["path"] = "B_buffer"
+ 
+                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
+                     if self.experts_shared_outer_loras and name == "down_proj_moe":
 diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
 index 9ff683a7e..ca846c1f2 100644
 --- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
@@ -395,3 +590,59 @@ index 9ff683a7e..ca846c1f2 100644
              logger.info(
                  "Start unload Lora adapter. Lora name=%s",
                  obj.lora_name,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 7a68e69c4..d4e9b37c4 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3147,8 +3147,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             if hasattr(self.model, "post_load_weights"):
+                 self.model.post_load_weights()
+ 
++        # LoRA wrappers (e.g. FusedMoEWithLoRA) forward `quant_method` from
++        # their inner base layer so the model's forward path can dispatch
++        # correctly, but the packed quantization parameters themselves
++        # (`w13_weight_packed`, `w13_weight_g_idx`, ...) live on the inner base
++        # layer — not on the wrapper. `named_modules()` yields both, so
++        # invoking quant post-processing on the wrapper would try to read
++        # packed attributes off it and crash. Skip wrappers here; the inner
++        # base is yielded separately and gets processed correctly.
++        from sglang.srt.lora.layers import BaseLayerWithLoRA
++
+         if recv_req.restore_weights_before_load:
+             for _, module in self.model.named_modules():
++                if isinstance(module, BaseLayerWithLoRA):
++                    continue
+                 quant_method = getattr(module, "quant_method", None)
+ 
+                 # Check if the module supports restoring weights
+@@ -3162,6 +3174,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         if recv_req.post_process_quantization:
+             # Iterate through all modules to apply specific post-loading processing
+             for _, module in self.model.named_modules():
++                if isinstance(module, BaseLayerWithLoRA):
++                    continue
+                 quant_method = getattr(module, "quant_method", None)
+ 
+                 # Check if the module supports quantization post-processing
+diff --git a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py b/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+index 08a0c5b50..70aa41a5a 100644
+--- a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
++++ b/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+@@ -321,6 +321,17 @@ class DeepseekV2WeightLoaderMixin:
+                                 # modelopt ckpt contains not needed weights for MTP module:
+                                 # model.decoder.self_attn.attn_mqa.v_scale and
+                                 # model.decoder.self_attn.attn_mqa.k_scale
++                                if not getattr(self, "_miss_logged", False):
++                                    self._miss_logged = True
++                                    sample_expert_keys = [
++                                        k for k in params_dict if "experts.w13" in k or "experts.w2" in k
++                                    ][:5]
++                                    logger.warning(
++                                        f"[NAME_MISS_DEBUG] failed_name={name!r} "
++                                        f"raw_incoming_contains_experts={'experts.' in name} "
++                                        f"total_params={len(params_dict)} "
++                                        f"sample_expert_params_in_dict={sample_expert_keys}"
++                                    )
+                                 logger.warning(f"{name} not found in params_dict.")
+                                 continue
+                             param = params_dict[name]
