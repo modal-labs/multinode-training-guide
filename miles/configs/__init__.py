@@ -2,7 +2,7 @@ import importlib
 from pathlib import Path
 
 _CONFIGS_DIR = Path(__file__).parent
-_SKIP = {"base", "__init__"}
+_SKIP = {"base", "__init__", "model_configuration"}
 
 
 def get_module(name: str):

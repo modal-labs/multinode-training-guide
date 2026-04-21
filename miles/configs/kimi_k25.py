@@ -5,7 +5,10 @@ Run: EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
 
 from pathlib import Path
 
-from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
+from configs.base import ModalConfig, MilesConfig, DATA_PATH
+from configs.model_configuration import KimiK25ModelConfiguration
+
+_KIMI_MODEL = KimiK25ModelConfiguration()
 
 _SGLANG_SYNC_SHA = "1ca33e4e95dda7d5afc9e461fa3924ea2f57e126"
 _MEGATRON_BRIDGE_SHA = "d1232659282474c70e5233fbb6f29a5527f22bb0"
@@ -46,8 +49,9 @@ class _Miles(MilesConfig):
         "OPEN_TRAINING_INT4_GROUP_SIZE": "32",
         # "NCCL_DEBUG": "WARN",
     }
-    hf_checkpoint = "moonshotai/Kimi-K2.5"
-    ref_load = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
+    model_configuration = _KIMI_MODEL
+    hf_checkpoint = _KIMI_MODEL.model_name
+    ref_load = _KIMI_MODEL.model_path
     megatron_to_hf_mode = "bridge"
 
     only_train_params_name_list = ["layers\\.58\\.", "layers\\.59\\.", "layers\\.60\\."]

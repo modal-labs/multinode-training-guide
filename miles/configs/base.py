@@ -27,7 +27,7 @@ CHECKPOINTS_PATH = Path("/checkpoints")
 GPUType = Literal["H100", "H200", "B200", "B300", "A100"]
 
 # Fields on MilesConfig that are NOT Miles CLI args.
-_MILES_SKIP = {"environment", "async_mode", "miles_model_script"}
+_MILES_SKIP = {"environment", "async_mode", "miles_model_script", "model_configuration"}
 
 # MilesConfig fields that Miles reads as YAML files at runtime.
 # Users may set these as inline dicts in Python configs; the launcher

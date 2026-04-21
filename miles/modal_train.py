@@ -107,7 +107,7 @@ RAY_DASHBOARD_PORT = 8265
 @app.local_entrypoint()
 def list_configs():
     """Print all available experiments."""
-    _skip = {"base", "__init__"}
+    _skip = {"base", "__init__", "model_configuration"}
     names = sorted(f.stem for f in _CONFIGS_DIR.glob("*.py") if f.stem not in _skip)
     print("Available experiments:")
     for name in names:
