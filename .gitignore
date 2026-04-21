@@ -196,3 +196,6 @@ slime/configs/qwen3vl_geo3k_vlm_delta_compression.py
 
 # Humanize plugin state
 .humanize/
+
+# Claude Code local state
+.claude/

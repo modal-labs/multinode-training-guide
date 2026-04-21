@@ -43,13 +43,13 @@ Converts the HF checkpoint to `torch_dist` format. Only required when `megatron_
 Skip this step if using bridge mode.
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::convert_checkpoint
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run modal_train.py::convert_checkpoint
 ```
 
 ### 5. Run training
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run -d miles/modal_train.py::train
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run -d modal_train.py::train
 ```
 
 Use `-d` (detached) to keep training running after you close your terminal.
@@ -215,9 +215,13 @@ modal = ModalConfig(
 To inject local patch files into the image (e.g. to patch SGLang), use `patch_files` and `image_run_commands`:
 
 ```python
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+
 modal = ModalConfig(
     gpu="H200",
-    patch_files=["patches/sglang_fix.patch"],
+    patch_files=[str(_HERE.parent / "patches" / "sglang_fix.patch")],
     image_run_commands=["cd /sgl-workspace/sglang && git apply /tmp/sglang_fix.patch"],
 )
 ```

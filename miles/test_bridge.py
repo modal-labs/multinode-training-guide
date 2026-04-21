@@ -1,19 +1,27 @@
 """Quick test: bridge + provider + model construction + mapping validation for K2.5."""
+from pathlib import Path
+
 import modal
 
 app = modal.App("test-k25-bridge")
 checkpoints_volume = modal.Volume.from_name("miles-checkpoints", create_if_missing=False)
+_MILES_DIR = Path(__file__).resolve().parent
+_PATCHES_DIR = _MILES_DIR / "patches"
 
 image = (
     modal.Image.from_registry("radixark/miles:dev")
     .entrypoint([])
     .add_local_dir(
-        "/home/ec2-user/nan_wonderland/miles",
+        str(_MILES_DIR),
         remote_path="/root/miles",
         copy=True,
         ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
     )
-    .add_local_file("patches/megatron_bridge_kimi_vl.patch", "/tmp/megatron_bridge_kimi_vl.patch", copy=True)
+    .add_local_file(
+        str(_PATCHES_DIR / "megatron_bridge_kimi_vl.patch"),
+        "/tmp/megatron_bridge_kimi_vl.patch",
+        copy=True,
+    )
     .run_commands(
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
         "uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@d2ee05178d382414bec006fb94dc415483ec6cda",
