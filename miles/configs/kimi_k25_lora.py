@@ -62,7 +62,7 @@ class _Miles(_FullParamMiles):
     lora_alpha = 32
     lora_dropout = 0.0
 
-    _MOE_LORA_INTERVAL = 2   # 1=every layer, 2=every 2nd, 3=every 3rd, ...
+    _MOE_LORA_INTERVAL = 3   # 1=every layer, 2=every 2nd, 3=every 3rd, ...
     _MOE_LORA_LAYERS = list(range(_MOE_LORA_INTERVAL, 61, _MOE_LORA_INTERVAL))
     target_modules = ",".join(
         # MLA attention — every layer:
@@ -74,12 +74,17 @@ class _Miles(_FullParamMiles):
             for mod in ("linear_fc1", "linear_fc2")
         ]
     )
+    # target_modules = "q_a_proj,kv_a_proj_with_mqa,o_proj,gate_proj,up_proj,down_proj"
     experts_shared_outer_loras = True
 
     sglang_lora_backend = "triton"
     disable_parameter_transpose_cache = True
     sglang_lora_use_virtual_experts = True
     sglang_experts_shared_outer_loras = True
+
+    sglang_mem_fraction_static = 0.65
+    sglang_chunked_prefill_size = 4096
+    sglang_max_prefill_tokens = 8192
 
     lr = 1e-5
     wandb_group = "kimi-k25-lora"
