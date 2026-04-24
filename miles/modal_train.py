@@ -23,9 +23,7 @@ miles_cfg = exp_mod.miles if exp_mod else None
 MILES_ROOT = "/root/miles"
 
 image = (
-    modal.Image.from_registry(
-        "radixark/miles:dev-202604201238"
-    )
+    modal.Image.from_registry("radixark/miles:dev-202604221234")
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
     .add_local_python_source("modal_helpers", copy=True)

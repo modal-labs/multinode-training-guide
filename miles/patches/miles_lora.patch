@@ -1,354 +1,5 @@
-diff --git a/.github/CODEOWNERS b/.github/CODEOWNERS
-index fade5e455..b91331c93 100644
---- a/.github/CODEOWNERS
-+++ b/.github/CODEOWNERS
-@@ -6,6 +6,6 @@
- /miles/backends/sglang_utils/ @fzyzcjy @yueming-yuan @maocheng23 @yushengsu-thu
- /miles/ray/ @fzyzcjy @yueming-yuan @maocheng23
- /miles/rollout/ @fzyzcjy @yueming-yuan @guapisolo
--/miles/rollout/session/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23
-+/miles/rollout/session/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23 @jybsuper
- /miles/router/ @fzyzcjy @yueming-yuan @guapisolo
--/miles/utils/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23
-+/miles/utils/ @fzyzcjy @yueming-yuan @guapisolo @maocheng23 @jybsuper
-diff --git a/examples/lora/dev.sh b/examples/lora/dev.sh
-new file mode 100644
-index 000000000..cd6e4da3d
---- /dev/null
-+++ b/examples/lora/dev.sh
-@@ -0,0 +1,158 @@
-+#!/bin/bash
-+export FLASHINFER_DISABLE_VERSION_CHECK=1
-+export GPUS_PER_NODE=1
-+# will prevent ray from buffering stdout/stderr
-+export PYTHONBUFFERED=1
-+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-+
-+# for rerun the task
-+pkill sglang
-+ray stop --force
-+sleep 5 # Wait for processes to terminate gracefully
-+# Force kill any remaining processes.
-+# Note: `pkill -9 python` is broad and can be risky.
-+pkill -9 sglang
-+pkill -9 ray
-+pkill -9 python
-+
-+set -ex
-+
-+
-+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-+source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-3B.sh"
-+
-+CKPT_ARGS=(
-+   --hf-checkpoint /root/Qwen2.5-3B-Instruct/
-+   --megatron-to-hf-mode bridge
-+)
-+
-+LORA_ARGS=(
-+   --lora-rank 32                    # LoRA rank (typical values: 8, 16, 32, 64)
-+   --lora-alpha 32                   # LoRA alpha (usually 2x rank)
-+   --lora-dropout 0.0                # LoRA dropout (0.0 for RL training)
-+   --target-modules "all-linear"
-+   --megatron-to-hf-mode bridge
-+)
-+
-+ROLLOUT_ARGS=(
-+   --prompt-data /root/gsm8k/train.parquet
-+   --input-key messages
-+   --label-key label
-+   --apply-chat-template
-+   --rollout-shuffle
-+   --rm-type math
-+   --num-rollout 5
-+   # --num-rollout 31 # only train 30 stesp
-+   # --rollout-batch-size 32
-+   --rollout-batch-size 16 # for testing 
-+   --n-samples-per-prompt 8
-+   --rollout-max-response-len 1024
-+   --rollout-temperature 1
-+
-+   # --global-batch-size 256
-+   --global-batch-size 32 # for testing
-+)
-+
-+EVAL_ARGS=(
-+   # --eval-interval 20
-+   --eval-interval 10
-+   --eval-prompt-data gsm8k /root/gsm8k/test.parquet
-+   --n-samples-per-eval-prompt 1
-+   --eval-max-response-len 1024
-+   --eval-top-k 1
-+)
-+
-+PERF_ARGS=(
-+   --tensor-model-parallel-size 1
-+   --sequence-parallel
-+   --pipeline-model-parallel-size 1
-+   --context-parallel-size 1
-+   --expert-model-parallel-size 1
-+   --expert-tensor-parallel-size 1
-+
-+   --use-dynamic-batch-size
-+   --max-tokens-per-gpu 4096
-+)
-+
-+GRPO_ARGS=(
-+   --advantage-estimator grpo
-+   # --use-kl-loss # if use kl loss, should use --ref-load
-+   --kl-loss-coef 0.00
-+   --kl-loss-type low_var_kl
-+   --kl-coef 0.00
-+   --entropy-coef 0.00
-+   --eps-clip 0.2
-+   --eps-clip-high 0.28
-+)
-+
-+OPTIMIZER_ARGS=(
-+   --optimizer adam
-+   # --lr 1e-6
-+   --lr 1e-5                         # Higher LR often works better for LoRA
-+   --lr-decay-style constant
-+   --weight-decay 0.1
-+   --adam-beta1 0.9
-+   --adam-beta2 0.98
-+)
-+
-+WANDB_ARGS=(
-+   # --use-wandb
-+   --wandb-host https://wandb.ai/
-+   --wandb-project miles-lora-update-weight-refactory
-+   --wandb-group qwen2.5-3B-lora-benchmark
-+)
-+
-+
-+SGLANG_ARGS=(
-+   --rollout-num-gpus-per-engine 1
-+   # --sglang-mem-fraction-static 0.7
-+   --sglang-mem-fraction-static 0.2
-+
-+   # --sglang-enable-deterministic-inference
-+   # --sglang-attention-backend flashinfer
-+   # --deterministic-mode
-+)
-+
-+MISC_ARGS=(
-+   # default dropout in megatron is 0.1
-+   --attention-dropout 0.0
-+   --hidden-dropout 0.0
-+   # should be good for model performance
-+   --accumulate-allreduce-grads-in-fp32
-+   --attention-softmax-in-fp32
-+   # need to comment this when using model with MLA
-+   --attention-backend flash
-+)
-+
-+
-+# launch the master node of ray in container
-+ray start --head --node-ip-address 127.0.0.1 --num-gpus $GPUS_PER_NODE --disable-usage-stats
-+# ray start --head --node-ip-address 127.0.0.1 --num-gpus 1 --disable-usage-stats
-+
-+ray job submit --address="http://127.0.0.1:8265" \
-+   --runtime-env-json='{
-+     "env_vars": {
-+        "PYTHONPATH": "/root/Megatron-LM",
-+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-+        "NCCL_ALGO": "Ring",
-+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8"
-+     }
-+   }' \
-+   -- python3 train.py \
-+   --actor-num-nodes 1 \
-+   --actor-num-gpus-per-node $GPUS_PER_NODE \
-+   --colocate \
-+   --calculate-per-token-loss \
-+   --use-miles-router \
-+   ${MODEL_ARGS[@]} \
-+   ${CKPT_ARGS[@]} \
-+   ${LORA_ARGS[@]} \
-+   ${OPTIMIZER_ARGS[@]} \
-+   ${GRPO_ARGS[@]} \
-+   ${WANDB_ARGS[@]} \
-+   ${PERF_ARGS[@]} \
-+   ${EVAL_ARGS[@]} \
-+   ${SGLANG_ARGS[@]} \
-+   ${MISC_ARGS[@]} \
-+   ${ROLLOUT_ARGS[@]}
-\ No newline at end of file
-diff --git a/examples/lora/run-gpt-oss-20B-megatron-moe-lora.sh b/examples/lora/run-gpt-oss-20B-megatron-moe-lora.sh
-new file mode 100644
-index 000000000..f349f2922
---- /dev/null
-+++ b/examples/lora/run-gpt-oss-20B-megatron-moe-lora.sh
-@@ -0,0 +1,164 @@
-+pkill -9 sglang
-+sleep 3
-+ray stop --force
-+pkill -9 ray
-+pkill -9 python
-+sleep 3
-+pkill -9 ray
-+pkill -9 python
-+
-+set -ex
-+
-+# will prevent ray from buffering stdout/stderr
-+export PYTHONBUFFERED=16
-+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
-+GPUS_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
-+
-+# Load model architecture config
-+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-+source "${SCRIPT_DIR}/../../scripts/models/gpt-oss-20b.sh"
-+
-+CKPT_ARGS=(
-+   --hf-checkpoint /root/models/gpt-oss-20b
-+   --megatron-to-hf-mode bridge
-+   # --save $BASE_DIR/gpt-oss-20b-BF16
-+   # --save-interval 50
-+)
-+
-+LORA_ARGS=(
-+   --lora-rank 32                    # LoRA rank (typical values: 8, 16, 32, 64)
-+   --lora-alpha 32                   # LoRA alpha (usually 2x rank)
-+   --lora-dropout 0.0                # LoRA dropout (0.0 for RL training)
-+   --target-modules "gate_proj,up_proj,down_proj"
-+   --sglang-lora-backend triton      # !!! must for moe-lora !!!, else display "Current LoRA backend does not support LoRA on MoE layers; skipping MoE layer"
-+)
-+
-+ROLLOUT_ARGS=(
-+   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
-+   --input-key prompt
-+   --label-key label
-+   --apply-chat-template
-+   --rollout-shuffle
-+   --rm-type math
-+   --num-rollout 1
-+   --rollout-batch-size 32
-+   --n-samples-per-prompt 8
-+   --rollout-max-response-len 4096
-+   --rollout-temperature 1.0
-+
-+   --global-batch-size 8
-+)
-+
-+EVAL_ARGS=(
-+   --eval-interval 10
-+   --eval-prompt-data gsm8k /root/gsm8k/test.parquet
-+   --eval-input-key messages
-+   --n-samples-per-eval-prompt 1
-+   --eval-max-response-len 4096
-+   --eval-top-k 1
-+)
-+
-+PERF_ARGS=(
-+   # Parallelism: TP=4, EP=1, PP=1, CP=1
-+   --tensor-model-parallel-size 4
-+   --sequence-parallel
-+   --pipeline-model-parallel-size 1
-+   --context-parallel-size 1
-+   --expert-model-parallel-size 1
-+   --expert-tensor-parallel-size 1
-+
-+   # Recomputation: full recompute needed to fit optimizer states in 80GB
-+   --recompute-granularity full
-+   --recompute-method uniform
-+   --recompute-num-layers 1
-+
-+   # Batch size settings
-+   # Note: --use-dynamic-batch-size is not supported with --qkv-format bshd
-+   --micro-batch-size 1
-+   --max-tokens-per-gpu 4096
-+)
-+
-+GRPO_ARGS=(
-+   --advantage-estimator grpo
-+   # TODO: need gpt oss ckpt conversion.
-+   # --use-kl-loss
-+   # --kl-loss-coef 0.00
-+   # --kl-loss-type low_var_kl
-+   # --kl-coef 0.00
-+   --entropy-coef 0.00
-+   --eps-clip 0.2
-+   --eps-clip-high 0.28
-+)
-+
-+OPTIMIZER_ARGS=(
-+   --optimizer adam
-+   --lr 1e-5
-+   --lr-decay-style constant
-+   --weight-decay 0.1
-+   --adam-beta1 0.9
-+   --adam-beta2 0.98
-+   # CPU offload optimizer states (fp32 master weights + Adam moments) to free ~30GB GPU memory
-+   --optimizer-cpu-offload
-+   --overlap-cpu-optimizer-d2h-h2d
-+   --use-precision-aware-optimizer
-+)
-+
-+SGLANG_ARGS=(
-+   # TP size for sglang inference engine
-+   --rollout-num-gpus-per-engine 4
-+   --sglang-dtype bfloat16
-+   --sglang-decode-log-interval 1000
-+   --sglang-mem-fraction-static 0.2
-+   # Note: need to use bf16 ckpt when enable triton moe backend, eg, lmsys/gpt-oss-20b-bf16
-+   # mxfp4 currently not supported
-+   --sglang-moe-runner-backend triton
-+)
-+
-+WANDB_ARGS=(
-+   --use-wandb
-+   --wandb-project miles-gpt-oss
-+   --wandb-group "gpt-oss-20b-moe-lora"
-+)
-+
-+MISC_ARGS=(
-+   # default dropout in megatron is 0.1
-+   --attention-dropout 0.0
-+   --hidden-dropout 0.0
-+   # Sink attention (sliding window + learnable softmax) in TE only supports BSHD/SBHD, not THD.
-+   # Must use --qkv-format bshd for the fused backend to work with this model's attention pattern.
-+   --qkv-format bshd
-+   --attention-backend fused
-+   --update-weight-buffer-size 536870912 # 512MB
-+)
-+
-+
-+# launch the master node of ray in container
-+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus $GPUS_PER_NODE --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
-+
-+# Build the runtime environment JSON with proper variable substitution
-+RUNTIME_ENV_JSON="{
-+  \"env_vars\": {
-+    \"PYTHONPATH\": \"/root/Megatron-LM/\",
-+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
-+  }
-+}"
-+
-+ray job submit --address="http://127.0.0.1:8265" \
-+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-+   -- python3 train.py \
-+   --actor-num-nodes 1 \
-+   --actor-num-gpus-per-node $GPUS_PER_NODE \
-+   --colocate \
-+   ${MODEL_ARGS[@]} \
-+   ${LORA_ARGS[@]} \
-+   ${CKPT_ARGS[@]} \
-+   ${ROLLOUT_ARGS[@]} \
-+   ${OPTIMIZER_ARGS[@]} \
-+   ${GRPO_ARGS[@]} \
-+   ${WANDB_ARGS[@]} \
-+   ${PERF_ARGS[@]} \
-+   ${EVAL_ARGS[@]} \
-+   ${SGLANG_ARGS[@]} \
-+   ${MISC_ARGS[@]}
-\ No newline at end of file
 diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
-index 2cfd373f4..0f7b3d67a 100644
+index 1b9c64eb9..0f7b3d67a 100644
 --- a/miles/backends/megatron_utils/actor.py
 +++ b/miles/backends/megatron_utils/actor.py
 @@ -170,7 +170,10 @@ class MegatronTrainRayActor(TrainRayActor):
@@ -363,66 +14,23 @@ index 2cfd373f4..0f7b3d67a 100644
              is_lora=is_lora_enabled(args),
          )
  
-@@ -201,7 +204,8 @@ class MegatronTrainRayActor(TrainRayActor):
-         print_memory("before offload model")
-         destroy_process_groups()
- 
--        torch_memory_saver.pause()
-+        tag = "default" if is_lora_enabled(self.args) else None
-+        torch_memory_saver.pause(tag=tag)
- 
-         print_memory("after offload model")
- 
-@@ -213,7 +217,8 @@ class MegatronTrainRayActor(TrainRayActor):
-         assert self.args.offload_train
-         print_memory("before wake_up model")
- 
--        torch_memory_saver.resume()
-+        tag = "default" if is_lora_enabled(self.args) else None
-+        torch_memory_saver.resume(tag=tag)
- 
-         clear_memory()
-         reload_process_groups()
-@@ -520,13 +525,6 @@ class MegatronTrainRayActor(TrainRayActor):
-             if dist.get_rank() == 0:
-                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
- 
--        if self.args.offload_train and is_lora_enabled(self.args):
--            # For LoRA, we must resume() to restore GPU memory backing for adapter
--            # weights. Unlike base model weights (which are read from CPU backups),
--            # LoRA adapter weights are accessed directly from GPU model parameters.
--            # The disable() context alone only prevents new allocations from being
--            # tracked -- it does NOT restore previously paused/offloaded tensors.
--            torch_memory_saver.resume()
-         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-             print_memory("before update_weights")
-             self.weight_updater.update_weights()
-@@ -552,8 +550,6 @@ class MegatronTrainRayActor(TrainRayActor):
-                     self.weights_backuper.backup("old_actor")
- 
-         if self.args.offload_train:
--            if is_lora_enabled(self.args):
--                torch_memory_saver.pause()
-             destroy_process_groups()
- 
-     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
 diff --git a/miles/backends/megatron_utils/bridge_lora_helpers.py b/miles/backends/megatron_utils/bridge_lora_helpers.py
-index 5244faa35..c7c4ec3d6 100644
+index 1aa4293e1..e69602420 100644
 --- a/miles/backends/megatron_utils/bridge_lora_helpers.py
 +++ b/miles/backends/megatron_utils/bridge_lora_helpers.py
-@@ -11,7 +11,7 @@ from dataclasses import dataclass
- 
- from megatron.core.utils import get_attr_wrapped_model
- 
--from .lora_utils import create_lora_instance
-+from .lora_utils import create_lora_instance, patch_param_grad_buffer_for_colocate_mode_lora
- 
- 
- @dataclass
-@@ -96,6 +96,10 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
+@@ -96,6 +96,19 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
      provider.variable_seq_lengths = True
      provider.moe_token_dispatcher_type = "alltoall"
      provider.moe_router_load_balancing_type = "none"
++    # Not a Megatron CLI arg (listed under "no CLI argument exists" in
++    # ``megatron/training/arguments.py``) — must be set directly on the
++    # provider. Defaults to False (Megatron-Core default); set True to skip
++    # TE's per-module transposed-weight cache. Useful under INT4 fake-QAT
++    # where every forward produces a fresh dequantized bf16 weight and the
++    # cache can pin stale dequants in memory; trade a small per-step
++    # transpose recompute for the memory.
++    if getattr(args, "disable_parameter_transpose_cache", False):
++        provider.disable_parameter_transpose_cache = True
 +    if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
 +        provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
 +    if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
@@ -430,17 +38,14 @@ index 5244faa35..c7c4ec3d6 100644
      provider.finalize()
  
      lora = create_lora_instance(args)
-@@ -118,5 +122,8 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
-     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
-     ddp_config.finalize()
+@@ -122,4 +135,5 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
+         patch_param_grad_buffer_for_colocate_mode_lora()
  
-+    if args.offload_train:
-+        patch_param_grad_buffer_for_colocate_mode_lora()
-+
      model = provider.provide_distributed_model(wrap_with_ddp=True, ddp_config=ddp_config)
++
      return model
 diff --git a/miles/backends/megatron_utils/lora_utils.py b/miles/backends/megatron_utils/lora_utils.py
-index c935c8b5b..776f319dd 100644
+index 2c48c08fd..823f3f8ad 100644
 --- a/miles/backends/megatron_utils/lora_utils.py
 +++ b/miles/backends/megatron_utils/lora_utils.py
 @@ -73,6 +73,19 @@ _MEGATRON_TO_HF_MODULES = {
@@ -463,48 +68,7 @@ index c935c8b5b..776f319dd 100644
  
  # ---------------------------------------------------------------------------
  # Core helpers
-@@ -105,6 +118,40 @@ def _is_adapter_param_name(name: str) -> bool:
-     return "lora_" in name or (".adapter." in name and ("linear_in" in name or "linear_out" in name))
- 
- 
-+_param_grad_buffer_patched = False
-+
-+
-+def patch_param_grad_buffer_for_colocate_mode_lora() -> None:
-+    """Patch _ParamAndGradBuffer to use disable_param_buffers_cpu_backup=True.
-+
-+    In colocate mode with offload_train, torch_memory_saver.pause(tag="default")
-+    offloads default-region GPU memory.  During LoRA training, base weights are
-+    frozen (requires_grad=False) so DDP only creates buffers for adapter params.
-+
-+    This patch ensures those buffers are allocated in the "param_buffer" region
-+    (enable_cpu_backup=False), making them invisible to pause(tag="default") —
-+    eliminating the need for resume()/pause() around update_weights.
-+
-+    The patch is idempotent and only takes effect once.
-+    """
-+    global _param_grad_buffer_patched
-+    if _param_grad_buffer_patched:
-+        return
-+    _param_grad_buffer_patched = True
-+
-+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
-+
-+    _original_init = _ParamAndGradBuffer.__init__
-+
-+    def _patched_init(self, *args, **kwargs):
-+        kwargs["disable_param_buffers_cpu_backup"] = True
-+        kwargs["disable_grad_buffers_cpu_backup"] = True
-+        _original_init(self, *args, **kwargs)
-+
-+    _ParamAndGradBuffer.__init__ = _patched_init
-+    logger.info("Patched _ParamAndGradBuffer.__init__ for LoRA colocate mode (disable cpu backup)")
-+
-+
- # ---------------------------------------------------------------------------
- # Module name conversion
- # ---------------------------------------------------------------------------
-@@ -148,14 +195,20 @@ def convert_target_modules_to_megatron(
+@@ -182,14 +195,20 @@ def convert_target_modules_to_megatron(
          if hf_modules[0] in ("all", "all-linear", "all_linear"):
              return list(all_modules)
  
@@ -529,26 +93,49 @@ index c935c8b5b..776f319dd 100644
          if megatron_name not in megatron_modules:
              megatron_modules.append(megatron_name)
  
-@@ -171,16 +224,41 @@ def convert_target_modules_to_hf(megatron_modules: list[str]) -> list[str]:
+@@ -205,14 +224,60 @@ def convert_target_modules_to_hf(megatron_modules: list[str]) -> list[str]:
      Megatron canonical:  linear_q, linear_k, linear_v, linear_proj,
                           linear_fc1_up, linear_fc1_gate, linear_fc2
      HF:                  q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 +    Kimi MLA Megatron:   linear_q_down_proj -> q_a_proj, linear_kv_down_proj -> kv_a_proj_with_mqa, ...
++
++    Wildcard patterns (e.g. ``*.layers.2.mlp.experts.linear_fc1``) have their
++    last dotted segment extracted and mapped to HF leaf names; the layer-
++    scoping information is dropped. Rationale: SGLang consumes this list to
++    decide which adapter-buffer TYPES to allocate (``gate_proj``/``up_proj``
++    /``down_proj``/...). It does not scope by layer — per-layer LoRA
++    enablement is enforced on the training side by Megatron-Bridge's
++    :class:`ModuleMatcher`. If we passed wildcards through verbatim, SGLang
++    would fail to allocate MoE LoRA buffers when the config only has
++    wildcards (no plain HF names) for MoE modules.
      """
 +    if isinstance(megatron_modules, tuple):
 +        megatron_modules = list(megatron_modules)
      hf_modules: list[str] = []
      for module in megatron_modules:
 -        if module in _MEGATRON_TO_HF_MODULES:
-+        if module in _MEGATRON_MLA_TO_HF:
-+            hf_modules.append(_MEGATRON_MLA_TO_HF[module])
-+        elif module in _MEGATRON_TO_HF_MODULES:
-             hf_modules.extend(_MEGATRON_TO_HF_MODULES[module])
+-            hf_modules.extend(_MEGATRON_TO_HF_MODULES[module])
++        # Wildcards: extract the last path segment so lookups hit the map
++        # tables. Non-wildcards go through as-is.
++        lookup_key = module.rsplit(".", 1)[-1] if "*" in module else module
++        if lookup_key in _MEGATRON_MLA_TO_HF:
++            hf_modules.append(_MEGATRON_MLA_TO_HF[lookup_key])
++        elif lookup_key in _MEGATRON_TO_HF_MODULES:
++            hf_modules.extend(_MEGATRON_TO_HF_MODULES[lookup_key])
          else:
++            # Unknown wildcard tail or already-HF name — pass through as-is.
              hf_modules.append(module)
-     return hf_modules
- 
- 
+-    return hf_modules
++    # Dedup preserving order.
++    seen: set[str] = set()
++    unique: list[str] = []
++    for m in hf_modules:
++        if m not in seen:
++            seen.add(m)
++            unique.append(m)
++    return unique
++
++
 +def target_modules_hf_for_sglang_rollout(args: Namespace) -> list[str]:
 +    """HF-style target_modules for SGLang LoRA init / sync (after Megatron→HF name map).
 +
@@ -567,12 +154,32 @@ index c935c8b5b..776f319dd 100644
 +            sorted(dropped),
 +        )
 +    return out
-+
-+
+ 
+ 
  # ---------------------------------------------------------------------------
- # Model setup helpers (used by model.py)
- # ---------------------------------------------------------------------------
-@@ -457,7 +535,7 @@ def _load_training_state(
+@@ -252,7 +317,7 @@ def create_lora_instance(args: Namespace):
+     target_modules = convert_target_modules_to_megatron(args.target_modules, lora_type=lora_cls)
+     exclude_modules = parse_exclude_modules(args, lora_type=lora_cls)
+ 
+-    lora = lora_cls(
++    lora_kwargs = dict(
+         target_modules=target_modules,
+         exclude_modules=exclude_modules,
+         dim=args.lora_rank,
+@@ -261,6 +326,12 @@ def create_lora_instance(args: Namespace):
+         lora_A_init_method=getattr(args, "lora_A_init_method", "xavier"),
+         lora_B_init_method=getattr(args, "lora_B_init_method", "zero"),
+     )
++    # Opt-in to SGLang PR #21466's shared-outer grouped-expert LoRA. Only the
++    # standard ``LoRA`` class supports the flag today.
++    if lora_cls is LoRA and getattr(args, "experts_shared_outer_loras", False):
++        lora_kwargs["experts_shared_outer_loras"] = True
++
++    lora = lora_cls(**lora_kwargs)
+ 
+     logger.info(
+         f"Created {lora_cls.__name__}: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+@@ -491,7 +562,7 @@ def _load_training_state(
  def build_lora_sync_config(args: Namespace) -> dict[str, Any]:
      """Build LoRA config dict for syncing weights to SGLang engines."""
      target_modules_hf = (
@@ -863,11 +470,20 @@ index ca69df8e6..76bd7295a 100644
          qweight_name = name.replace(".weight", ".weight_packed")
          scale_name = name.replace(".weight", ".weight_scale")
 diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
-index c7ca14b48..21b6cce96 100644
+index a9be3696d..557b17ac9 100644
 --- a/miles/backends/megatron_utils/model.py
 +++ b/miles/backends/megatron_utils/model.py
-@@ -39,7 +39,7 @@ from .ci_utils import (
- from .fp32_param_utils import enforce_marked_param_dtypes
+@@ -22,6 +22,8 @@ from megatron.training.global_vars import get_args
+ from megatron.training.training import get_model
+ 
+ from miles.utils.dumper_utils import DumperMegatronUtil, DumperPhase
++from miles.utils.memory_profile import dump_memory_snapshot, enable_memory_history
++from miles.utils.memory_probe import log_memory, scope as mem_scope
+ from miles.utils.memory_utils import clear_memory
+ 
+ from ..training_utils.ci_utils import check_grad_norm, check_kl
+@@ -38,7 +40,7 @@ from .ci_utils import (
+ )
  from .initialize import is_megatron_main_rank
  from .lora_utils import is_lora_enabled, is_lora_model
 -from .model_provider import get_model_provider_func
@@ -875,7 +491,7 @@ index c7ca14b48..21b6cce96 100644
  from .parallel import get_packed_seq_params
  
  logger = logging.getLogger(__name__)
-@@ -123,8 +123,12 @@ def setup_model_and_optimizer(
+@@ -122,8 +124,12 @@ def setup_model_and_optimizer(
  
      if is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
          model = _setup_lora_model_via_bridge(args)
@@ -887,10 +503,49 @@ index c7ca14b48..21b6cce96 100644
 +            ModelType.encoder_or_decoder,
 +        )
  
-     # Apply parameter-level dtype overrides declared in model definitions.
-     enforce_marked_param_dtypes(model)
+     # Optimizer
+     kwargs = {}
+@@ -438,16 +444,28 @@ def train_one_step(
+ 
+     # Forward pass.
+     forward_backward_func = get_forward_backward_func()
+-    losses_reduced = forward_backward_func(
+-        forward_step_func=forward_step,
+-        data_iterator=data_iterator,
+-        model=model,
+-        num_microbatches=num_microbatches,
+-        seq_length=args.seq_length,
+-        micro_batch_size=args.micro_batch_size,
+-        decoder_seq_length=args.decoder_seq_length,
+-        forward_only=False,
+-    )
++    # Start recording the CUDA allocator history on the first step so an OOM
++    # in fwd/bwd can dump a full timeline. Enable by setting
++    # ``MILES_MEMORY_PROFILE_DIR``; no-op otherwise.
++    enable_memory_history()
++    log_memory(f"train_step_enter rollout={rollout_id} step={step_id}")
++    try:
++        with mem_scope(f"forward_backward rollout={rollout_id} step={step_id}"):
++            losses_reduced = forward_backward_func(
++                forward_step_func=forward_step,
++                data_iterator=data_iterator,
++                model=model,
++                num_microbatches=num_microbatches,
++                seq_length=args.seq_length,
++                micro_batch_size=args.micro_batch_size,
++                decoder_seq_length=args.decoder_seq_length,
++                forward_only=False,
++            )
++    except torch.cuda.OutOfMemoryError:
++        log_memory(f"train_step_oom rollout={rollout_id} step={step_id}")
++        dump_memory_snapshot(f"train_oom_rollout{rollout_id}_step{step_id}")
++        raise
++    log_memory(f"train_step_fwdbwd_done rollout={rollout_id} step={step_id}")
+ 
+     valid_step = True
+     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
 diff --git a/miles/backends/megatron_utils/model_provider.py b/miles/backends/megatron_utils/model_provider.py
-index 45adc8679..4eebe7687 100644
+index 45adc8679..670c294ec 100644
 --- a/miles/backends/megatron_utils/model_provider.py
 +++ b/miles/backends/megatron_utils/model_provider.py
 @@ -2,6 +2,7 @@
@@ -901,7 +556,22 @@ index 45adc8679..4eebe7687 100644
  from contextlib import nullcontext
  from typing import Literal
  
-@@ -248,3 +249,48 @@ def get_model_provider_func(
+@@ -100,6 +101,14 @@ def get_model_provider_func(
+         provider.context_parallel_size = args.context_parallel_size
+         provider.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
+         provider.variable_seq_lengths = args.variable_seq_lengths
++        # Not a Megatron CLI arg (listed under "no CLI argument exists" in
++        # ``megatron/training/arguments.py``) — must be set directly here.
++        # Off by default; opt-in via miles ``--disable-parameter-transpose-cache``
++        # or the matching config field. Primary use case: INT4 fake-QAT, where
++        # every forward produces a fresh dequant and the cache can pin stale
++        # tensors in memory.
++        if getattr(args, "disable_parameter_transpose_cache", False):
++            provider.disable_parameter_transpose_cache = True
+         if hasattr(args, "moe_token_dispatcher_type"):
+             provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
+         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
+@@ -248,3 +257,48 @@ def get_model_provider_func(
          return model
  
      return model_provider
@@ -972,83 +642,11 @@ index c61f26487..ffa91e6de 100644
              match = re.match(decoder_layers_pattern, name)
              if not match:
                  yield name, buffer
-diff --git a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_base.py b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_base.py
-index 93059e8e9..c152bffbf 100644
---- a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_base.py
-+++ b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_base.py
-@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
- 
- class HfWeightIteratorBase(ABC):
-     @staticmethod
--    def create(args, model, *, is_lora=False, **kwargs):
-+    def create(args, model, **kwargs):
-         from .hf_weight_iterator_bridge import HfWeightIteratorBridge
-         from .hf_weight_iterator_direct import HfWeightIteratorDirect
- 
-@@ -12,17 +12,16 @@ class HfWeightIteratorBase(ABC):
-             "bridge": HfWeightIteratorBridge,
-         }[args.megatron_to_hf_mode]
- 
--        return c(args, model, is_lora=is_lora, **kwargs)
-+        return c(args, model, **kwargs)
- 
--    def __init__(self, args, model, model_name, quantization_config, *, is_lora=False):
-+    def __init__(self, args, model, model_name, quantization_config, **kwargs):
-         self.args = args
-         self.model = model
-         self.model_name = model_name
-         self.quantization_config = quantization_config
--        self.is_lora = is_lora
- 
-     @abstractmethod
--    def get_hf_weight_chunks(self, megatron_local_weights):
-+    def get_hf_weight_chunks(self, megatron_local_weights, weight_type="base"):
-         """
-         Mental model of the API:
-         megatron_model.to_hf_magically().named_parameters()
 diff --git a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
-index aa6d2b730..8a24600bf 100644
+index 10c3c8fb6..8a24600bf 100644
 --- a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
 +++ b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
-@@ -1,5 +1,6 @@
- import dataclasses
- 
-+from miles.backends.megatron_utils.lora_utils import is_lora_weight_name
- from miles.utils import megatron_bridge_utils
- from miles.utils.iter_utils import chunk_named_params_by_size
- 
-@@ -18,17 +19,17 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
- 
-         self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
- 
--    def get_hf_weight_chunks(self, megatron_local_weights):
-+    def get_hf_weight_chunks(self, megatron_local_weights, weight_type: str = "base"):
-         # TODO: support quantization (e.g. modify megatron-bridge to provide megatron param name)
-         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
-         with megatron_bridge_utils.patch_megatron_model(self.model):
--            if self.is_lora:
-+            if weight_type == "lora":
-                 named_weights = self._bridge.export_adapter_weights(
-                     self.model,
-                     cpu=False,
-                     show_progress=False,
-                 )
--            else:
-+            elif weight_type == "base":
-                 conversion_tasks = self._bridge.get_conversion_tasks(self.model)
-                 conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
-                 named_weights = self._bridge.export_hf_weights(
-@@ -51,11 +52,18 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
-                 for hf_param_name, weight, megatron_param_name in named_weights
-             )
- 
-+            if weight_type == "base":
-+                named_weights = ((n, t) for n, t in named_weights if not is_lora_weight_name(n))
-+            elif weight_type == "lora":
-+                named_weights = ((n, t) for n, t in named_weights if is_lora_weight_name(n))
-+
-             yield from chunk_named_params_by_size(named_weights, chunk_size=self.args.update_weight_buffer_size)
- 
+@@ -62,6 +62,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
  
  def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
      def _handle_one(task):
@@ -1057,225 +655,227 @@ index aa6d2b730..8a24600bf 100644
          if task.param_weight is None:
              return task
  
-diff --git a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py
-index ecdba3c8c..4e97d6c30 100644
---- a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py
-+++ b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py
-@@ -21,7 +21,7 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
-         super().__init__(*args, **kwargs)
-         self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
- 
--    def get_hf_weight_chunks(self, megatron_local_weights):
-+    def get_hf_weight_chunks(self, megatron_local_weights, weight_type="base"):
-         rank = dist.get_rank()
- 
-         for megatron_local_param_infos in tqdm(
 diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
-index 86073d5ab..6397d2b28 100644
+index e045b5f27..86469053b 100644
 --- a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
 +++ b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
-@@ -54,8 +54,6 @@ class UpdateWeightFromTensor:
-         self.quantization_config = quantization_config
-         self.weight_version = 0
-         self.is_lora = is_lora
--        self._lora_loaded = False
--
-         self._hf_weight_iterator = HfWeightIteratorBase.create(
-             args=args,
-             model=model,
-@@ -63,8 +61,11 @@ class UpdateWeightFromTensor:
-             quantization_config=quantization_config,
-             is_lora=self.is_lora,
-         )
-+        if self.is_lora:
-+            self._lora_config = build_lora_sync_config(args)
-+            self._lora_loaded = False
-+            self._lora_base_synced = False
+@@ -201,11 +201,33 @@ class UpdateWeightFromTensor:
+                 del long_lived_tensors
  
--        self._lora_config = build_lora_sync_config(args) if self.is_lora else None
-         # Create IPC gather groups within megatron.
-         for start_rank in range(0, dist.get_world_size(), self.args.rollout_num_gpus_per_engine):
-             end_rank = start_rank + self.args.rollout_num_gpus_per_engine
-@@ -187,25 +188,59 @@ class UpdateWeightFromTensor:
-                 )
-         dist.barrier(group=get_gloo_group())
- 
-+        # Release allocator-cached blocks before streaming weights. The
-+        # preceding `restore_weights_before_load` resizes SGLang-side
-+        # quantized params from Marlin layout back to loading layout, freeing
-+        # the larger Marlin buffers; those blocks sit in the torch allocator
-+        # cache until we evict them. Empty_cache here prevents fragmentation
-+        # from compounding across the update path and gives the upcoming
-+        # `post_process_weights` (Marlin repack) room for its transient
-+        # 2x allocations.
-+        torch.cuda.empty_cache()
-+
-         megatron_local_weights = self.weights_getter()
- 
--        sync_chunk_count = 0
--        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
--            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
--            results = ray.get(refs)
--            _check_weight_sync_results(results, is_lora=self.is_lora)
--            del long_lived_tensors
--            sync_chunk_count += 1
-+        # For LoRA+distributed: base weights are frozen, skip after first round.
-+        if not (self.is_lora and self.use_distribute and self._lora_base_synced):
-+            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
-+                megatron_local_weights, weight_type="base"
-+            ):
-+                refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
-+                results = ray.get(refs)
-+                _check_weight_sync_results(results, is_lora=False)
-+                del long_lived_tensors
- 
--        if self.is_lora and sync_chunk_count == 0:
--            raise RuntimeError(
--                "LoRA weight sync failed: the weight iterator produced zero chunks. "
--                "No adapter weights were sent to the rollout engine. This usually means "
--                "the Megatron-Bridge or SGLang version is incompatible."
--            )
-+        if self.is_lora:
+         if self.is_lora:
+-            lora_sync_chunk_count = 0
+-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
++            # Stream chunks with 1-ahead lookahead so we know which chunk is the
++            # last. SGLang's load_lora_adapter_from_tensors is called with
++            # append_to_existing=False on chunk 0 (replaces any prior adapter)
++            # and True on chunks 1..N; finalize=True is set on the last chunk
++            # so normalize_gate_up_proj / qkv fusion runs over the accumulated
++            # state. This fixes shared-outer MoE LoRA where per-layer shared-A
++            # tensors would otherwise be overwritten by later chunks' per-expert
++            # B tensors (see SGLang PR #21466).
++            chunk_stream = self._hf_weight_iterator.get_hf_weight_chunks(
+                 megatron_local_weights, weight_type="lora"
+-            ):
+-                refs, long_lived_tensors = self._send_lora_params(hf_named_tensors)
++            )
 +            lora_sync_chunk_count = 0
-+            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
-+                megatron_local_weights, weight_type="lora"
-+            ):
-+                refs, long_lived_tensors = self._send_lora_params(hf_named_tensors)
-+                results = ray.get(refs)
-+                _check_weight_sync_results(results, is_lora=True)
-+                del long_lived_tensors
-+                lora_sync_chunk_count += 1
-+
-+            if lora_sync_chunk_count == 0:
-+                raise RuntimeError(
-+                    "LoRA weight sync failed: the weight iterator produced zero chunks. "
-+                    "No adapter weights were sent to the rollout engine. This usually means "
-+                    "the Megatron-Bridge or SGLang version is incompatible."
++            pending = None
++            for next_chunk in chunk_stream:
++                if pending is not None:
++                    refs, long_lived_tensors = self._send_lora_params(
++                        pending, chunk_idx=lora_sync_chunk_count, is_last=False
++                    )
++                    results = ray.get(refs)
++                    _check_weight_sync_results(results, is_lora=True)
++                    del long_lived_tensors
++                    lora_sync_chunk_count += 1
++                pending = next_chunk
++            if pending is not None:
++                refs, long_lived_tensors = self._send_lora_params(
++                    pending, chunk_idx=lora_sync_chunk_count, is_last=True
 +                )
-+
-+            if self.use_distribute and not self._lora_base_synced:
-+                self._lora_base_synced = True
+                 results = ray.get(refs)
+                 _check_weight_sync_results(results, is_lora=True)
+                 del long_lived_tensors
+@@ -255,7 +277,13 @@ class UpdateWeightFromTensor:
+                 refs = (refs or []) + refs_distributed
+         return refs or [], long_lived_tensors
  
-         dist.barrier(group=get_gloo_group())
- 
-+        # Drop cached blocks held by the weight-streaming path (flattened
-+        # tensor buckets, IPC staging buffers, etc.) before SGLang runs its
-+        # Marlin repack. `process_weights_after_loading` allocates a full
-+        # new tensor for each weight before an in-place resize+copy, so peak
-+        # memory temporarily doubles per weight; returning freed cache to
-+        # the driver here prevents those transients from OOMing.
-+        torch.cuda.empty_cache()
-+
-         if rank == 0:
-             # `post_process_quantization` is related to the `process_weights_after_loading`
-             # in the sglang rollout side, which should always be invoked after weight
-@@ -218,61 +253,46 @@ class UpdateWeightFromTensor:
-             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-         dist.barrier(group=get_gloo_group())
- 
--    def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
--        all_refs = []
--        long_lived_tensors = []
--
--        # Separate LoRA weights from base weights
--        if self.is_lora:
--            weight_tensors = [(n, t) for n, t in hf_named_tensors if is_lora_weight_name(n)]
--            if not weight_tensors:
--                raise RuntimeError(
--                    "LoRA weight sync failed: no LoRA weights (lora_A/lora_B) found in the "
--                    "HF weight chunk produced by the weight iterator. This usually means the "
--                    "Megatron-Bridge or SGLang version is incompatible and adapter weights were "
--                    "not exported. Check that `megatron_to_hf_mode` and bridge version match."
--                )
+-    def _send_lora_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
++    def _send_lora_params(
++        self,
++        hf_named_tensors,
++        *,
++        chunk_idx: int,
++        is_last: bool,
++    ) -> tuple[list[ObjectRef], Any]:
+         if not any(is_lora_weight_name(n) for n, _ in hf_named_tensors):
+             raise RuntimeError(
+                 "LoRA weight sync failed: chunk contains no LoRA weights "
+@@ -263,18 +291,28 @@ class UpdateWeightFromTensor:
+             )
+         if self.use_distribute and self._is_distributed_src_rank:
+             raise NotImplementedError("LoRA weight sync is not yet supported for distributed (non-colocated) engines")
 -        else:
--            weight_tensors = hf_named_tensors
--
--        kwargs = dict(
--            hf_named_tensors=weight_tensors,
--            ipc_engine=self._ipc_engine,
--            ipc_gather_src=self._ipc_gather_src,
--            ipc_gather_group=self._ipc_gather_group,
--        )
--        if self.is_lora:
--            kwargs |= dict(
+-            refs, long_lived_tensors = _send_to_colocated_engine(
+-                hf_named_tensors=hf_named_tensors,
+-                ipc_engine=self._ipc_engine,
+-                ipc_gather_src=self._ipc_gather_src,
+-                ipc_gather_group=self._ipc_gather_group,
 -                lora_config=self._lora_config,
 -                lora_name=LORA_ADAPTER_NAME,
 -                lora_loaded=self._lora_loaded,
 -            )
--        else:
--            kwargs |= dict(
--                weight_version=self.weight_version,
--            )
--
--        refs_colocated, long_lived_tensors = _send_to_colocated_engine(**kwargs)
--        all_refs.extend(refs_colocated)
--
--        if self.is_lora:
--            self._lora_loaded = True
--
--        if self.is_lora and self.use_distribute and self._is_distributed_src_rank:
--            raise NotImplementedError("LoRA weight sync is not yet supported for distributed (non-colocated) engines")
--
-+    def _send_base_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
-         if self.use_distribute and self._is_distributed_src_rank:
--            refs_distributed = update_weights_from_distributed(
-+            refs = update_weights_from_distributed(
-                 self._group_name,
-                 self._model_update_groups,
-                 self.weight_version,
-                 self.distributed_rollout_engines,
--                weight_tensors,
-+                hf_named_tensors,
-+            )
-+            return refs or [], []
-+        else:
-+            refs, long_lived_tensors = _send_to_colocated_engine(
-+                hf_named_tensors=hf_named_tensors,
-+                ipc_engine=self._ipc_engine,
-+                ipc_gather_src=self._ipc_gather_src,
-+                ipc_gather_group=self._ipc_gather_group,
-+                weight_version=self.weight_version,
-             )
--            if refs_distributed:
--                all_refs.extend(refs_distributed)
-+            return refs or [], long_lived_tensors
- 
--        return all_refs, long_lived_tensors
-+    def _send_lora_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
-+        if not any(is_lora_weight_name(n) for n, _ in hf_named_tensors):
-+            raise RuntimeError(
-+                "LoRA weight sync failed: chunk contains no LoRA weights "
-+                "(no lora_A/lora_B names found). Check weight iterator configuration."
-+            )
-+        if self.use_distribute and self._is_distributed_src_rank:
-+            raise NotImplementedError("LoRA weight sync is not yet supported for distributed (non-colocated) engines")
-+        else:
-+            refs, long_lived_tensors = _send_to_colocated_engine(
-+                hf_named_tensors=hf_named_tensors,
-+                ipc_engine=self._ipc_engine,
-+                ipc_gather_src=self._ipc_gather_src,
-+                ipc_gather_group=self._ipc_gather_group,
-+                lora_config=self._lora_config,
-+                lora_name=LORA_ADAPTER_NAME,
-+                lora_loaded=self._lora_loaded,
-+            )
-+            self._lora_loaded = True
-+            return refs or [], long_lived_tensors
++
++        is_first_chunk = chunk_idx == 0
++        # Mirror base weight sync: "load" creates the adapter (first sync only),
++        # "update" does in-place writes into the existing adapter's CPU state.
++        # The first chunk of every sync uses reset=True to drop stale post-
++        # normalize entries from the previous sync.
++        # The last chunk sets finalize=True so SGLang runs normalize_gate_up_proj
++        # / qkv fusion over the accumulated state.
++        refs, long_lived_tensors = _send_to_colocated_engine(
++            hf_named_tensors=hf_named_tensors,
++            ipc_engine=self._ipc_engine,
++            ipc_gather_src=self._ipc_gather_src,
++            ipc_gather_group=self._ipc_gather_group,
++            lora_config=self._lora_config,
++            lora_name=LORA_ADAPTER_NAME,
++            lora_mode="load" if (not self._lora_loaded and is_first_chunk) else "update",
++            lora_reset=is_first_chunk,
++            lora_finalize=is_last,
++        )
++        if is_last:
+             self._lora_loaded = True
+-            return refs or [], long_lived_tensors
++        return refs or [], long_lived_tensors
  
  
  def _send_to_colocated_engine(
+@@ -286,7 +324,9 @@ def _send_to_colocated_engine(
+     weight_version=None,
+     lora_config: dict | None = None,
+     lora_name: str | None = None,
+-    lora_loaded: bool = False,
++    lora_mode: str = "load",   # "load" (first sync only) or "update"
++    lora_reset: bool = False,
++    lora_finalize: bool = True,
+ ) -> tuple[list[ObjectRef], Any]:
+     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
+     # gather_object is only collective among group members, so we skip entirely.
+@@ -329,22 +369,34 @@ def _send_to_colocated_engine(
+     refs = []
+     if dist.get_rank() == ipc_gather_src:
+         if is_lora:
+-            if lora_loaded:
+-                ray.get(ipc_engine.unload_lora_adapter.remote(lora_name=lora_name))
+-
+-            # (Yusheng) to-do-1: update lora weights from tensors should support multiple dtypes (bf16, fp8, fp16, fp32)
+-            # currently, we only support 1 type. If there are multiple dtypes, we need to serialize the tensors for each dtype.
+-            # Thus, we need to apply the same way as `ipc_engine.update_weights_from_tensor` in future
+-            # (Yusheng) to-do-2: need to add ci test acc here - now it will pass but fail to update lora weights
+-
+-            refs.append(
+-                ipc_engine.load_lora_adapter_from_tensors.remote(
+-                    lora_name=lora_name,
+-                    config_dict=lora_config,
+-                    serialized_tensors=serialized_named_tensors[0][0],
+-                    load_format="flattened_bucket",
++            # Two endpoints, mirroring base's load/update split:
++            #   - lora_mode="load":   first sync ever — creates the adapter uid,
++            #                         config, and writes chunk-0 weights.
++            #   - lora_mode="update": in-place weight write into the existing
++            #                         adapter (every subsequent chunk). Parallel
++            #                         to update_weights_from_tensor for base.
++            if lora_mode == "load":
++                refs.append(
++                    ipc_engine.load_lora_adapter_from_tensors.remote(
++                        lora_name=lora_name,
++                        config_dict=lora_config,
++                        serialized_tensors=serialized_named_tensors[0][0],
++                        load_format="flattened_bucket",
++                        finalize=lora_finalize,
++                    )
+                 )
+-            )
++            elif lora_mode == "update":
++                refs.append(
++                    ipc_engine.update_lora_adapter_from_tensors.remote(
++                        lora_name=lora_name,
++                        serialized_tensors=serialized_named_tensors[0][0],
++                        load_format="flattened_bucket",
++                        reset=lora_reset,
++                        finalize=lora_finalize,
++                    )
++                )
++            else:
++                raise ValueError(f"Unknown lora_mode: {lora_mode!r}")
+ 
+         else:
+             num_dtypes = len(serialized_named_tensors[0])
 diff --git a/miles/backends/sglang_utils/sglang_engine.py b/miles/backends/sglang_utils/sglang_engine.py
-index 1c215c7b6..ee76b3872 100644
+index ee76b3872..df292f1cd 100644
 --- a/miles/backends/sglang_utils/sglang_engine.py
 +++ b/miles/backends/sglang_utils/sglang_engine.py
-@@ -655,7 +655,6 @@ def _compute_server_args(
-     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
+@@ -339,13 +339,20 @@ class SGLangEngine(RayActor):
+         load_format: str | None = None,
+         pinned: bool = False,
+         added_tokens_config: dict | None = None,
++        finalize: bool = True,
+     ):
+-        """Load a LoRA adapter from serialized tensor data."""
++        """Create a LoRA adapter from tensors + config (once per uid lifetime).
++
++        For chunked syncs, pass ``finalize=False`` on chunk 0 and call
++        :meth:`update_lora_adapter_from_tensors` for remaining chunks with
++        ``finalize=True`` on the last one.
++        """
+         payload = {
+             "lora_name": lora_name,
+             "serialized_tensors": serialized_tensors,
+             "config_dict": config_dict,
+             "pinned": pinned,
++            "finalize": finalize,
+         }
+         if load_format is not None:
+             payload["load_format"] = load_format
+@@ -357,6 +364,36 @@ class SGLangEngine(RayActor):
+             payload,
+         )
  
-     if is_lora_enabled(args):
--        kwargs["enable_weights_cpu_backup"] = args.offload_rollout
-         kwargs["enable_lora"] = True
-         kwargs["max_loras_per_batch"] = 1
-         kwargs["max_lora_rank"] = max(getattr(args, "lora_rank", 0), 1)
++    def update_lora_adapter_from_tensors(
++        self,
++        lora_name: str,
++        serialized_tensors: str,
++        load_format: str | None = None,
++        reset: bool = False,
++        finalize: bool = True,
++    ):
++        """In-place weight update for an already-loaded LoRA adapter.
++
++        Parallel to :meth:`update_weights_from_tensor` for base weights:
++        no config, no uid allocation, just writes tensors. ``reset=True`` on
++        the first chunk of a sync clears stale post-normalize entries from
++        the previous sync. ``finalize=True`` on the last chunk triggers
++        normalize over the accumulated state.
++        """
++        payload = {
++            "lora_name": lora_name,
++            "serialized_tensors": serialized_tensors,
++            "reset": reset,
++            "finalize": finalize,
++        }
++        if load_format is not None:
++            payload["load_format"] = load_format
++
++        return self._make_request(
++            "update_lora_adapter_from_tensors",
++            payload,
++        )
++
+     def flush_cache(self):
+         """Flush the cache of the server."""
+         if self.node_rank != 0:
 diff --git a/miles/backends/training_utils/data.py b/miles/backends/training_utils/data.py
 index 3bda887b2..cc7b735fc 100644
 --- a/miles/backends/training_utils/data.py
@@ -1513,10 +1113,10 @@ index 551021f53..23035a9d8 100644
              k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
          } or None
 diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
-index 375cd6c2c..eaa493add 100644
+index ab9ef5b23..73c28b883 100644
 --- a/miles/utils/arguments.py
 +++ b/miles/utils/arguments.py
-@@ -194,6 +194,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -211,6 +211,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
              parser.add_argument(
                  "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
              )
@@ -1544,7 +1144,41 @@ index 375cd6c2c..eaa493add 100644
              parser.add_argument(
                  "--allgather-cp",
                  action="store_true",
-@@ -1701,7 +1722,7 @@ def parse_args(add_custom_arguments=None):
+@@ -225,6 +246,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "Allocate optimizer states on CPU during checkpoint loading to prevent GPU OOM on memory spike. "
+                 ),
+             )
++            parser.add_argument(
++                "--disable-parameter-transpose-cache",
++                action="store_true",
++                default=False,
++                help=(
++                    "Skip TE's per-module transposed-weight cache (sets "
++                    "``TransformerConfig.disable_parameter_transpose_cache=True``). "
++                    "Trade a small forward transpose recompute for the memory the "
++                    "cache holds — mainly useful under INT4 fake-QAT where every "
++                    "forward produces a fresh dequantized weight."
++                ),
++            )
+ 
+             return parser
+ 
+@@ -1092,6 +1125,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                 default=False,
+                 help="Sync LoRA weights via tensor instead of file (more efficient)",
+             )
++            parser.add_argument(
++                "--experts-shared-outer-loras",
++                action="store_true",
++                default=False,
++                help="Enable shared-outer grouped-expert LoRA (gate_up lora_A and "
++                "down lora_B shared across experts, expert_dim=1). Matches SGLang "
++                "PR #21466's experts_shared_outer_loras=True serving contract.",
++            )
+             return parser
+ 
+         def add_router_arguments(parser):
+@@ -1718,7 +1759,7 @@ def parse_args(add_custom_arguments=None):
          from miles.backends.megatron_utils.arguments import validate_args as megatron_validate_args
  
          args = megatron_parse_args(extra_args_provider=add_miles_arguments)
@@ -1553,7 +1187,7 @@ index 375cd6c2c..eaa493add 100644
              hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
              hf_validate_args(args, hf_config)
  
-@@ -1805,6 +1826,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
+@@ -1822,6 +1863,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
  def miles_validate_args(args):
      args.eval_datasets = _resolve_eval_datasets(args)
  
@@ -1565,6 +1199,21 @@ index 375cd6c2c..eaa493add 100644
      # Normalize --tito-allowed-append-roles: lowercase + deduplicate.
      raw_roles = getattr(args, "tito_allowed_append_roles", ["tool"])
      args.tito_allowed_append_roles = sorted(set(r.lower() for r in raw_roles))
+@@ -1907,6 +1953,14 @@ def miles_validate_args(args):
+ 
+         args.target_modules = modules
+ 
++        # Training and serving must agree on shared-outer grouped-expert LoRA
++        # (expert_dim=1 buffers in SGLang).
++        if args.experts_shared_outer_loras:
++            args.sglang_experts_shared_outer_loras = True
++        assert args.experts_shared_outer_loras == bool(args.sglang_experts_shared_outer_loras), (
++            "experts_shared_outer_loras and sglang_experts_shared_outer_loras must agree"
++        )
++
+     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+ 
+     if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
 diff --git a/miles/utils/data.py b/miles/utils/data.py
 index 6e64ef678..35642764d 100644
 --- a/miles/utils/data.py
@@ -1586,6 +1235,276 @@ index 6e64ef678..35642764d 100644
              input_ids = processor_output["input_ids"][0]
              if len(input_ids) <= max_length:
                  filtered_samples.append(sample)
+diff --git a/miles/utils/memory_probe.py b/miles/utils/memory_probe.py
+new file mode 100644
+index 000000000..d01f894e8
+--- /dev/null
++++ b/miles/utils/memory_probe.py
+@@ -0,0 +1,154 @@
++"""Fine-grained GPU memory timeline logging.
++
++Companion to :mod:`miles.utils.memory_profile` (which dumps full snapshots on
++OOM). This module prints lightweight tag-based memory samples so you can see
++WHICH step / layer / phase is growing memory without needing to open a pickle.
++
++Enable with ``MILES_MEM_TRACE=1``. Optionally throttle noisy callers with
++``MILES_MEM_TRACE_EVERY_N=<int>`` (default 1: every call). Output goes to
++stdout with rank tag so you can grep by rank.
++
++Example output:
++  [MEM rank=13 +42.31 GiB / +0.56 GiB res] layer_0_fc1_enter
++  [MEM rank=13 +42.89 GiB / +0.00 GiB res] layer_0_fc1_exit
++  [MEM rank=13 +43.44 GiB / +0.55 GiB res] layer_1_fc1_enter
++
++The "+X" numbers are absolute allocated / reserved in GiB (leading "+" is just
++cosmetic). No prints and zero overhead when the env var is unset.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++from typing import Optional
++
++
++_ENABLED: Optional[bool] = None
++_EVERY_N: Optional[int] = None
++_COUNTER_LOCK = threading.Lock()
++_COUNTERS: dict[str, int] = {}
++
++
++def _enabled() -> bool:
++    global _ENABLED
++    if _ENABLED is None:
++        v = os.environ.get("MILES_MEM_TRACE", "")
++        _ENABLED = v.strip().lower() not in ("", "0", "false", "no")
++    return _ENABLED
++
++
++def _every_n() -> int:
++    global _EVERY_N
++    if _EVERY_N is None:
++        try:
++            _EVERY_N = max(1, int(os.environ.get("MILES_MEM_TRACE_EVERY_N", "1")))
++        except ValueError:
++            _EVERY_N = 1
++    return _EVERY_N
++
++
++def _should_fire(tag: str) -> bool:
++    every = _every_n()
++    if every == 1:
++        return True
++    with _COUNTER_LOCK:
++        n = _COUNTERS.get(tag, 0) + 1
++        _COUNTERS[tag] = n
++    return (n % every) == 1
++
++
++def log_memory(tag: str, extra: str = "") -> None:
++    """Print current GPU memory with ``tag`` to stdout, one line.
++
++    No-op when ``MILES_MEM_TRACE`` is unset. Uses
++    :func:`torch.cuda.memory_allocated` / ``memory_reserved`` (both cheap,
++    on-host counters; no CUDA sync).
++    """
++    if not _enabled():
++        return
++    if not _should_fire(tag):
++        return
++    try:
++        import torch
++        import torch.distributed as dist
++    except Exception:
++        return
++    if not torch.cuda.is_available():
++        return
++    rank = dist.get_rank() if dist.is_initialized() else 0
++    alloc_gib = torch.cuda.memory_allocated() / (1024**3)
++    res_gib = torch.cuda.memory_reserved() / (1024**3)
++    suffix = f"  {extra}" if extra else ""
++    print(
++        f"[MEM rank={rank} alloc={alloc_gib:6.2f}GiB reserved={res_gib:6.2f}GiB] {tag}{suffix}",
++        flush=True,
++    )
++
++
++def log_delta(tag: str, start_alloc_bytes: int) -> None:
++    """Log memory delta since ``start_alloc_bytes``. Use for scope enter/exit."""
++    if not _enabled():
++        return
++    if not _should_fire(tag + "__delta"):
++        return
++    try:
++        import torch
++        import torch.distributed as dist
++    except Exception:
++        return
++    if not torch.cuda.is_available():
++        return
++    rank = dist.get_rank() if dist.is_initialized() else 0
++    now = torch.cuda.memory_allocated()
++    delta_gib = (now - start_alloc_bytes) / (1024**3)
++    print(
++        f"[MEM rank={rank} Δ={delta_gib:+6.2f}GiB alloc={now/1024**3:6.2f}GiB] {tag}",
++        flush=True,
++    )
++
++
++class scope:  # noqa: N801 — lowercase for `with memory_probe.scope("..."):`
++    """Context manager that prints enter/exit memory deltas for a region.
++
++    ``with scope("my_tag"): ...`` prints on enter and exit (with delta). Zero
++    overhead when disabled — short-circuits immediately.
++    """
++
++    __slots__ = ("tag", "_start")
++
++    def __init__(self, tag: str):
++        self.tag = tag
++        self._start: Optional[int] = None
++
++    def __enter__(self):
++        if not _enabled():
++            return self
++        try:
++            import torch
++        except Exception:
++            return self
++        if not torch.cuda.is_available():
++            return self
++        self._start = torch.cuda.memory_allocated()
++        log_memory(f"{self.tag}::enter")
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        if not _enabled() or self._start is None:
++            return False
++        log_delta(f"{self.tag}::exit", self._start)
++        return False
++
++
++def memory_allocated_bytes() -> int:
++    """Best-effort current allocated bytes; 0 when disabled / no CUDA."""
++    if not _enabled():
++        return 0
++    try:
++        import torch
++    except Exception:
++        return 0
++    if not torch.cuda.is_available():
++        return 0
++    return torch.cuda.memory_allocated()
+diff --git a/miles/utils/memory_profile.py b/miles/utils/memory_profile.py
+new file mode 100644
+index 000000000..63e0477ef
+--- /dev/null
++++ b/miles/utils/memory_profile.py
+@@ -0,0 +1,104 @@
++"""Lightweight CUDA memory profiling via ``torch.cuda.memory._record_memory_history``.
++
++Enable with ``MILES_MEMORY_PROFILE=1`` (snapshots land in ``/data/memsnaps``)
++or override the output directory with ``MILES_MEMORY_PROFILE_DIR=/some/path``.
++Snapshots are dumped as ``memsnap_rank{N}_{tag}.pickle`` files viewable at
++https://pytorch.org/memory_viz — drag-drop the pickle to get an interactive
++timeline of every alloc / free and the Python stack that made it.
++
++Typical flow:
++  1. :func:`enable_memory_history` once at model setup.
++  2. :func:`dump_memory_snapshot("step-N-oom")` inside an ``except
++     torch.cuda.OutOfMemoryError`` block, before re-raising.
++
++Recording is a no-op when neither env var is set (zero overhead).
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++_DEFAULT_OUTPUT_DIR = "/data/memsnaps"
++
++_ENABLED: Optional[bool] = None
++_OUTPUT_DIR: Optional[str] = None
++_RECORDING_STARTED: bool = False
++
++
++def _truthy(value: Optional[str]) -> bool:
++    return value is not None and value.strip().lower() not in {"", "0", "false", "no"}
++
++
++def _resolve_settings() -> None:
++    """Resolve the enable flag and output directory once."""
++    global _ENABLED, _OUTPUT_DIR
++    if _ENABLED is not None:
++        return
++    override_dir = os.environ.get("MILES_MEMORY_PROFILE_DIR")
++    enable_flag = _truthy(os.environ.get("MILES_MEMORY_PROFILE"))
++    if override_dir:
++        _ENABLED = True
++        _OUTPUT_DIR = override_dir
++    elif enable_flag:
++        _ENABLED = True
++        _OUTPUT_DIR = _DEFAULT_OUTPUT_DIR
++    else:
++        _ENABLED = False
++        _OUTPUT_DIR = None
++
++
++def _enabled() -> bool:
++    _resolve_settings()
++    return bool(_ENABLED)
++
++
++def enable_memory_history(max_entries: int = 200_000) -> None:
++    """Start recording CUDA allocator history. Idempotent; no-op if disabled."""
++    global _RECORDING_STARTED
++    if not _enabled() or _RECORDING_STARTED:
++        return
++    import torch
++
++    if not torch.cuda.is_available():
++        return
++    torch.cuda.memory._record_memory_history(max_entries=max_entries)
++    _RECORDING_STARTED = True
++    logger.info("CUDA memory history recording enabled (max_entries=%d)", max_entries)
++
++
++def dump_memory_snapshot(tag: str) -> Optional[str]:
++    """Dump the current allocator snapshot to
++    ``<output_dir>/memsnap_rank{N}_{tag}.pickle``.
++
++    Output directory defaults to ``/data/memsnaps`` (override with
++    ``MILES_MEMORY_PROFILE_DIR``). Returns the path (or ``None`` if disabled /
++    failed). All ranks dump — inspect a few to spot cross-rank asymmetry.
++    """
++    if not _enabled():
++        return None
++    import torch
++    import torch.distributed as dist
++
++    if not torch.cuda.is_available():
++        return None
++
++    out_dir = _OUTPUT_DIR or _DEFAULT_OUTPUT_DIR
++    try:
++        os.makedirs(out_dir, exist_ok=True)
++    except OSError as e:
++        logger.warning("cannot create memory profile dir %s: %s", out_dir, e)
++        return None
++
++    rank = dist.get_rank() if dist.is_initialized() else 0
++    path = os.path.join(out_dir, f"memsnap_rank{rank}_{tag}.pickle")
++    try:
++        torch.cuda.memory._dump_snapshot(path)
++    except Exception as e:  # noqa: BLE001
++        logger.warning("memory snapshot dump (%s) failed: %s", path, e)
++        return None
++    logger.info("CUDA memory snapshot dumped to %s", path)
++    return path
 diff --git a/miles/utils/processing_utils.py b/miles/utils/processing_utils.py
 index 9d12eed8b..e3eea47f6 100644
 --- a/miles/utils/processing_utils.py
@@ -1648,89 +1567,6 @@ index af4878b4e..7a3b27452 100644
      dist.reduce = get_new_function(dist.reduce)
      dist.reduce_scatter = get_new_function(dist.reduce_scatter)
      dist.reduce_scatter_tensor = get_new_function(dist.reduce_scatter_tensor)
-diff --git a/tests/fast/backends/megatron_utils/test_lora_hf_weight_iterator.py b/tests/fast/backends/megatron_utils/test_lora_hf_weight_iterator.py
-index 9319b4a9d..226b5aec6 100644
---- a/tests/fast/backends/megatron_utils/test_lora_hf_weight_iterator.py
-+++ b/tests/fast/backends/megatron_utils/test_lora_hf_weight_iterator.py
-@@ -1,7 +1,6 @@
--"""Unit tests for HfWeightIteratorBase factory routing with LoRA flag.
-+"""Unit tests for HfWeightIteratorBase factory routing.
- 
--Validates that the is_lora flag is correctly propagated through the factory
--and that the right iterator subclass is selected based on megatron_to_hf_mode.
-+Validates that the right iterator subclass is selected based on megatron_to_hf_mode.
- """
- 
- from argparse import Namespace
-@@ -11,12 +10,6 @@ import pytest
- 
- from miles.backends.megatron_utils.update_weight.hf_weight_iterator_base import HfWeightIteratorBase
- 
--
--class _ConcreteIterator(HfWeightIteratorBase):
--    def get_hf_weight_chunks(self, megatron_local_weights):
--        return []
--
--
- _BASE_MODULE = "miles.backends.megatron_utils.update_weight.hf_weight_iterator_base"
- 
- 
-@@ -58,23 +51,3 @@ class TestHfWeightIteratorFactory:
-             HfWeightIteratorBase.create(
-                 args=args, model=[MagicMock()], is_lora=False, model_name="qwen", quantization_config=None
-             )
--
--    def test_is_lora_stored_on_instance(self):
--        """Verify is_lora attribute is stored on the base class."""
--        instance = _ConcreteIterator(
--            args=self._make_args(),
--            model=[MagicMock()],
--            model_name="qwen",
--            quantization_config=None,
--            is_lora=True,
--        )
--        assert instance.is_lora is True
--
--    def test_is_lora_default_false(self):
--        instance = _ConcreteIterator(
--            args=self._make_args(),
--            model=[MagicMock()],
--            model_name="qwen",
--            quantization_config=None,
--        )
--        assert instance.is_lora is False
-diff --git a/tests/fast/backends/megatron_utils/test_lora_update_weight.py b/tests/fast/backends/megatron_utils/test_lora_update_weight.py
-index c4b3f328a..c180218de 100644
---- a/tests/fast/backends/megatron_utils/test_lora_update_weight.py
-+++ b/tests/fast/backends/megatron_utils/test_lora_update_weight.py
-@@ -117,4 +117,4 @@ class TestUpdateWeightFromTensorLoraConfig:
-             quantization_config=None,
-             is_lora=False,
-         )
--        assert updater._lora_config is None
-+        assert not hasattr(updater, "_lora_config")
-diff --git a/tests/fast/backends/megatron_utils/test_lora_weight_sync_validation.py b/tests/fast/backends/megatron_utils/test_lora_weight_sync_validation.py
-index 81748bca7..52348622a 100644
---- a/tests/fast/backends/megatron_utils/test_lora_weight_sync_validation.py
-+++ b/tests/fast/backends/megatron_utils/test_lora_weight_sync_validation.py
-@@ -141,7 +141,7 @@ class TestSendHfParamsEmptyLoraDetection:
-         updater.use_distribute = False
- 
-         with pytest.raises(RuntimeError, match="no LoRA weights"):
--            updater._send_hf_params(SAMPLE_BASE_ONLY_WEIGHTS)
-+            updater._send_lora_params(SAMPLE_BASE_ONLY_WEIGHTS)
- 
-     @patch(f"{_UW_MODULE}._send_to_colocated_engine", return_value=([], []))
-     @patch(f"{_UW_MODULE}.dist")
-@@ -168,7 +168,7 @@ class TestSendHfParamsEmptyLoraDetection:
-         updater._ipc_gather_group = MagicMock()
-         updater.use_distribute = False
- 
--        refs, _ = updater._send_hf_params(SAMPLE_LORA_WEIGHTS)
-+        refs, _ = updater._send_lora_params(SAMPLE_LORA_WEIGHTS)
-         # Should not raise; mock_send was called with the LoRA tensors
-         assert mock_send.called
- 
 diff --git a/tools/convert_hf_to_fp8.py b/tools/convert_hf_to_fp8.py
 index 7754e7dea..4043025e5 100644
 --- a/tools/convert_hf_to_fp8.py

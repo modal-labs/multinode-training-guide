@@ -655,7 +655,7 @@ index f11f1081..4c95163e 100644
              from megatron.bridge.training.model_load_save import temporary_distributed_context
          except ImportError:
 diff --git a/src/megatron/bridge/models/conversion/model_bridge.py b/src/megatron/bridge/models/conversion/model_bridge.py
-index ddd3d31f..70b411d4 100644
+index ddd3d31f..3246396d 100644
 --- a/src/megatron/bridge/models/conversion/model_bridge.py
 +++ b/src/megatron/bridge/models/conversion/model_bridge.py
 @@ -34,9 +34,7 @@ from typing import (
@@ -943,7 +943,7 @@ index ddd3d31f..70b411d4 100644
  
              # 2) Delegate conversion & distribution to the bridge
              converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
-@@ -976,15 +1055,38 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -976,15 +1055,36 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
  
          hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
  
@@ -982,14 +982,12 @@ index ddd3d31f..70b411d4 100644
 +                continue
  
 +            # --- Standard export path ---
-+            # Merge LoRA adapters into the base weight BEFORE any HF-side
-+            # modification (e.g. per-expert INT4 re-quantization). Quantizing
-+            # first would leave the base in a packed form that cannot absorb a
-+            # full-precision `linear_out @ linear_in` delta.
++            # Merge LoRA before maybe_modify: post-quantize base (e.g.
++            # INT4-packed) can't absorb an fp32 `linear_out @ linear_in` delta.
              adapter_tasks = None
              if merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
                  task_global_base_prefix, _, _ = task.global_param_name.partition(".to_wrap.weight")
-@@ -998,11 +1100,22 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -998,11 +1098,22 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                      adapter_weights,
                  )
  
@@ -1013,7 +1011,7 @@ index ddd3d31f..70b411d4 100644
  
                  # Handle tied embeddings case
                  # TODO(yuya): fix this hard coded naming
-@@ -1015,6 +1128,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1015,6 +1126,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                          expected_keys = hf_pretrained.state.source.get_all_keys()
                          if "lm_head.weight" in expected_keys:
                              yield HFWeightTuple("lm_head.weight", final_tensor.clone().detach(), task.param_name)
@@ -1023,7 +1021,7 @@ index ddd3d31f..70b411d4 100644
                  elif embeddings_are_tied and hf_name == "lm_head.weight":
                      # This should not happen when embeddings are tied - assert error
                      raise ValueError(
-@@ -1063,8 +1179,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1063,8 +1177,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
      def dtype_from_str(self, dtype: str) -> torch.dtype:
          """Convert a string precision identifier to equivalent torch dtype.
  
@@ -1034,7 +1032,7 @@ index ddd3d31f..70b411d4 100644
  
          Args:
              dtype (str): String representation of dtype (e.g., "float16", "fp16",
-@@ -1072,27 +1188,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1072,27 +1186,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
  
          Returns:
              torch.dtype: Corresponding PyTorch dtype (defaults to float32 if unknown).
@@ -1067,7 +1065,7 @@ index ddd3d31f..70b411d4 100644
              return torch.float32
  
      def make_vocab_size_divisible_by(self, vocab_size: int) -> int:
-@@ -1194,6 +1295,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1194,6 +1293,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                  if hasattr(unwrapped_model, "output_layer"):
                      unwrapped_model.output_layer.weight.data.copy_(embd_weights)
  
@@ -1097,7 +1095,7 @@ index ddd3d31f..70b411d4 100644
      def build_conversion_tasks(
          self,
          hf_pretrained: HFPreTrained,
-@@ -1208,11 +1332,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1208,11 +1330,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
          populated.
          """
  
@@ -1112,7 +1110,7 @@ index ddd3d31f..70b411d4 100644
  
          mapping_registry = self.mapping_registry()
          unwrapped_model = unwrap_model(megatron_model)[0]
-@@ -1249,8 +1373,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1249,8 +1371,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                      logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
                      continue
  
@@ -1123,7 +1121,7 @@ index ddd3d31f..70b411d4 100644
                      if isinstance(mapping.hf_param, str):
                          if mapping.hf_param not in hf_keys:
                              logger.warning(f"WARNING: Can't find {mapping.hf_param} in hf_keys")
-@@ -1444,7 +1568,7 @@ def register_bridge_implementation(
+@@ -1444,7 +1566,7 @@ def register_bridge_implementation(
      ) -> Iterable[HFWeightTuple]:
          bridge = bridge_class()
  
@@ -1132,95 +1130,6 @@ index ddd3d31f..70b411d4 100644
          bridge.hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
  
          return bridge.stream_weights_megatron_to_hf(
-diff --git a/src/megatron/bridge/models/conversion/peft_bridge.py b/src/megatron/bridge/models/conversion/peft_bridge.py
-index 6f0ebe43..9ac79d9c 100644
---- a/src/megatron/bridge/models/conversion/peft_bridge.py
-+++ b/src/megatron/bridge/models/conversion/peft_bridge.py
-@@ -701,6 +701,25 @@ class MegatronPeftBridge:
- 
-                             lin_in = current_linear_in_tensor.unsqueeze(0) if is_grouped_expert else current_linear_in_tensor
-                             lin_out = current_linear_out_tensor.unsqueeze(0) if is_grouped_expert else current_linear_out_tensor
-+                            # Fire only on the first grouped-MoE emission so
-+                            # we capture the shape that SGLang's MoE LoRA
-+                            # buffer path receives (the dense fc1 emission
-+                            # already works, it's the (1, 64, 7168)-style
-+                            # moe adapter that's suspected).
-+                            if is_grouped_expert and not getattr(self, "_lora_emit_dbg_logged", False):
-+                                import logging as _logging
-+                                self._lora_emit_dbg_logged = True
-+                                _logging.getLogger(__name__).warning(
-+                                    "[LORA_EMIT_DBG] fused base_name=%s is_grouped_expert=%s "
-+                                    "lin_in_shape=%s lin_out_shape=%s "
-+                                    "linear_in_hf=%s linear_out_hf=%s",
-+                                    base_name,
-+                                    is_grouped_expert,
-+                                    tuple(lin_in.shape),
-+                                    tuple(lin_out.shape),
-+                                    linear_in_hf_names[index],
-+                                    linear_out_hf_names[index],
-+                                )
-                             yield HFWeightTuple(linear_in_hf_names[index], lin_in, megatron_linear_in_name)
-                             yield HFWeightTuple(linear_out_hf_names[index], lin_out, megatron_linear_out_name)
-                         continue
-@@ -829,9 +848,23 @@ class MegatronPeftBridge:
-                     raise ValueError(f"Unknown weight name: {hf_name}")
-                 current_linear_out_weight = qkv_linear_out_weights[projection_key]
- 
--            merged_weight = self._merge_single_adapter_weight(
--                base_weight, alpha, dim, current_linear_in_weight, current_linear_out_weight
--            )
-+            try:
-+                merged_weight = self._merge_single_adapter_weight(
-+                    base_weight, alpha, dim, current_linear_in_weight, current_linear_out_weight
-+                )
-+            except RuntimeError as e:
-+                import torch.distributed as _dist
-+                _rank = _dist.get_rank() if _dist.is_initialized() else -1
-+                print(
-+                    f"[LORA_MERGE_DEBUG rank={_rank}] hf_name={hf_name} "
-+                    f"global_base_prefix={adapter_weight.global_base_prefix} "
-+                    f"adapter_key={adapter_weight.adapter_key} "
-+                    f"base={tuple(base_weight.shape)} "
-+                    f"linear_in={tuple(current_linear_in_weight.shape)} "
-+                    f"linear_out={tuple(current_linear_out_weight.shape)}",
-+                    flush=True,
-+                )
-+                raise
-             converted_weights_dict[hf_name] = merged_weight
- 
-         return converted_weights_dict
-@@ -856,13 +889,24 @@ class MegatronPeftBridge:
-         base_device = base_weight.device
-         linear_out_on_base = linear_out_weight.to(device=base_device, dtype=torch.float32)
-         linear_in_on_base = linear_in_weight.to(device=base_device, dtype=torch.float32)
--        merged = merger.merge(
--            base_weight.float(),
--            linear_out_on_base,
--            linear_in_on_base,
--            alpha,
--            dim,
--        )
-+        try:
-+            merged = merger.merge(
-+                base_weight.float(),
-+                linear_out_on_base,
-+                linear_in_on_base,
-+                alpha,
-+                dim,
-+            )
-+        except RuntimeError as e:
-+            import torch.distributed as _dist
-+            _rank = _dist.get_rank() if _dist.is_initialized() else -1
-+            print(
-+                f"[LORA_MERGE_DEBUG rank={_rank}] merge failure: "
-+                f"base={tuple(base_weight.shape)} linear_in={tuple(linear_in_on_base.shape)} "
-+                f"linear_out={tuple(linear_out_on_base.shape)} alpha={alpha} dim={dim} err={e}",
-+                flush=True,
-+            )
-+            raise
-         return merged.to(orig_dtype)
- 
-     def _merge_canonical_adapter_from_weights(
 diff --git a/src/megatron/bridge/models/hf_pretrained/vlm.py b/src/megatron/bridge/models/hf_pretrained/vlm.py
 index 06c96e57..0a45a2df 100644
 --- a/src/megatron/bridge/models/hf_pretrained/vlm.py
@@ -1275,10 +1184,10 @@ index 00000000..f3a852e4
 +]
 diff --git a/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
 new file mode 100644
-index 00000000..1e5f4a57
+index 00000000..f023f91c
 --- /dev/null
 +++ b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,633 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -1293,14 +1202,17 @@ index 00000000..1e5f4a57
 +# See the License for the specific language governing permissions and
 +# limitations under the License.
 +
++import itertools
++import re
 +from functools import partial
-+from typing import Dict, List, Mapping
++from typing import Dict, Iterable, List, Mapping, Union
 +
 +import torch
++from megatron.core import parallel_state
 +from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 +
 +from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
++from megatron.bridge.models.conversion.model_bridge import MegatronModel, MegatronModelBridge, WeightConversionTask
 +from megatron.bridge.models.conversion.param_mapping import (
 +    AutoMapping,
 +    GatedMLPMapping,
@@ -1314,6 +1226,7 @@ index 00000000..1e5f4a57
 +    dequantize_int4,
 +    quantize_to_int4,
 +)
++from megatron.bridge.peft.utils import is_expert_linear
 +
 +
 +try:
@@ -1338,6 +1251,370 @@ index 00000000..1e5f4a57
 +
 +    The language backbone shares the same architecture as Kimi K2 (MoE with MLA).
 +    """
++
++    # ------------------------------------------------------------------
++    # Shared-outer grouped expert LoRA export
++    # ------------------------------------------------------------------
++    # K2.5 uses SharedOuterGroupedExpertAdapter (see peft/utils.py):
++    #   fc1: linear_in is 2D (shared A, hidden->rank);
++    #        linear_out is 3D [N_local, 2*intermediate, rank] (per-expert B).
++    #   fc2: linear_in is 3D [N_local, rank, intermediate] (per-expert A);
++    #        linear_out is 2D (shared B, rank->hidden).
++    # The shared side emits ONCE as [1, ..., ...] under the .weight0 HF name.
++    # The per-expert side emits N times, one 2D slice per expert, under
++    # .weight0..weight{N-1} HF names. The base MegatronPeftBridge emission
++    # can't handle this mixed case (treats both sides through a single
++    # per-suffix loop and asserts weight.ndim<3), so we override below.
++    # Follows SGLang PR #21466's ``experts_shared_outer_loras=True`` contract.
++
++    def _is_fused_fc1_gate_up(
++        self,
++        base_hf_weight_names,
++        linear_out_tensor: torch.Tensor,
++        base_weight_shape=None,
++    ) -> bool:
++        """Accept 3D per-expert ``linear_out`` in addition to the upstream 2D case.
++
++        SharedOuterGroupedExpertAdapter stores fc1's linear_out as
++        ``[N_local, 2*intermediate_per_tp, rank]`` (packed per-expert). The
++        upstream check rejects any ``ndim != 2``; fall through to the per-
++        expert dim check instead.
++        """
++
++        names = list(base_hf_weight_names)
++        has_gate_up = (
++            bool(names)
++            and len(names) % 2 == 0
++            and all(("gate_proj" in n or "up_proj" in n) for n in names)
++            and any("gate_proj" in n for n in names)
++            and any("up_proj" in n for n in names)
++        )
++        if not has_gate_up:
++            return False
++        if linear_out_tensor.ndim == 2:
++            out_dim = linear_out_tensor.shape[0]
++        elif linear_out_tensor.ndim == 3:
++            # [N_local, 2*intermediate_per_tp, rank] — per-expert out dim is shape[1].
++            out_dim = linear_out_tensor.shape[1]
++        else:
++            return False
++        if out_dim % 2 != 0:
++            return False
++        if base_weight_shape is not None and out_dim != 2 * base_weight_shape[0]:
++            return False
++        return True
++
++    def _gather_expert_adapter_weight(self, weight):
++        # Relaxed: accepts 2D (shared across experts) and 3D (per-expert
++        # packed [N_local, out, in]) tensors. EP all-gather returns one
++        # tensor per EP rank; shape per entry matches the input.
++        ep_size = parallel_state.get_expert_model_parallel_world_size()
++        if ep_size <= 1:
++            return None
++        gathered = [torch.empty_like(weight) for _ in range(ep_size)]
++        torch.distributed.all_gather(
++            gathered, weight, group=parallel_state.get_expert_model_parallel_group()
++        )
++        return gathered
++
++    def _select_expert_adapter_weight(self, weight, gathered, expert_idx, num_experts):
++        """Return the 2D slice for ``expert_idx`` across EP ranks.
++
++        - 2D weight (shared): same tensor returned regardless of ``expert_idx``.
++        - 3D weight (per-expert): ``gathered[rank][local_expert_idx]`` where
++          the expert lives on EP rank ``rank``.
++        """
++        ep_size = parallel_state.get_expert_model_parallel_world_size()
++        if ep_size <= 1:
++            return weight[expert_idx] if weight.ndim == 3 else weight
++        num_local = num_experts // ep_size
++        rank = expert_idx // num_local
++        local_e = expert_idx % num_local
++        per_rank = gathered[rank]
++        return per_rank[local_e] if per_rank.ndim == 3 else per_rank
++
++    def stream_adapter_weights_megatron_to_hf(
++        self,
++        megatron_model,
++        cpu: bool = True,
++        show_progress: bool = True,
++    ):
++        """Stream adapter weights with mixed-side emission for shared-outer grouped expert LoRA."""
++        import os
++        from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
++
++        rank = int(os.environ.get("RANK", "0"))
++        print(f"[BRIDGE_DBG rank={rank}] stream_adapter_weights_megatron_to_hf ENTER (KimiK25VLBridge override)", flush=True)
++
++        if not isinstance(megatron_model, list):
++            megatron_model = [megatron_model]
++
++        num_moe_experts = megatron_model[0].config.num_moe_experts
++        adapter_tasks_by_base = self.build_adapter_conversion_tasks(megatron_model)
++        adapter_tasks = list(itertools.chain.from_iterable(adapter_tasks_by_base.values()))
++        print(f"[BRIDGE_DBG rank={rank}] num_moe_experts={num_moe_experts}, num_adapter_tasks={len(adapter_tasks)}", flush=True)
++        if not adapter_tasks:
++            return
++
++        assert hasattr(self, "mapping_registry"), "MegatronModelBridge must define mapping_registry"
++        mapping_registry = self.mapping_registry()
++
++        _task_idx = 0
++        for adapter_task in self._with_progress_tracking(
++            adapter_tasks, "Streaming adapter weights", show_progress
++        ):
++            adapter_weight = self.materialize_adapter_weights([adapter_task])[0]
++
++            linear_in_tensor = adapter_weight.linear_in_weight.weight
++            linear_out_tensor = adapter_weight.linear_out_weight.weight
++            megatron_linear_in_name = adapter_weight.linear_in_weight.param_name
++            megatron_linear_out_name = adapter_weight.linear_out_weight.param_name
++            is_expert = is_expert_linear(adapter_task.global_base_prefix)
++            is_grouped_expert = (
++                is_expert and ".local_experts." not in adapter_task.global_base_prefix
++            )
++
++            if _task_idx < 3 or "linear_fc1" in adapter_task.global_base_prefix and _task_idx < 8:
++                print(
++                    f"[BRIDGE_DBG rank={rank}] task#{_task_idx} "
++                    f"prefix={adapter_task.global_base_prefix} "
++                    f"adapter_key={adapter_task.adapter_key} "
++                    f"is_expert={is_expert} is_grouped={is_grouped_expert} "
++                    f"lin_in.shape={tuple(linear_in_tensor.shape)} ndim={linear_in_tensor.ndim} "
++                    f"lin_out.shape={tuple(linear_out_tensor.shape)} ndim={linear_out_tensor.ndim}",
++                    flush=True,
++                )
++            _task_idx += 1
++
++            if not is_grouped_expert:
++                # Non-grouped adapter: delegate to the default per-suffix loop.
++                # Falls back to parent behavior (single ".weight" suffix).
++                yield from self._emit_default_adapter(
++                    adapter_task=adapter_task,
++                    linear_in_tensor=linear_in_tensor,
++                    linear_out_tensor=linear_out_tensor,
++                    megatron_linear_in_name=megatron_linear_in_name,
++                    megatron_linear_out_name=megatron_linear_out_name,
++                    megatron_model=megatron_model,
++                    mapping_registry=mapping_registry,
++                    cpu=cpu,
++                )
++                continue
++
++            # Grouped expert: mixed 2D (shared) / 3D (per-expert) emission.
++            linear_in_gathered = self._gather_expert_adapter_weight(linear_in_tensor)
++            linear_out_gathered = self._gather_expert_adapter_weight(linear_out_tensor)
++
++            linear_in_shared = linear_in_tensor.ndim == 2
++            linear_out_shared = linear_out_tensor.ndim == 2
++
++            # Emit linear_in side.
++            yield from self._emit_grouped_adapter_side(
++                side_tensor=linear_in_tensor,
++                side_gathered=linear_in_gathered,
++                side_is_shared=linear_in_shared,
++                side_suffix=".linear_in.weight",
++                megatron_side_name=megatron_linear_in_name,
++                adapter_task=adapter_task,
++                num_moe_experts=num_moe_experts,
++                megatron_model=megatron_model,
++                mapping_registry=mapping_registry,
++                cpu=cpu,
++                is_linear_out=False,
++            )
++            # Emit linear_out side (may be fused — gate/up split under linear_fc1).
++            yield from self._emit_grouped_adapter_side(
++                side_tensor=linear_out_tensor,
++                side_gathered=linear_out_gathered,
++                side_is_shared=linear_out_shared,
++                side_suffix=".linear_out.weight",
++                megatron_side_name=megatron_linear_out_name,
++                adapter_task=adapter_task,
++                num_moe_experts=num_moe_experts,
++                megatron_model=megatron_model,
++                mapping_registry=mapping_registry,
++                cpu=cpu,
++                is_linear_out=True,
++            )
++
++    def _emit_grouped_adapter_side(
++        self,
++        *,
++        side_tensor,
++        side_gathered,
++        side_is_shared,
++        side_suffix,
++        megatron_side_name,
++        adapter_task,
++        num_moe_experts,
++        megatron_model,
++        mapping_registry,
++        cpu,
++        is_linear_out,
++    ):
++        """Emit one adapter side (linear_in or linear_out) for a grouped expert.
++
++        Shared (2D): emit ONCE at base_suffix ".weight0" with ``unsqueeze(0)``
++        to produce [1, ..., ...] — SGLang detects expert_dim=1 as shared.
++
++        Per-expert (3D): emit ``num_moe_experts`` times, one 2D slice per
++        expert under ``.weight0..weight{N-1}``.
++        """
++        import os
++        from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
++
++        rank = int(os.environ.get("RANK", "0"))
++        _should_log = (
++            "linear_fc1" in adapter_task.global_base_prefix
++            and ".layers.0." in adapter_task.global_base_prefix
++        )
++
++        if side_is_shared:
++            suffixes = [".weight0"]
++        else:
++            suffixes = [f".weight{i}" for i in range(num_moe_experts)]
++
++        _emitted_names = []
++        # The shared side is now a fully-replicated ReplicatedSharedLinear
++        # (see peft/utils.py); every rank holds the full [out, in] tensor.
++        # No TP gather is needed — emit ``side_tensor`` directly.
++        for base_suffix in suffixes:
++            if side_is_shared:
++                current = side_tensor
++            else:
++                expert_idx = int(base_suffix[len(".weight"):])
++                current = self._select_expert_adapter_weight(
++                    side_tensor, side_gathered, expert_idx, num_moe_experts
++                )
++            if cpu:
++                current = current.cpu()
++            if side_is_shared:
++                current = current.unsqueeze(0)  # 2D -> [1, ..., ...]
++
++            base_hf_names = self._get_base_hf_param_names_for_adapter(
++                mapping_registry,
++                adapter_task.global_base_prefix,
++                adapter_task.adapter_key,
++                base_suffix,
++            )
++            if side_is_shared:
++                # Shared-outer (PR #21466) is a single ``[1, ..., ...]`` tensor,
++                # not "expert 0's weight". The mapping registry resolved
++                # ``.weight0`` through the per-expert wildcard and produced an
++                # HF name containing ``experts.N.``; strip it so SGLang's
++                # ``_process_weight`` routes the tensor through the direct 3D
++                # branch (``"experts" in name and weights.dim() == 3``) rather
++                # than the per-expert dict path (``experts\.(\d+)\.``).
++                base_hf_names = [
++                    re.sub(r"\bexperts\.\d+\.", "experts.", n) for n in base_hf_names
++                ]
++            side_hf_names = [
++                self._make_lora_param_name(bn, side_suffix) for bn in base_hf_names
++            ]
++
++            if _should_log:
++                print(
++                    f"[BRIDGE_DBG rank={rank}] _emit side: prefix={adapter_task.global_base_prefix} "
++                    f"side_suffix={side_suffix} side_is_shared={side_is_shared} "
++                    f"is_linear_out={is_linear_out} base_suffix={base_suffix} "
++                    f"base_hf_names={base_hf_names} side_hf_names={side_hf_names} "
++                    f"current.shape={tuple(current.shape)}",
++                    flush=True,
++                )
++
++            # Handle fused adapters (e.g., linear_fc1 splitting into
++            # gate_proj/up_proj). Only applies to linear_out side.
++            if is_linear_out and adapter_task.adapter_key is None:
++                per_base = self._get_fused_adapter_linear_out_slices(
++                    megatron_model,
++                    base_hf_names,
++                    current,
++                    is_expert=is_expert_linear(adapter_task.global_base_prefix),
++                )
++                if per_base is not None:
++                    for index, base_name in enumerate(base_hf_names):
++                        chunk = per_base.get(base_name)
++                        assert chunk is not None, "unknown projection name"
++                        _emitted_names.append(side_hf_names[index])
++                        yield HFWeightTuple(side_hf_names[index], chunk, megatron_side_name)
++                    continue
++
++            # Shared side of a fused adapter (Megatron ``LoRA`` class, as
++            # opposed to ``CanonicalLoRA``): one ``A`` feeds all fused
++            # projections (gate AND up through the single ``linear_fc1``).
++            # HF PEFT expects the same A at BOTH gate_proj.lora_A AND
++            # up_proj.lora_A so that SGLang's ``normalize_gate_up_proj``
++            # stacks ``[A, A]`` along the rank dim. If we only emit the
++            # first name, the other half gets zero-filled and the up-side
++            # LoRA delta is silently 0. Mirrors the dense-MLP path in
++            # ``_emit_default_adapter``.
++            if side_is_shared and len(side_hf_names) > 1:
++                for hf_name in side_hf_names:
++                    _emitted_names.append(hf_name)
++                    yield HFWeightTuple(hf_name, current, megatron_side_name)
++                continue
++
++            _emitted_names.append(side_hf_names[0] if side_hf_names else "<EMPTY!>")
++            yield HFWeightTuple(side_hf_names[0], current, megatron_side_name)
++
++        if _should_log:
++            print(
++                f"[BRIDGE_DBG rank={rank}] _emit DONE: prefix={adapter_task.global_base_prefix} "
++                f"side_suffix={side_suffix} side_is_shared={side_is_shared} "
++                f"is_linear_out={is_linear_out} emitted={len(_emitted_names)} names "
++                f"first3={_emitted_names[:3]}",
++                flush=True,
++            )
++
++    def _emit_default_adapter(
++        self,
++        *,
++        adapter_task,
++        linear_in_tensor,
++        linear_out_tensor,
++        megatron_linear_in_name,
++        megatron_linear_out_name,
++        megatron_model,
++        mapping_registry,
++        cpu,
++    ):
++        """Non-grouped-expert adapter: single-suffix emission (parent default)."""
++        from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
++
++        if cpu:
++            linear_in_tensor = linear_in_tensor.cpu()
++            linear_out_tensor = linear_out_tensor.cpu()
++
++        base_hf_names = self._get_base_hf_param_names_for_adapter(
++            mapping_registry,
++            adapter_task.global_base_prefix,
++            adapter_task.adapter_key,
++            ".weight",
++        )
++        linear_in_hf_names = [
++            self._make_lora_param_name(bn, ".linear_in.weight") for bn in base_hf_names
++        ]
++        linear_out_hf_names = [
++            self._make_lora_param_name(bn, ".linear_out.weight") for bn in base_hf_names
++        ]
++
++        if adapter_task.adapter_key is None:
++            per_base = self._get_fused_adapter_linear_out_slices(
++                megatron_model,
++                base_hf_names,
++                linear_out_tensor,
++                is_expert=is_expert_linear(adapter_task.global_base_prefix),
++            )
++            if per_base is not None:
++                for index, base_name in enumerate(base_hf_names):
++                    chunk = per_base.get(base_name)
++                    assert chunk is not None, "unknown projection name"
++                    yield HFWeightTuple(linear_in_hf_names[index], linear_in_tensor, megatron_linear_in_name)
++                    yield HFWeightTuple(linear_out_hf_names[index], chunk, megatron_linear_out_name)
++                return
++
++        yield HFWeightTuple(linear_in_hf_names[0], linear_in_tensor, megatron_linear_in_name)
++        yield HFWeightTuple(linear_out_hf_names[0], linear_out_tensor, megatron_linear_out_name)
 +
 +    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> KimiK25VLModelProvider:
 +        hf_config = hf_pretrained.config
@@ -2275,6 +2552,582 @@ index 41b8f716..f859d6e5 100644
  
      def provide(self, pre_process=None, post_process=None, vp_stage=None):
          """Provide a Qwen2.5 Omni model instance with vision, audio, and language components."""
+diff --git a/src/megatron/bridge/peft/lora.py b/src/megatron/bridge/peft/lora.py
+index 48d4057e..c54931b6 100644
+--- a/src/megatron/bridge/peft/lora.py
++++ b/src/megatron/bridge/peft/lora.py
+@@ -27,6 +27,7 @@ from megatron.core.utils import unwrap_model
+ from megatron.bridge.peft.base import PEFT
+ from megatron.bridge.peft.lora_layers import (
+     LinearAdapter,
++    LoRAGroupedExpertLinear,
+     LoRALinear,
+     LoRATopKRouter,
+     TEFusedLoRALinear,
+@@ -34,7 +35,16 @@ from megatron.bridge.peft.lora_layers import (
+     patch_linear_module,
+ )
+ from megatron.bridge.peft.module_matcher import ModuleMatcher
+-from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
++from megatron.bridge.peft.utils import (
++    HAVE_TE_COL_GRP_LINEAR,
++    HAVE_TE_ROW_GRP_LINEAR,
++    ParallelLinearAdapter,
++    SharedOuterGroupedExpertAdapter,
++    TEColumnParallelGroupedLinear,
++    TERowParallelGroupedLinear,
++    get_adapter_attributes_from_linear,
++    is_expert_linear,
++)
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -78,6 +88,12 @@ class LoRA(PEFT, ModuleMatcher):
+         lora_A_init_method (str): Initialization method for the low-rank matrix A. Defaults to "xavier".
+         lora_B_init_method (str): Initialization method for the low-rank matrix B. Defaults to "zero".
+         lora_dtype (torch.dtype): Parameter data type for LoRA weights. Default None (will use model's dtype).
++        experts_shared_outer_loras (bool): When True, grouped-expert LoRA
++            (``TE*ParallelGroupedLinear`` base modules) uses
++            :class:`SharedOuterGroupedExpertAdapter` — ``gate_up`` lora_A and
++            ``down`` lora_B are shared across experts (expert_dim=1), matching
++            SGLang's ``experts_shared_outer_loras=True`` serving contract (PR
++            #21466). Default False preserves the standard per-expert adapter.
+     """
+ 
+     target_modules: List[str] = field(
+@@ -91,6 +107,7 @@ class LoRA(PEFT, ModuleMatcher):
+     lora_B_init_method: str = "zero"
+     a2a_experimental: bool = False
+     lora_dtype: torch.dtype = None
++    experts_shared_outer_loras: bool = False
+ 
+     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
+         """
+@@ -148,6 +165,44 @@ class LoRA(PEFT, ModuleMatcher):
+             )
+ 
+             logging.info(f"Adding lora to: {full_name}")
++
++            # Grouped-expert linear (TEGroupedMLP's linear_fc1/linear_fc2):
++            # optionally use the shared-outer adapter (matches SGLang PR
++            # #21466's experts_shared_outer_loras=True contract). Gated on
++            # ``experts_shared_outer_loras`` so other grouped-MoE LoRA users
++            # keep the default per-expert behavior.
++            grouped_expert_types = []
++            if HAVE_TE_COL_GRP_LINEAR:
++                grouped_expert_types.append(TEColumnParallelGroupedLinear)
++            if HAVE_TE_ROW_GRP_LINEAR:
++                grouped_expert_types.append(TERowParallelGroupedLinear)
++            is_grouped_expert_linear = bool(grouped_expert_types) and isinstance(
++                module, tuple(grouped_expert_types)
++            )
++            if is_grouped_expert_linear and self.experts_shared_outer_loras:
++                adapter = SharedOuterGroupedExpertAdapter(
++                    attrs.in_features,
++                    attrs.out_features,
++                    self.dim,
++                    num_local_experts=module.num_gemms,
++                    base_linear_name=full_name,
++                    activation="identity",
++                    norm_type=None,
++                    column_init_method=self.lora_A_init_method,
++                    row_init_method=self.lora_B_init_method,
++                    gather_output=False,
++                    input_is_parallel=attrs.input_is_parallel,
++                    dropout=self.dropout,
++                    dropout_position=self.dropout_position,
++                    model_parallel_config=getattr(module, "config", None),
++                    alpha=self.alpha,
++                    a2a_experimental=self.a2a_experimental,
++                    disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
++                    disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
++                    base_linear_is_parallel=attrs.base_linear_is_parallel,
++                )
++                return LoRAGroupedExpertLinear(module, adapter)
++
+             adapter = ParallelLinearAdapter(
+                 attrs.in_features,
+                 attrs.out_features,
+diff --git a/src/megatron/bridge/peft/lora_layers.py b/src/megatron/bridge/peft/lora_layers.py
+index d5404c64..2eaa138b 100644
+--- a/src/megatron/bridge/peft/lora_layers.py
++++ b/src/megatron/bridge/peft/lora_layers.py
+@@ -62,6 +62,71 @@ class LoRALinear(AdapterWrapper):
+         return linear_output + adapter_output, bias
+ 
+ 
++class LoRAGroupedExpertLinear(LoRALinear):
++    """LoRALinear for grouped-expert linears (TE*ParallelGroupedLinear).
++
++    The base module's forward takes ``(x, tokens_per_expert)``; the adapter
++    for shared-outer expert LoRA also needs ``tokens_per_expert`` to run its
++    per-expert GroupedLinear side. Plumb it through.
++    """
++
++    # Per-process counter for diagnostic logging (ordered per-layer trace).
++    _MEM_TRACE_COUNTER = 0
++
++    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
++        # Diagnostic logging — no-op unless ``MILES_MEM_TRACE=1``.
++        import os as _os
++        _trace = _os.environ.get("MILES_MEM_TRACE", "").strip().lower() not in ("", "0", "false", "no")
++        _tag = ""
++        _rank = 0
++        _alloc0 = _alloc1 = _alloc2 = 0
++        if _trace:
++            LoRAGroupedExpertLinear._MEM_TRACE_COUNTER += 1
++            _tag = f"lora_grouped#{LoRAGroupedExpertLinear._MEM_TRACE_COUNTER}"
++            _alloc0 = torch.cuda.memory_allocated()
++            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++            print(
++                f"[MEM rank={_rank} alloc={_alloc0/1024**3:6.2f}GiB] {_tag} enter "
++                f"x.requires_grad={x.requires_grad} grad_enabled={torch.is_grad_enabled()}",
++                flush=True,
++            )
++
++        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
++
++        if _trace:
++            _alloc1 = torch.cuda.memory_allocated()
++            print(
++                f"[MEM rank={_rank} alloc={_alloc1/1024**3:6.2f}GiB Δ={(_alloc1-_alloc0)/1024**3:+.2f}GiB] {_tag} post_base "
++                f"linear_output.requires_grad={linear_output.requires_grad}",
++                flush=True,
++            )
++
++        if not self._adapter_enabled:
++            return linear_output, bias
++        # TEGroupedMLP calls linear_fc1(x, tokens_per_expert) positionally.
++        m_splits = args[0] if args else kwargs.get("m_splits", kwargs.get("tokens_per_expert"))
++        adapter_output = self.adapter(layernorm_output.contiguous(), m_splits=m_splits)
++        adapter_output = adapter_output.reshape(linear_output.shape)
++
++        if _trace:
++            _alloc2 = torch.cuda.memory_allocated()
++            print(
++                f"[MEM rank={_rank} alloc={_alloc2/1024**3:6.2f}GiB Δ={(_alloc2-_alloc1)/1024**3:+.2f}GiB] {_tag} post_adapter "
++                f"adapter_output.requires_grad={adapter_output.requires_grad}",
++                flush=True,
++            )
++
++        out = linear_output + adapter_output
++        if _trace:
++            _alloc3 = torch.cuda.memory_allocated()
++            print(
++                f"[MEM rank={_rank} alloc={_alloc3/1024**3:6.2f}GiB Δ={(_alloc3-_alloc2)/1024**3:+.2f}GiB] {_tag} post_add "
++                f"out.requires_grad={out.requires_grad} has_grad_fn={out.grad_fn is not None}",
++                flush=True,
++            )
++        return out, bias
++
++
+ class LoRATopKRouter(AdapterWrapper):
+     """Adapter wrapper that applies LoRA to router gating logits."""
+ 
+diff --git a/src/megatron/bridge/peft/utils.py b/src/megatron/bridge/peft/utils.py
+index 1ca5b18b..886d3ee0 100644
+--- a/src/megatron/bridge/peft/utils.py
++++ b/src/megatron/bridge/peft/utils.py
+@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional, Tuple
+ 
+ import packaging
+ import torch
++import torch.distributed as dist
+ import torch.nn as nn
+ from megatron.core import ModelParallelConfig, parallel_state
+ from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
+@@ -732,3 +733,391 @@ class ParallelLinearAdapter(nn.Module):
+         sharded_state_dict.update(linear_in_sd)
+         sharded_state_dict.update(linear_out_sd)
+         return sharded_state_dict
++
++
++class SharedGradAllReduce(torch.autograd.Function):
++    """Identity forward; backward averages the grad across the intra-PP-stage
++    group (``tensor_and_data_parallel_group`` with CP = TP×DP×CP, which by
++    Megatron's construction equals ETP×EP×EDP = all ranks in this stage).
++
++    Used to keep a logically-replicated weight in sync across EP replicas
++    that Megatron's default DDP paths don't cover: neither ``allreduce=True``
++    (reduces over dp_cp only) nor ``allreduce=False`` (reduces over EDP
++    only) spans the full intra-stage set.
++
++    Mirrors the :class:`_All2AllHp2Sp` pattern in this file: a custom
++    ``torch.autograd.Function`` for a distributed collective Megatron-Core
++    has no native primitive for.
++    """
++
++    @staticmethod
++    def forward(ctx, weight: torch.Tensor) -> torch.Tensor:
++        return weight
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
++        if grad_output is None:
++            return None
++        group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
++        if torch.distributed.get_world_size(group=group) > 1:
++            grad = grad_output.contiguous()
++            torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.AVG, group=group)
++            return grad
++        return grad_output
++
++
++def broadcast_across_intra_stage_group(weight: torch.Tensor) -> None:
++    """One-shot broadcast from group rank 0 so replicas start bit-identical.
++
++    Called once per adapter ``__init__`` so that despite per-rank
++    initialization (different RNG state), every rank in the intra-PP-stage
++    group holds the same initial weight. Gradient sync during training is
++    handled by :class:`SharedGradAllReduce`.
++    """
++    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
++        return
++    try:
++        group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
++    except AssertionError:
++        return
++    if torch.distributed.get_world_size(group=group) <= 1:
++        return
++    if not weight.is_cuda:
++        # NCCL requires CUDA tensors; if construction is pre-GPU, skip the
++        # broadcast and rely on deterministic init matching across ranks.
++        return
++    src_rank = torch.distributed.get_global_rank(group, 0)
++    with torch.no_grad():
++        torch.distributed.broadcast(weight, src=src_rank, group=group)
++
++
++class StageReplicatedColumnParallelLinear(ColumnParallelLinear):
++    """:class:`ColumnParallelLinear` whose weight gradient is averaged across
++    the intra-PP-stage group in backward, keeping a logically-replicated
++    weight in sync across EP replicas.
++
++    Construct with ``is_expert=True`` so the underlying TP group is the ETP
++    group (ETP=1 ⇒ local forward; ETP>1 ⇒ native ETP column sharding).
++    ``allreduce=False`` is set automatically by the parent (line ~902 of
++    ``megatron/core/tensor_parallel/layers.py``) → DDP routes the weight
++    through ``intra_expt_dp_group``, and the cross-EP axis is covered by
++    :class:`SharedGradAllReduce`.
++    """
++
++    def forward(self, input_, weight=None, runtime_gather_output=None):
++        if weight is None:
++            weight = self.weight
++        return super().forward(
++            input_,
++            weight=SharedGradAllReduce.apply(weight),
++            runtime_gather_output=runtime_gather_output,
++        )
++
++
++class StageReplicatedRowParallelLinear(RowParallelLinear):
++    """Row-parallel twin of :class:`StageReplicatedColumnParallelLinear`.
++
++    Parent's ``forward`` uses ``self.weight`` directly (no override kwarg),
++    so we inline the minimal forward body with a wrapped weight.
++    """
++
++    def forward(self, input_):
++        weight = SharedGradAllReduce.apply(self.weight)
++
++        if self.input_is_parallel:
++            input_parallel = input_
++        else:
++            assert not self.sequence_parallel
++            from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
++
++            input_parallel = scatter_to_tensor_model_parallel_region(input_, group=self.tp_group)
++
++        if self.config._cpu_offloading_context is not None:
++            if self.config._cpu_offloading_context.inside_context is True:
++                input_parallel.activation_offloading = self.config.cpu_offloading_activations
++
++        output_parallel = self._forward_impl(
++            input=input_parallel,
++            weight=weight,
++            bias=None,
++            gradient_accumulation_fusion=self.gradient_accumulation_fusion,
++            allreduce_dgrad=False,
++            sequence_parallel=False,
++            tp_group=None,
++            grad_output_buffer=None,
++        )
++
++        if self.explicit_expert_comm:
++            assert self.skip_bias_add
++            output_ = output_parallel
++        elif self.sequence_parallel:
++            from megatron.core.tensor_parallel.mappings import reduce_scatter_to_sequence_parallel_region
++
++            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel, group=self.tp_group)
++        else:
++            from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
++
++            output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
++
++        if not self.skip_bias_add:
++            output = (output_ + self.bias) if self.bias is not None else output_
++            output_bias = None
++        else:
++            output = output_
++            output_bias = self.bias
++        return output, output_bias
++
++
++class PackedPerExpertLinear(nn.Module):
++    """Per-expert linear with a packed 3D weight ``[N_local, out, in]``.
++
++    Used as the per-expert side of :class:`SharedOuterGroupedExpertAdapter`.
++    Stores one ``nn.Parameter`` (3D) so Bridge's adapter export sees a single
++    ``.weight`` per side (matching the ``adapter.linear_in.weight`` /
++    ``adapter.linear_out.weight`` convention in
++    :mod:`megatron.bridge.models.conversion.peft_bridge`). Forward dispatches
++    to :func:`torch._grouped_mm` — same grouped GEMM kernel TE's
++    :class:`te.pytorch.GroupedLinear` calls, but via a single fused op with
++    native autograd, so we don't need per-expert Python iteration (which
++    desyncs rank kernel launch counts and deadlocks CP's ring P2P).
++
++    .. note::
++        :func:`torch._grouped_mm` is a private API (added in torch 2.9). We
++        guard on ``hasattr`` at construction; consumers targeting older torch
++        would need a ``te.pytorch.general_grouped_gemm`` path here.
++
++    Marks ``.weight`` with ``allreduce=False`` so Megatron-Core's DDP syncs
++    gradients only within ``intra_expt_dp_group`` — each EP rank's per-expert
++    adapter is distinct by construction and should stay that way.
++    """
++
++    def __init__(
++        self,
++        num_local_experts: int,
++        in_features: int,
++        out_features: int,
++        *,
++        init_method: Optional[Callable] = None,
++        dtype: Optional[torch.dtype] = None,
++        device: Optional[torch.device] = None,
++    ):
++        super().__init__()
++        if not hasattr(torch, "_grouped_mm"):
++            raise RuntimeError(
++                "PackedPerExpertLinear requires torch._grouped_mm (torch >= 2.9)."
++            )
++        self.num_local_experts = num_local_experts
++        self.in_features = in_features
++        self.out_features = out_features
++        weight = torch.empty(num_local_experts, out_features, in_features, dtype=dtype, device=device)
++        if init_method is not None:
++            for e in range(num_local_experts):
++                init_method(weight[e])
++        else:
++            nn.init.zeros_(weight)
++        self.weight = nn.Parameter(weight)
++        setattr(self.weight, "allreduce", False)
++
++    def forward(self, x: torch.Tensor, m_splits) -> Tuple[torch.Tensor, None]:
++        # torch._grouped_mm expects mat2 as [num_groups, K, N]; our weight is
++        # [N_local, out, in] so transpose last two dims.
++        if isinstance(m_splits, torch.Tensor):
++            m_splits_i32 = m_splits.to(device=x.device, dtype=torch.int32)
++        else:
++            m_splits_i32 = torch.tensor(m_splits, device=x.device, dtype=torch.int32)
++        offs = torch.cumsum(m_splits_i32, dim=0, dtype=torch.int32)
++        out = torch._grouped_mm(x, self.weight.transpose(1, 2), offs=offs)
++        return out, None
++
++    def sharded_state_dict(self, prefix: str = "", sharded_offsets=(), metadata=None):
++        """Shard the packed 3D weight along dim 0 (experts) across EP ranks.
++
++        Logical shape across the EP group is ``[N_global, out, in]``; each EP
++        rank owns the contiguous ``[ep_rank*N_local : (ep_rank+1)*N_local]``
++        slice. The ``('num_local_experts', ep_rank, ep_size)`` rank-offset
++        makes Megatron's dist-ckpt recognize these as true shards (not
++        replicas) and avoid save collisions.
++        """
++        from megatron.core.dist_checkpointing.mapping import ShardedTensor
++
++        key = f"{prefix}weight"
++        ep_size = parallel_state.get_expert_model_parallel_world_size()
++        if ep_size > 1:
++            ep_rank = parallel_state.get_expert_model_parallel_rank()
++            # The expert dim (dim 0 of the 3D weight) is globally offset by
++            # ep_rank * num_local_experts, and spans ep_size EP shards.
++            shard = ShardedTensor.from_rank_offsets(
++                key,
++                self.weight.data,
++                (0, ep_rank, ep_size),
++                replica_id=(
++                    parallel_state.get_pipeline_model_parallel_rank(),
++                    parallel_state.get_expert_tensor_parallel_rank(),
++                    parallel_state.get_expert_data_parallel_rank(),
++                ),
++            )
++        else:
++            shard = ShardedTensor.from_rank_offsets(
++                key,
++                self.weight.data,
++                replica_id=(
++                    parallel_state.get_pipeline_model_parallel_rank(),
++                    0,
++                    0,
++                ),
++            )
++        return {key: shard}
++
++
++class SharedOuterGroupedExpertAdapter(ParallelLinearAdapter):
++    """LoRA adapter for grouped expert MLP with shared-outer semantics.
++
++    Matches SGLang PR #21466's ``experts_shared_outer_loras=True`` contract:
++
++    * fc1 (gate_up):  linear_in  = SHARED     (hidden -> rank)
++                      linear_out = PER-EXPERT (rank -> 2*intermediate)
++    * fc2 (down):     linear_in  = PER-EXPERT (intermediate -> rank)
++                      linear_out = SHARED     (rank -> hidden)
++
++    **Shared side** uses :class:`StageReplicatedColumnParallelLinear` (fc1)
++    or :class:`StageReplicatedRowParallelLinear` (fc2). Both are ``is_expert=
++    True`` subclasses of Megatron's parallel linear: the TP group is ETP
++    (ETP=1 → local forward), DDP routes through the EDP group, and the
++    logically-replicated cross-EP axis is covered by :class:`SharedGradAllReduce`.
++
++    **Per-expert side** uses :class:`PackedPerExpertLinear` (packed 3D weight
++    + :func:`torch._grouped_mm`) — kept as a single ``.weight`` Parameter so
++    Bridge's adapter-export materializer (which reads ``linear_in.weight`` /
++    ``linear_out.weight``) sees a standard single-weight linear per side.
++
++    Differs from ``ParallelLinearAdapter`` only in ``__init__`` and
++    ``forward``; ``sharded_state_dict`` and scaling behavior are inherited.
++    """
++
++    def __init__(
++        self,
++        in_features: int,
++        out_features: int,
++        dim: int,
++        *,
++        num_local_experts: int,
++        base_linear_name: str,
++        activation: str = "identity",
++        norm_type: Optional[str] = None,
++        column_init_method: str = "xavier",
++        row_init_method: str = "zero",
++        gather_output: bool = False,
++        input_is_parallel: bool = False,
++        dropout: float = 0.0,
++        dropout_position: str = "post",
++        model_parallel_config: Optional[ModelParallelConfig] = None,
++        alpha: Optional[float] = None,
++        a2a_experimental: bool = False,
++        disable_tensor_parallel_comm: bool = False,
++        disable_sequence_parallel_comm: bool = False,
++        base_linear_is_parallel: bool = True,
++    ):
++        nn.Module.__init__(self)
++
++        self._is_fc1 = ".linear_fc1" in base_linear_name
++        if not self._is_fc1:
++            assert ".linear_fc2" in base_linear_name, (
++                f"SharedOuterGroupedExpertAdapter only supports linear_fc1/linear_fc2; "
++                f"got base_linear_name={base_linear_name}"
++            )
++        self.num_local_experts = num_local_experts
++        self.base_linear_name = base_linear_name
++
++        self.activation = self._get_activation_fn(activation)
++        self.dim = dim
++        self.alpha = alpha if alpha is not None else self.dim
++        self.input_is_parallel = input_is_parallel
++        self.dropout_position = dropout_position
++        self.use_a2a = a2a_experimental
++        # is_expert=True keeps ParallelLinearAdapter.sharded_state_dict on the
++        # expert replica_id branch (which we don't fully inherit for our
++        # packed per-expert side, but matches the convention).
++        self.is_expert = True
++
++        if model_parallel_config is None:
++            model_parallel_config = ModelParallelConfig()
++        self.config = model_parallel_config
++
++        if self._is_fc1:
++            # Shared A (hidden → rank): ColumnParallel, ETP-sharded output.
++            self.linear_in = StageReplicatedColumnParallelLinear(
++                in_features,
++                dim,
++                config=model_parallel_config,
++                bias=False,
++                gather_output=True,
++                init_method=self._get_init_fn(column_init_method),
++                is_expert=True,
++            )
++            # Per-expert B (rank → 2*intermediate): packed 3D weight.
++            self.linear_out = PackedPerExpertLinear(
++                num_local_experts=num_local_experts,
++                in_features=dim,
++                out_features=out_features,
++                init_method=self._get_init_fn(row_init_method),
++            )
++        else:
++            # Per-expert A (intermediate → rank): packed 3D weight.
++            self.linear_in = PackedPerExpertLinear(
++                num_local_experts=num_local_experts,
++                in_features=in_features,
++                out_features=dim,
++                init_method=self._get_init_fn(column_init_method),
++            )
++            # Shared B (rank → hidden): RowParallel, ETP-sharded input.
++            self.linear_out = StageReplicatedRowParallelLinear(
++                dim,
++                out_features,
++                config=model_parallel_config,
++                bias=False,
++                input_is_parallel=True,
++                skip_bias_add=True,
++                init_method=self._get_init_fn(row_init_method),
++                is_expert=True,
++            )
++
++        if dropout > 0.0:
++            self.dropout = nn.Dropout(dropout)
++        else:
++            self.dropout = nn.Identity()
++
++        if model_parallel_config.bf16:
++            self.bfloat16()
++        elif model_parallel_config.fp16:
++            self.half()
++
++        self.disable_sequence_parallel_comm = disable_sequence_parallel_comm
++
++        # One-shot broadcast so every rank in the intra-PP-stage group starts
++        # bit-identical. Gradient-side sync during training is owned by
++        # SharedGradAllReduce inside the stage-replicated linear subclasses.
++        shared_weight = self.linear_in.weight if self._is_fc1 else self.linear_out.weight
++        broadcast_across_intra_stage_group(shared_weight.data)
++
++    def forward(self, x: torch.Tensor, m_splits=None) -> torch.Tensor:
++        """Forward. ``m_splits`` is the tokens-per-expert split passed through
++        from the base TEGroupedLinear; required for the per-expert side.
++        """
++        if self.dropout_position == "pre":
++            x = self.dropout(x)
++
++        if self._is_fc1:
++            # Shared A → activation → per-expert B.
++            x, _ = self.linear_in(x)
++            x = self.activation(x)
++            x, _ = self.linear_out(x, m_splits)
++        else:
++            # Per-expert A → activation → shared B.
++            x, _ = self.linear_in(x, m_splits)
++            x = self.activation(x)
++            x, _ = self.linear_out(x)
++
++        if self.dropout_position == "post":
++            x = self.dropout(x)
++
++        return x * (self.alpha / self.dim)
 diff --git a/src/megatron/bridge/utils/activation_map.py b/src/megatron/bridge/utils/activation_map.py
 new file mode 100644
 index 00000000..db32ed32

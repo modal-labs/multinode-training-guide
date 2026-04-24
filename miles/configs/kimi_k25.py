@@ -1,13 +1,33 @@
-"""Kimi-K2.5 full-param smoke test — 8x H200, colocated, freeze most layers.
+"""Kimi-K2.5 — 8 H200 nodes (8 GPUs each), colocated. NOT real full-param:
+trains only the last 3 layers via ``only_train_params_name_list``.
 
-Run: EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
+Run:
+    EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
+
+To train the actual full-param Kimi-K2.5, you need **at least 32 nodes (256
+H200s)** for the parallelism to close. Reference recipe (script + parallelism
+config):
+    https://gist.github.com/GeLee-Q/aa8a5336fa48c5934172aaa6e25ef5e7
+
+To convert this config to real full-param:
+  1. Remove / set ``only_train_params_name_list = None`` so all layers train.
+  2. Bump ``actor_num_nodes`` to 32 and re-size the parallelism accordingly
+     (``tensor_model_parallel_size``, ``pipeline_model_parallel_size``,
+     ``context_parallel_size``, ``expert_model_parallel_size``) — see gist.
+
+Knobs to tune (train/rollout throughput):
+  - ``max_tokens_per_gpu`` (+ ``log_probs_max_tokens_per_gpu``)
+  - ``rollout_max_response_len`` (increase if you see high truncated_ratio)
+  - ``rollout_batch_size``
+  - ``n_samples_per_prompt``
+  - ``sglang_mem_fraction_static``
 """
 
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
 
-_SGLANG_SYNC_SHA = "1ca33e4e95dda7d5afc9e461fa3924ea2f57e126"
-_MEGATRON_BRIDGE_SHA = "d1232659282474c70e5233fbb6f29a5527f22bb0"
-_MILES_SHA = "9a003644739f4e6dd509e2e8337e8ae7e571941c"
+SGLANG_SYNC_SHA = "b51b26377b72f8fb839d6d3b56ad2ead840bda95"
+MEGATRON_BRIDGE_SHA = "3fd3768045422d0aa5c97e90a4e6c659aea9acb9"
+MILES_SHA = "cc077c4e03cc806cfcafce61a0667a8aa6636777"
 
 modal = ModalConfig(
     gpu="H200",
@@ -21,11 +41,11 @@ modal = ModalConfig(
         # Remove pip nvidia-cudnn — TE loads system cuDNN via absolute paths and
         # the pip version has H200 symbol mismatches.
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
-        f"cd /sgl-workspace/sglang && git fetch origin sglang-miles && git checkout {_SGLANG_SYNC_SHA}",
+        f"cd /sgl-workspace/sglang && git fetch origin sglang-miles && git checkout {SGLANG_SYNC_SHA}",
         "cd /sgl-workspace/sglang && git update-index --refresh && git apply --3way /tmp/sglang_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
-        f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{_MEGATRON_BRIDGE_SHA}",
+        f"uv pip install --system --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@{MEGATRON_BRIDGE_SHA}",
         "cd /usr/local/lib/python3.12/dist-packages && patch -p2 --no-backup-if-mismatch < /tmp/megatron_bridge_kimi_vl.patch",
-        f"cd /root/miles && git fetch && git checkout {_MILES_SHA} && git update-index --refresh && git apply --3way /tmp/miles_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
+        f"cd /root/miles && git fetch && git checkout {MILES_SHA} && git update-index --refresh && git apply --3way /tmp/miles_lora.patch && if grep -R -n '^<<<<<<< ' .; then echo 'Patch failed to apply cleanly. Please resolve conflicts.' && exit 1; fi",
     ],
 )
 
@@ -40,7 +60,6 @@ class _Miles(MilesConfig):
         "NCCL_TIMEOUT": "3600",
         "OPEN_TRAINING_INT4_FAKE_QAT_FLAG": "1",
         "OPEN_TRAINING_INT4_GROUP_SIZE": "32",
-        # "NCCL_DEBUG": "WARN",
     }
     hf_checkpoint = "moonshotai/Kimi-K2.5"
     ref_load = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
@@ -67,8 +86,9 @@ class _Miles(MilesConfig):
     num_rollout = 5
     rollout_batch_size = 32
     n_samples_per_prompt = 8
-    rollout_max_response_len = 8192
+    rollout_max_response_len = 16384
     rollout_temperature = 1
+    sglang_cuda_graph_bs = [1, 2, 4, 8] + list(range(16, 129, 8))
     # dynamic_sampling_filter_path = (
     #     "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std"
     # )
@@ -108,7 +128,7 @@ class _Miles(MilesConfig):
     recompute_num_layers = 1
 
     use_dynamic_batch_size = True
-    max_tokens_per_gpu = 2048
+    max_tokens_per_gpu = 4096
 
     attention_dropout = 0.0
     hidden_dropout = 0.0
@@ -120,7 +140,7 @@ class _Miles(MilesConfig):
     rollout_num_gpus_per_engine = 8
     sglang_mem_fraction_static = 0.7
     sglang_ep_size = 8
-    sglang_server_concurrency = 256
+    sglang_server_concurrency = 1024
 
     use_wandb = True
     wandb_project = "miles-kimi-k25"
