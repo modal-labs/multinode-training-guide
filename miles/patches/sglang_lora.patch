@@ -1,0 +1,1120 @@
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index 971762f43..01399ca85 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -66,6 +66,7 @@ from sglang.srt.managers.io_struct import (
+     GetWeightsByNameReqInput,
+     InitWeightsUpdateGroupReqInput,
+     LoadLoRAAdapterFromTensorsReqInput,
++    UpdateLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterReqInput,
+     MultimodalDataInputFormat,
+     OpenSessionReqInput,
+@@ -998,6 +999,7 @@ class Engine(EngineScoreMixin, EngineBase):
+         tensors,
+         config_dict: Dict,
+         load_format: Optional[str] = None,
++        finalize: bool = True,
+     ):
+         if load_format == "flattened_bucket":
+             serialized_tensors = tensors
+@@ -1010,11 +1012,37 @@ class Engine(EngineScoreMixin, EngineBase):
+             config_dict=config_dict,
+             serialized_tensors=serialized_tensors,
+             load_format=load_format,
++            finalize=finalize,
+         )
+         return self.loop.run_until_complete(
+             self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+         )
+ 
++    def update_lora_adapter_from_tensors(
++        self,
++        lora_name: str,
++        tensors,
++        load_format: Optional[str] = None,
++        reset: bool = False,
++        finalize: bool = True,
++    ):
++        if load_format == "flattened_bucket":
++            serialized_tensors = tensors
++        else:
++            serialized_tensors = MultiprocessingSerializer.serialize(
++                tensors, output_str=True
++            )
++        req = UpdateLoRAAdapterFromTensorsReqInput(
++            lora_name=lora_name,
++            serialized_tensors=serialized_tensors,
++            load_format=load_format,
++            reset=reset,
++            finalize=finalize,
++        )
++        return self.loop.run_until_complete(
++            self.tokenizer_manager.update_lora_adapter_from_tensors(req, None)
++        )
++
+     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+         """Load a new LoRA adapter without re-launching the engine."""
+ 
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 288f2a24c..dbd27cfec 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -123,6 +123,7 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsSendGroupForRemoteInstanceReqInput,
+     InitWeightsUpdateGroupReqInput,
+     LoadLoRAAdapterFromTensorsReqInput,
++    UpdateLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterReqInput,
+     OpenSessionReqInput,
+     ParseFunctionCallReq,
+@@ -1290,6 +1291,20 @@ async def load_lora_adapter_from_tensors(
+         return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+ 
+ 
++@app.api_route("/update_lora_adapter_from_tensors", methods=["POST"])
++async def update_lora_adapter_from_tensors(
++    obj: UpdateLoRAAdapterFromTensorsReqInput, request: Request
++):
++    """In-place weight update for an already-loaded LoRA adapter."""
++    result = await _global_state.tokenizer_manager.update_lora_adapter_from_tensors(
++        obj, request
++    )
++    if result.success:
++        return ORJSONResponse(result, status_code=HTTPStatus.OK)
++    else:
++        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
++
++
+ @app.api_route("/unload_lora_adapter", methods=["POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+diff --git a/python/sglang/srt/lora/backend/base_backend.py b/python/sglang/srt/lora/backend/base_backend.py
+index 17b7bef1b..2bb59f8ea 100644
+--- a/python/sglang/srt/lora/backend/base_backend.py
++++ b/python/sglang/srt/lora/backend/base_backend.py
+@@ -19,6 +19,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
+     def __init__(self, max_loras_per_batch: int, device: torch.device):
+         self.max_loras_per_batch = max_loras_per_batch
+         self.device = device
++        self.batch_info = None
+         self.init_lm_head_config()
+ 
+     def run_lora_a_embedding(
+@@ -176,10 +177,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
+         """
+         base = moe_layer.base_layer
+         top_k = base.top_k
+-        qinfo = moe_layer._quant_info
+-        E, N, _ = qinfo.w13_weight.shape
+-        hidden_dim = qinfo.w2_weight.shape[1]
+-        device = qinfo.w13_weight.device
++        # Derive dims from the base FusedMoE rather than quant-specific tensors,
++        # so this works for any scheme (FP, WNA16, Marlin-packed, etc.).
++        E = base.num_local_experts
++        hidden_dim = base.hidden_size
++        N = 2 * base.intermediate_size_per_partition
++        device = next(base.parameters()).device
+         dtype = compute_dtype
+         num_experts = base.num_experts
+ 
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 9fb8aa14d..10c2e45b8 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -41,6 +41,15 @@ class BaseLayerWithLoRA(nn.Module):
+             self.weight = self.base_layer.weight
+         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+             self.bias = self.base_layer.bias
++        if hasattr(self.base_layer, "reduce_results"):
++            self.reduce_results = self.base_layer.reduce_results
++        # Alias remaining base-layer parameters onto the wrapper so
++        # `named_parameters(remove_duplicate=True)` yields them at the outer
++        # path — weight loaders (e.g. FusedMoE's `w13_weight_packed`) lookup
++        # names without the `.base_layer.` segment.
++        for _name, _param in base_layer.named_parameters(recurse=False):
++            if not hasattr(self, _name):
++                setattr(self, _name, _param)
+ 
+     def forward(self, x: torch.Tensor):
+         return self.base_layer.forward(x)
+@@ -200,8 +209,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
+         ):
+             base_output = self.extra_token_embedding(input_, base_output)
+ 
+-        # Apply LoRA if configured
+-        if self.set_lora:
++        # Apply LoRA if configured. Skip if no batch_info (DP-attention idle
++        # forward): the base path is correct because no real tokens need LoRA.
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             # The backend's run_lora_a_embedding now handles both regular
+             # and extra tokens efficiently with CUDA graph support
+             base_output = self.apply_lora(base_output, input_, batch_info)
+@@ -361,8 +371,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
+             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
+         )
+ 
+-        # Apply LoRA if set
+-        if self.set_lora:
++        # Apply LoRA if set. Skip in DP-attention idle forward (batch_info unset).
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             base_output = self.apply_lora(base_output, hidden_states)
+ 
+         return base_output
+@@ -446,7 +456,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+             self.base_layer, input_, bias
+         )
+ 
+-        if self.set_lora:
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             output_parallel = self.apply_lora(output_parallel, input_)
+ 
+         if self.base_layer.gather_output:
+@@ -460,9 +470,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+         return A
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative: DP-attention makes output_partition_sizes attn_tp-local while
++        # the caller passes global tp_rank.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.output_partition_sizes[0]
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         B = B[start_idx:end_idx, :]
+         return B
+ 
+@@ -510,10 +524,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+         # Since the outputs for both gate and up are identical, we use a random one.
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative under DP-attention.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.output_partition_sizes[0]
+         gate_size = self.base_layer.output_sizes[0]
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         return torch.concat(
+             (
+                 B[start_idx:end_idx, :],
+@@ -577,11 +594,14 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         q_proj_shard_size = base_layer.q_proj_shard_size
+         kv_proj_shard_size = base_layer.kv_proj_shard_size
+         num_kv_head_replicas = base_layer.num_kv_head_replicas
++        # See RowParallelLinearWithLoRA.slice_lora_a_weights for why base_layer.tp_rank
++        # is authoritative under DP-attention.
++        local_tp_rank = getattr(base_layer, "tp_rank", tp_rank)
+ 
+-        q_start_idx = q_proj_shard_size * tp_rank
++        q_start_idx = q_proj_shard_size * local_tp_rank
+         q_end_idx = q_start_idx + q_proj_shard_size
+ 
+-        kv_shard_id = tp_rank // num_kv_head_replicas
++        kv_shard_id = local_tp_rank // num_kv_head_replicas
+         kv_start_idx = kv_proj_shard_size * kv_shard_id
+         kv_end_idx = kv_start_idx + kv_proj_shard_size
+ 
+@@ -657,7 +677,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+             and not skip_all_reduce
+         )
+ 
+-        if self.set_lora and should_reduce:
++        # LoRA skipped when batch_info is None (DP-attention idle forward).
++        have_batch_info = self.lora_backend.batch_info is not None
++        if self.set_lora and have_batch_info and should_reduce:
+             lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                 input_parallel, self.A_buffer
+             )
+@@ -670,7 +692,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+                 base_output=output_,
+             )
+         else:
+-            if self.set_lora:
++            if self.set_lora and have_batch_info:
+                 output_parallel = self.apply_lora(output_parallel, input_parallel)
+             if should_reduce:
+                 output_ = tensor_model_parallel_all_reduce(output_parallel)
+@@ -681,9 +703,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+         return output_, output_bias
+ 
+     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
++        # Use base_layer.tp_rank (not the argument) so the slicing rank matches
++        # the partition group the base layer was built on. For DeepSeek/Kimi MLA
++        # o_proj under DP-attention, base_layer.tp_rank is attn_tp_rank (0..1)
++        # while the caller passes the global tp_rank (0..7); input_size_per_partition
++        # is already attn_tp-sized, so using global tp_rank overshoots to empty.
++        local_tp_rank = getattr(self.base_layer, "tp_rank", tp_rank)
+         shard_size = self.base_layer.input_size_per_partition
+-        start_idx = tp_rank * shard_size
+-        end_idx = (tp_rank + 1) * shard_size
++        start_idx = local_tp_rank * shard_size
++        end_idx = (local_tp_rank + 1) * shard_size
+         A = A[:, start_idx:end_idx].contiguous()
+         return A
+ 
+@@ -767,7 +795,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
+     def forward(self, x: torch.Tensor):
+         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+-        if self.set_lora:
++        if self.set_lora and self.lora_backend.batch_info is not None:
+             output = self.apply_lora(output, x)
+         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+         return output, output_bias
+@@ -801,7 +829,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+ 
+         self.experts_shared_outer_loras: bool = False
+         self.lora_use_virtual_experts: bool = False
++        # Forward for the model's own forward-path dispatch (e.g.
++        # `DeepseekV2MoE.forward_normal_dual_stream` reads `self.experts.quant_method`).
++        # Quant post-processing iterators skip LoRA wrappers via
++        # `isinstance(module, BaseLayerWithLoRA)` so the packed params on the
++        # inner FusedMoE get processed there, not here.
+         self.quant_method = base_layer.quant_method
++        if hasattr(base_layer, "scheme"):
++            self.scheme = base_layer.scheme
+ 
+         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
+         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
+@@ -826,6 +861,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+             and base_layer.quant_method.runner is not None
+         ):
+             runner_backend = base_layer.quant_method.runner.runner_backend
++        elif (
++            hasattr(base_layer, "scheme")
++            and hasattr(base_layer.scheme, "runner")
++            and base_layer.scheme.runner is not None
++        ):
++            runner_backend = base_layer.scheme.runner.runner_backend
+         else:
+             runner_backend = MoeRunnerBackend.TRITON
+ 
+@@ -918,6 +959,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         1. After gate_up projection, before activation
+         2. After down projection, before final reduction
+         """
++        if self.lora_backend.batch_info is None:
++            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
+ 
+         # Build LoRA info for this batch
+         lora_info = self._get_lora_info()
+@@ -945,6 +988,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+ 
+         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
+         quant_info = self._quant_info
++        quant_info.expert_map = getattr(
++            base_layer.dispatcher, "local_expert_mapping", None
++        )
+ 
+         # Run the only lora moe runner (Triton)
+         combine_input = self._lora_runner.run(
+diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+index 082d1fb0a..13c8dc27b 100644
+--- a/python/sglang/srt/lora/lora.py
++++ b/python/sglang/srt/lora/lora.py
+@@ -88,11 +88,46 @@ class LoRAAdapter(nn.Module):
+ 
+         self._normalize_weights()
+ 
+-    def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
++    def initialize_weights_from_tensors(
++        self, tensors: Dict[str, torch.Tensor], *, finalize: bool = True
++    ):
++        """Load the given tensor dict into this adapter's CPU layer weights.
++
++        When ``finalize`` is ``False``, defer ``_normalize_weights`` so later
++        :meth:`update_weights_from_tensors` calls can contribute more tensors
++        before fusion (qkv / gate_up) runs over the complete set.
++        """
+         for name, tensor in tensors.items():
+             self._process_weight(name, tensor)
+ 
+-        self._normalize_weights()
++        if finalize:
++            self._normalize_weights()
++
++    def update_weights_from_tensors(
++        self,
++        tensors: Dict[str, torch.Tensor],
++        *,
++        reset: bool,
++        finalize: bool,
++    ):
++        """In-place weight update (parallel to update_weights_from_tensor for base).
++
++        When ``reset`` is True, clear the pre-existing ``layer.weights`` dicts
++        before writing so stale post-normalize entries from the previous sync
++        don't collide with this sync's pre-normalize names. When ``finalize``
++        is True, run ``_normalize_weights`` after writing.
++        """
++        if reset:
++            for layer in self.layers:
++                layer.weights.clear()
++            self.embedding_layers.clear()
++            self.added_tokens_embeddings.clear()
++
++        for name, tensor in tensors.items():
++            self._process_weight(name, tensor)
++
++        if finalize:
++            self._normalize_weights()
+ 
+     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
+         from sglang.srt.lora.utils import get_normalized_target_modules
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 58d00551a..cd2a4fac1 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -630,7 +630,11 @@ class LoRAManager:
+         self.loras[lora_ref.lora_id] = lora_adapter
+ 
+     def load_lora_weights_from_tensors(
+-        self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]
++        self,
++        lora_ref: LoRARef,
++        tensors: Dict[str, torch.Tensor],
++        *,
++        finalize: bool = True,
+     ):
+         """
+         Load the weights of a LoRA adapter from tensors to CPU memory.
+@@ -642,7 +646,7 @@ class LoRAManager:
+             self.load_config,
+             self.lora_backend,
+         )
+-        lora_adapter.initialize_weights_from_tensors(tensors)
++        lora_adapter.initialize_weights_from_tensors(tensors, finalize=finalize)
+         self.loras[lora_ref.lora_id] = lora_adapter
+ 
+     def load_lora_adapter_from_tensors(
+@@ -651,16 +655,21 @@ class LoRAManager:
+         tensors: Dict[str, torch.Tensor],
+         config_dict: Dict,
+         added_tokens_config: Optional[Dict] = None,
++        *,
++        finalize: bool = True,
+     ) -> LoRAUpdateOutput:
+-        """
+-        Load a single LoRA adapter from tensors and config dict.
++        """Create a LoRA adapter from tensors + config and write the first chunk.
++
++        For chunked syncs pass ``finalize=False`` so the subsequent
++        :meth:`update_lora_adapter_from_tensors` call with ``finalize=True``
++        runs ``_normalize_weights`` over the fully-accumulated state.
+         """
+         assert (
+             lora_ref.lora_name is not None and lora_ref.lora_path is not None
+         ), "LoRARef must have both lora_name and lora_path set for loading."
+         assert (
+             lora_ref.lora_id not in self.loras
+-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
++        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded."
+ 
+         try:
+             new_adapter = LoRAConfig.from_dict(
+@@ -671,7 +680,7 @@ class LoRAManager:
+             self.validate_new_adapter(new_adapter, lora_ref)
+             self.configs[lora_ref.lora_id] = new_adapter
+ 
+-            self.load_lora_weights_from_tensors(lora_ref, tensors)
++            self.load_lora_weights_from_tensors(lora_ref, tensors, finalize=finalize)
+ 
+             self.lora_refs[lora_ref.lora_id] = lora_ref
+             self.num_pinned_loras += int(lora_ref.pinned)
+@@ -683,6 +692,40 @@ class LoRAManager:
+ 
+         return self.create_lora_update_result(success=True)
+ 
++    def update_lora_adapter_from_tensors(
++        self,
++        lora_ref: LoRARef,
++        tensors: Dict[str, torch.Tensor],
++        *,
++        reset: bool,
++        finalize: bool,
++    ) -> LoRAUpdateOutput:
++        """In-place weight update for an already-loaded adapter.
++
++        Parallels :meth:`update_weights_from_tensor` for base weights — no
++        config, no uid allocation. ``reset=True`` clears the pre-existing
++        ``layer.weights`` dict before writing (use on the first chunk of a
++        new sync to drop stale post-normalize names from the previous sync).
++        ``finalize=True`` triggers ``_normalize_weights`` after the write.
++        """
++        try:
++            existing = self.loras.get(lora_ref.lora_id)
++            if existing is None:
++                raise ValueError(
++                    f"update_lora_adapter_from_tensors: no adapter with id "
++                    f"{lora_ref.lora_id} is loaded. Call "
++                    f"load_lora_adapter_from_tensors first."
++                )
++            existing.update_weights_from_tensors(
++                tensors, reset=reset, finalize=finalize
++            )
++        except Exception as e:
++            return self.create_lora_update_result(
++                success=False,
++                error_message=str(e),
++            )
++        return self.create_lora_update_result(success=True)
++
+     def init_memory_pool(self):
+         """(Re)initialize the LoRA memory pool based on the current configurations."""
+         self.memory_pool = LoRAMemoryPool(
+diff --git a/python/sglang/srt/lora/lora_moe_runner_marlin.py b/python/sglang/srt/lora/lora_moe_runner_marlin.py
+index 58ee9ed01..f6c8e160d 100644
+--- a/python/sglang/srt/lora/lora_moe_runner_marlin.py
++++ b/python/sglang/srt/lora/lora_moe_runner_marlin.py
+@@ -107,8 +107,10 @@ class MarlinLoraRunnerCore:
+         scalar_type1 = get_scalar_type(num_bits, quant_info.w13_qzeros is not None)
+         scalar_type2 = get_scalar_type(num_bits, quant_info.w2_qzeros is not None)
+ 
+-        # Stage 1: Gate/Up (Marlin)
+-        intermediate_cache1 = torch.empty(
++        # Stage 1: Gate/Up (Marlin). Zero-init — use_atomic_add=True on H200
++        # accumulates partial sums into this buffer; torch.empty() garbage can
++        # overflow bf16 when the allocator recycles pages of real weights.
++        intermediate_cache1 = torch.zeros(
+             (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+         )
+         intermediate_cache1 = moe_wna16_marlin_gemm(
+@@ -153,12 +155,11 @@ class MarlinLoraRunnerCore:
+         )
+         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+ 
+-        # Stage 3: Down (Marlin)
+-        intermediate_cache3 = torch.empty(
++        # Stage 3: Down (Marlin). Zero-init for the same atomic-add reason as
++        # intermediate_cache1 (the original EP-gated zero was not sufficient).
++        intermediate_cache3 = torch.zeros(
+             (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
+         )
+-        if quant_info.expert_map is not None:
+-            intermediate_cache3.zero_()
+ 
+         intermediate_cache3 = moe_wna16_marlin_gemm(
+             intermediate_cache2,
+diff --git a/python/sglang/srt/lora/lora_moe_runners.py b/python/sglang/srt/lora/lora_moe_runners.py
+index 983064154..94475b871 100644
+--- a/python/sglang/srt/lora/lora_moe_runners.py
++++ b/python/sglang/srt/lora/lora_moe_runners.py
+@@ -313,7 +313,14 @@ def _compute_token_lora_mapping(
+     hidden_states: torch.Tensor,
+     lora_info: LoRAInfo,
+ ) -> torch.Tensor:
+-    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
++    """Map each token to its LoRA adapter index (-1 for no LoRA).
++
++    Under DP-attention, `hidden_states` is the gathered batch (local + foreign
++    tokens) but `seg_indptr` / `req_to_lora` cover only local requests, so
++    `searchsorted` on foreign positions would index one past the end. Pad
++    `req_to_lora` with a -1 sentinel; foreign outputs are discarded by the
++    DP-attention scatter anyway.
++    """
+     token_positions = torch.arange(
+         hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
+     )
+@@ -322,7 +329,11 @@ def _compute_token_lora_mapping(
+         token_positions,
+         right=True,
+     )
+-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
++    req_to_lora = lora_info.req_to_lora.to(torch.int32)
++    req_to_lora_padded = torch.cat(
++        [req_to_lora, req_to_lora.new_full((1,), -1)], dim=0
++    )
++    return req_to_lora_padded[req_indices]
+ 
+ 
+ def _compute_lora_alignment(
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index 34444edfc..0c520c375 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -157,6 +157,66 @@ class LoRAMemoryPool:
+             or 1
+         )
+ 
++    def _row_parallel_shard_tp(
++        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
++    ) -> int:
++        """Shard count for the module's TP-partitioned activation axis.
++
++        Probes the base module's ``input_size // input_size_per_partition`` so
++        the LoRA buffer matches the activation shard regardless of which TP
++        group owns it (global tp_size, attention attn_tp_size, or per-layer
++        differences in K2.5 shared_experts dense-vs-MoE). Falls back to
++        ``self.tp_size``. Cached per ``(module_name, layer_idx)``.
++
++        For MoE-internal names (``gate_up_proj_moe`` / ``down_proj_moe``),
++        probes the FusedMoE's ``moe_tp_size`` instead — under EP>1 that can be
++        1 even when ``tp_size`` is 8.
++        """
++        cache = getattr(self, "_row_parallel_tp_cache", None)
++        if cache is None:
++            cache = {}
++            setattr(self, "_row_parallel_tp_cache", cache)
++        key = (module_name, layer_idx)
++        if key in cache:
++            return cache[key]
++
++        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
++
++        if module_name in ("gate_up_proj_moe", "down_proj_moe"):
++            for _name, module in base_model.named_modules():
++                if not any(marker in _name for marker in layer_markers):
++                    continue
++                moe_tp = getattr(module, "moe_tp_size", None)
++                if moe_tp is not None and moe_tp > 0:
++                    cache[key] = moe_tp
++                    return moe_tp
++
++        def _probe(m):
++            in_size = getattr(m, "input_size", None)
++            per_part = getattr(m, "input_size_per_partition", None)
++            if in_size is not None and per_part is not None and per_part > 0:
++                return max(1, in_size // per_part)
++            inner = getattr(m, "base_layer", None)
++            if inner is not None and inner is not m:
++                return _probe(inner)
++            return None
++
++        suffix = f".{module_name}"
++        found = None
++        for _name, module in base_model.named_modules():
++            if not _name.endswith(suffix):
++                continue
++            if not any(marker in _name for marker in layer_markers):
++                continue
++            r = _probe(module)
++            if r is not None:
++                found = r
++                break
++
++        out = found if found is not None else self.tp_size
++        cache[key] = out
++        return out
++
+     def _get_standard_shape(
+         self,
+         module_name: str,
+@@ -169,8 +229,9 @@ class LoRAMemoryPool:
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+         c = get_stacked_multiply(module_name)
+-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+-            input_dim = divide(input_dim, self.tp_size)
++        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
++        if row_tp > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
++            input_dim = divide(input_dim, row_tp)
+         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
+ 
+     def get_lora_A_shape(
+@@ -191,12 +252,13 @@ class LoRAMemoryPool:
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
+         c = get_stacked_multiply(module_name)
++        row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+         if (
+-            self.tp_size > 1
++            row_tp > 1
+             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+             and module_name not in REPLICATED_LINEAR_LORA_NAMES
+         ):
+-            input_dim = divide(input_dim, self.tp_size)
++            input_dim = divide(input_dim, row_tp)
+ 
+         if self.is_moe_module(module_name):
+             num_experts = self._get_num_experts(base_model)
+@@ -247,12 +309,19 @@ class LoRAMemoryPool:
+         _, output_dim = get_hidden_dim(
+             module_name, self.base_hf_config, base_model, layer_idx
+         )
++        # Column-parallel MoE output (`gate_up_proj_moe`) uses moe_tp_size,
++        # which can differ from the global tp_size under EP.
++        col_tp = (
++            self._row_parallel_shard_tp(module_name, base_model, layer_idx)
++            if module_name in ("gate_up_proj_moe",)
++            else self.tp_size
++        )
+         if (
+-            self.tp_size > 1
++            col_tp > 1
+             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+             and module_name not in REPLICATED_LINEAR_LORA_NAMES
+         ):
+-            output_dim = divide(output_dim, self.tp_size)
++            output_dim = divide(output_dim, col_tp)
+ 
+         # Check if MoE module and return appropriate shape
+         if self.is_moe_module(module_name):
+@@ -590,16 +659,21 @@ class LoRAMemoryPool:
+                 expert_match = re.search(r"experts\.(\d+)\.", name)
+ 
+                 if expert_match:
+-                    # Per-expert MoE weight — 2D tensors, one per expert
++                    # Per-expert MoE weight — 2D tensors, one per expert.
++                    # Init A and B independently: under ``experts_shared_outer_loras``,
++                    # fc1 has shared A (Tensor in temp_A_buffer) + per-expert B
++                    # (dict in temp_B_buffer), and fc2 has the opposite. A shared
++                    # init on both would either clobber the shared Tensor or leave
++                    # the per-expert side as None.
+                     target_module = target_module + "_moe"
+-                    if temp_A_buffer[target_module] is None:
+-                        temp_A_buffer[target_module] = {}
+-                        temp_B_buffer[target_module] = {}
+-
+                     expert_id = int(expert_match.group(1))
+                     if "lora_A" in name:
++                        if temp_A_buffer[target_module] is None:
++                            temp_A_buffer[target_module] = {}
+                         temp_A_buffer[target_module][expert_id] = weights
+                     else:
++                        if temp_B_buffer[target_module] is None:
++                            temp_B_buffer[target_module] = {}
+                         temp_B_buffer[target_module][expert_id] = weights
+                 elif "experts" in name and weights.dim() == 3:
+                     # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 7958556d6..3553d899e 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1729,6 +1729,11 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+     added_tokens_config: Optional[Dict[str, Any]] = None
+     lora_id: Optional[str] = None
+     load_format: Optional[str] = None
++    # Defer `_normalize_weights` (qkv / gate_up fusion) to a subsequent
++    # `UpdateLoRAAdapterFromTensorsReqInput` call with ``finalize=True``.
++    # Set to False for chunk 0 of a chunked sync; defaults to True so single-
++    # call loads keep current semantics.
++    finalize: bool = True
+ 
+     def to_ref(self) -> LoRARef:
+         return LoRARef(
+@@ -1739,6 +1744,36 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
+         )
+ 
+ 
++@dataclass
++class UpdateLoRAAdapterFromTensorsReqInput(BaseReq):
++    """In-place update of an already-loaded LoRA adapter's CPU weights.
++
++    Mirrors ``UpdateWeightsFromTensorReqInput`` for base weights: the caller
++    streams chunks of tensors into an existing adapter without recreating its
++    config / uid. Used for chunks 2..N of a single sync and for every chunk
++    of every subsequent sync (since RL training keeps one adapter uid).
++
++    The first chunk of each sync should set ``reset=True`` so stale
++    post-normalize names from the previous sync are cleared before fresh
++    pre-normalize names are written. The last chunk sets ``finalize=True``
++    to trigger ``_normalize_weights`` over the accumulated state.
++    """
++
++    lora_name: str
++    serialized_tensors: str
++    lora_id: Optional[str] = None
++    load_format: Optional[str] = None
++    reset: bool = False
++    finalize: bool = True
++
++    def to_ref(self) -> LoRARef:
++        return LoRARef(
++            lora_id=self.lora_id,
++            lora_name=self.lora_name,
++            lora_path="__tensor__",
++        )
++
++
+ @dataclass
+ class LoRAUpdateOutput(BaseReq):
+     success: bool
+@@ -1748,7 +1783,7 @@ class LoRAUpdateOutput(BaseReq):
+ 
+ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+     LoadLoRAAdapterFromTensorsReqOutput
+-) = LoRAUpdateOutput
++) = UpdateLoRAAdapterFromTensorsReqOutput = LoRAUpdateOutput
+ 
+ 
+ class BlockReqType(Enum):
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index bed4eb799..3235179ff 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -118,6 +118,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterFromTensorsReqOutput,
+     LoadLoRAAdapterReqInput,
+     LoadLoRAAdapterReqOutput,
++    UpdateLoRAAdapterFromTensorsReqInput,
+     OpenSessionReqInput,
+     PauseGenerationReqInput,
+     PostProcessWeightsReqInput,
+@@ -1251,6 +1252,10 @@ class Scheduler(
+                     LoadLoRAAdapterFromTensorsReqInput,
+                     self.load_lora_adapter_from_tensors,
+                 ),
++                (
++                    UpdateLoRAAdapterFromTensorsReqInput,
++                    self.update_lora_adapter_from_tensors,
++                ),
+                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                 (GetLoadReqInput, self.get_load),
+                 (GetLoadsReqInput, self.get_loads),
+@@ -2644,6 +2649,14 @@ class Scheduler(
+                 self._add_request_to_queue(req, is_retracted=True)
+                 if self.enable_hisparse:
+                     self.hisparse_coordinator.retract_req(req)
++
++            # Release fragmented cached blocks back to the CUDA allocator so
++            # the upcoming retraction-triggered prefill (which allocates a
++            # large vocab-sized float32 buffer for logits) can find contiguous
++            # space. Without this, a heavily-decoded KV pool leaves enough
++            # free bytes nominally but too fragmented for a multi-GiB
++            # activation — OOM despite "free" memory.
++            torch.cuda.empty_cache()
+         else:
+             self.new_token_ratio = max(
+                 self.new_token_ratio - self.new_token_ratio_decay,
+@@ -3376,6 +3389,14 @@ class Scheduler(
+         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+         return result
+ 
++    def update_lora_adapter_from_tensors(
++        self, recv_req: UpdateLoRAAdapterFromTensorsReqInput
++    ) -> LoadLoRAAdapterFromTensorsReqOutput:
++        """In-place weight update for an already-loaded LoRA adapter."""
++
++        result = self.tp_worker.update_lora_adapter_from_tensors(recv_req)
++        return result
++
+     def unload_lora_adapter(
+         self, recv_req: UnloadLoRAAdapterReqInput
+     ) -> UnloadLoRAAdapterReqOutput:
+diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+index 9ff683a7e..cfa7e1965 100644
+--- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+@@ -55,6 +55,8 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsUpdateGroupReqOutput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterFromTensorsReqOutput,
++    UpdateLoRAAdapterFromTensorsReqInput,
++    UpdateLoRAAdapterFromTensorsReqOutput,
+     LoadLoRAAdapterReqInput,
+     LoadLoRAAdapterReqOutput,
+     LoRAUpdateOutput,
+@@ -95,6 +97,24 @@ T = TypeVar("T")
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
++    """Aggregate LoRAUpdateOutput responses from `dp_size` first-rank schedulers.
++
++    Every DP rank processes the same broadcast request with identical tensors and
++    converges to the same `lora_refs` dict, so `loaded_adapters` agrees across
++    ranks. Still AND `success` so a rank-local backend failure cannot be masked
++    by DP-0 succeeding.
++    """
++    all_success = all(r.success for r in results)
++    errors = [r.error_message for r in results if not r.success and r.error_message]
++    merged_error = " | ".join(errors) if errors else None
++    return LoRAUpdateOutput(
++        success=all_success,
++        error_message=merged_error,
++        loaded_adapters=results[0].loaded_adapters if results else None,
++    )
++
++
+ class _Communicator(Generic[T]):
+     """Note: The communicator now only run up to 1 in-flight request at any time."""
+ 
+@@ -665,7 +685,9 @@ class TokenizerCommunicatorMixin:
+         # Initiate the actual unloading operation at the backend processes only after all
+         # ongoing requests using this LoRA adapter are finished.
+         await self.lora_registry.wait_for_unload(lora_id)
+-        result = (await self.update_lora_adapter_communicator(obj))[0]
++        result = _merge_lora_update_results(
++            await self.update_lora_adapter_communicator(obj)
++        )
+ 
+         return result
+ 
+@@ -682,11 +704,9 @@ class TokenizerCommunicatorMixin:
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                 )
+ 
+-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+-            # with dp_size > 1.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter. Lora name=%s, path=%s",
+                 obj.lora_name,
+@@ -703,7 +723,9 @@ class TokenizerCommunicatorMixin:
+ 
+                 # Trigger the actual loading operation at the backend processes.
+                 obj.lora_id = new_adapter.lora_id
+-                result = (await self.update_lora_adapter_communicator(obj))[0]
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
+ 
+                 # Register the LoRA adapter only after loading is successful.
+                 if result.success:
+@@ -761,8 +783,8 @@ class TokenizerCommunicatorMixin:
+                 )
+ 
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter from tensors. Lora name=%s",
+                 obj.lora_name,
+@@ -775,7 +797,9 @@ class TokenizerCommunicatorMixin:
+                     pinned=obj.pinned,
+                 )
+                 obj.lora_id = new_adapter.lora_id
+-                result = (await self.update_lora_adapter_communicator(obj))[0]
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
+ 
+                 if result.success:
+                     await self.lora_registry.register(new_adapter)
+@@ -817,6 +841,49 @@ class TokenizerCommunicatorMixin:
+                 error_message=str(e),
+             )
+ 
++    async def update_lora_adapter_from_tensors(
++        self: TokenizerManager,
++        obj: UpdateLoRAAdapterFromTensorsReqInput,
++        _: Optional[fastapi.Request] = None,
++    ) -> UpdateLoRAAdapterFromTensorsReqOutput:
++        """In-place weight update for an already-loaded LoRA adapter.
++
++        Parallel to ``update_weights_from_tensor`` for base weights: no uid
++        allocation, no registry registration, just writes tensors into the
++        existing adapter's CPU state. The target adapter must have been
++        loaded via ``load_lora_adapter_from_tensors`` (or from disk) first.
++        """
++        self.auto_create_handle_loop()
++
++        try:
++            if not self.server_args.enable_lora:
++                raise ValueError(
++                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
++                )
++
++            assert (
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++
++            existing = self.lora_ref_cache.get(obj.lora_name)
++            if existing is None:
++                raise ValueError(
++                    f"update_lora_adapter_from_tensors: no adapter named "
++                    f"'{obj.lora_name}' is loaded. Call "
++                    f"load_lora_adapter_from_tensors first."
++                )
++            obj.lora_id = existing.lora_id
++
++            async with self.lora_update_lock:
++                return _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
++        except ValueError as e:
++            return UpdateLoRAAdapterFromTensorsReqOutput(
++                success=False,
++                error_message=str(e),
++            )
++
+     async def unload_lora_adapter(
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+@@ -834,11 +901,9 @@ class TokenizerCommunicatorMixin:
+                 obj.lora_name is not None
+             ), "lora_name must be provided to unload LoRA adapter"
+ 
+-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+-            # with dp_size > 1.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
+             logger.info(
+                 "Start unload Lora adapter. Lora name=%s",
+                 obj.lora_name,
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index fb56de158..a027d7932 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsUpdateGroupReqInput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterReqInput,
++    UpdateLoRAAdapterFromTensorsReqInput,
+     PostProcessWeightsReqInput,
+     SendWeightsToRemoteInstanceReqInput,
+     UnloadLoRAAdapterReqInput,
+@@ -158,12 +159,20 @@ class BaseTpWorker(ABC):
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+ 
+         monkey_patch_torch_reductions()
++        named_tensors = MultiprocessingSerializer.deserialize(
++            recv_req.serialized_named_tensors[self.tp_rank]
++        )
+         success, message = self.model_runner.update_weights_from_tensor(
+-            named_tensors=MultiprocessingSerializer.deserialize(
+-                recv_req.serialized_named_tensors[self.tp_rank]
+-            ),
++            named_tensors=named_tensors,
+             load_format=recv_req.load_format,
+         )
++        # Drop local refs to imported IPC tensors, run gc so PyTorch's IPC table
++        # entries become collectable, then ipc_collect to signal source release
++        # via the shmem refcount file.
++        del named_tensors
++        import gc
++        gc.collect()
++        torch.cuda.ipc_collect()
+         return success, message
+ 
+     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+@@ -195,6 +204,8 @@ class BaseTpWorker(ABC):
+     ):
+         # The LoRA code handles TP sharding internally using slice_lora_a_weights
+         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
++        flattened_data = None
++        bucket = None
+         if recv_req.load_format == "flattened_bucket":
+             flattened_data = MultiprocessingSerializer.deserialize(
+                 recv_req.serialized_tensors
+@@ -211,7 +222,41 @@ class BaseTpWorker(ABC):
+             tensors,
+             recv_req.config_dict,
+             recv_req.added_tokens_config,
++            finalize=recv_req.finalize,
++        )
++        # Drop importer refs + collect IPC table so source can free its export.
++        del tensors, bucket, flattened_data
++        import gc
++        gc.collect()
++        torch.cuda.ipc_collect()
++        return result
++
++    def update_lora_adapter_from_tensors(
++        self, recv_req: UpdateLoRAAdapterFromTensorsReqInput
++    ):
++        flattened_data = None
++        bucket = None
++        if recv_req.load_format == "flattened_bucket":
++            flattened_data = MultiprocessingSerializer.deserialize(
++                recv_req.serialized_tensors
++            )
++            bucket = FlattenedTensorBucket(
++                flattened_tensor=flattened_data["flattened_tensor"],
++                metadata=flattened_data["metadata"],
++            )
++            tensors = dict(bucket.reconstruct_tensors())
++        else:
++            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
++        result = self.model_runner.update_lora_adapter_from_tensors(
++            recv_req.to_ref(),
++            tensors,
++            reset=recv_req.reset,
++            finalize=recv_req.finalize,
+         )
++        del tensors, bucket, flattened_data
++        import gc
++        gc.collect()
++        torch.cuda.ipc_collect()
+         return result
+ 
+     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 7a68e69c4..31e9c4b16 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1890,15 +1890,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         return result
+ 
+     def load_lora_adapter_from_tensors(
+-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
++        self,
++        lora_ref: LoRARef,
++        tensors,
++        config_dict,
++        added_tokens_config=None,
++        *,
++        finalize: bool = True,
+     ):
+-        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
++        logger.info(
++            f"LoRA adapter loading from tensors starts: {lora_ref}, finalize={finalize}."
++        )
+         result = self.lora_manager.load_lora_adapter_from_tensors(
+-            lora_ref, tensors, config_dict, added_tokens_config
++            lora_ref,
++            tensors,
++            config_dict,
++            added_tokens_config,
++            finalize=finalize,
+         )
+         logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
+         return result
+ 
++    def update_lora_adapter_from_tensors(
++        self,
++        lora_ref: LoRARef,
++        tensors,
++        *,
++        reset: bool = False,
++        finalize: bool = True,
++    ):
++        logger.info(
++            f"LoRA adapter in-place update from tensors: {lora_ref}, reset={reset}, finalize={finalize}."
++        )
++        return self.lora_manager.update_lora_adapter_from_tensors(
++            lora_ref, tensors, reset=reset, finalize=finalize
++        )
++
+     def unload_lora_adapter(self, lora_ref: LoRARef):
+         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
+ 
+@@ -3147,8 +3174,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             if hasattr(self.model, "post_load_weights"):
+                 self.model.post_load_weights()
+ 
++        # LoRA wrappers forward `quant_method` for forward-path dispatch but
++        # don't own the packed params; skip them here so the inner base layer
++        # (yielded separately by `named_modules`) handles post-processing.
++        from sglang.srt.lora.layers import BaseLayerWithLoRA
++
+         if recv_req.restore_weights_before_load:
+             for _, module in self.model.named_modules():
++                if isinstance(module, BaseLayerWithLoRA):
++                    continue
+                 quant_method = getattr(module, "quant_method", None)
+ 
+                 # Check if the module supports restoring weights
+@@ -3162,6 +3196,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         if recv_req.post_process_quantization:
+             # Iterate through all modules to apply specific post-loading processing
+             for _, module in self.model.named_modules():
++                if isinstance(module, BaseLayerWithLoRA):
++                    continue
+                 quant_method = getattr(module, "quant_method", None)
+ 
+                 # Check if the module supports quantization post-processing

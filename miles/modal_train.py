@@ -1,686 +1,309 @@
-"""Launch Miles training jobs on Modal.
-
-This module defines the clustered `MilesCluster` launcher, helper functions for
-model download and dataset preparation, and a local CLI entrypoint for
-submitting runs.
-
-It supports two execution modes:
-  - deployed: submit runs to a deployed `MilesCluster` with a fixed compute shape
-  - ephemeral: launch a one-off app directly from the local entrypoint
-
-The Python wrapper owns only Modal and Ray orchestration plus a small set of
-infrastructure-critical flags. Model and training arguments live in `recipes/`.
-"""
-
-import datetime as dt
+import asyncio
 import os
-import pathlib
-import re
 import shlex
 import subprocess
-import time
-from typing import Optional
+import tempfile
 
 import modal
 import modal.experimental
 
-from recipes import (
-    Recipe,
-    format_recipe_table,
-    get_optional_recipe,
-    load_recipe_text,
-    merge_arg_texts,
-    parse_arg_text,
-    read_arg_file,
+from configs import get_module, _CONFIGS_DIR
+from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH
+from modal_helpers.utils import get_checkpoint_conversion_policy
+
+# ── Experiment (client-side only — feeds decorator params) ────────────────────
+
+experiment = os.environ.get("EXPERIMENT_CONFIG", "")
+exp_mod = get_module(experiment) if experiment else None
+modal_cfg = exp_mod.modal if exp_mod else None
+miles_cfg = exp_mod.miles if exp_mod else None
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+
+MILES_ROOT = "/root/miles"
+
+image = (
+    modal.Image.from_registry("radixark/miles:dev-202604221234")
+    .entrypoint([])
+    .add_local_python_source("configs", copy=True)
+    .add_local_python_source("modal_helpers", copy=True)
 )
+if modal_cfg:
+    for patch in modal_cfg.patch_files:
+        image = image.add_local_file(
+            patch, f"/tmp/{os.path.basename(patch)}", copy=True
+        )
+    if modal_cfg.local_miles:
+        image = image.add_local_dir(
+            modal_cfg.local_miles,
+            remote_path=MILES_ROOT,
+            copy=True,
+            ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
+        )
+    if modal_cfg.image_run_commands:
+        image = image.run_commands(*modal_cfg.image_run_commands)
+    # Ensure system libraries (cuDNN, NCCL) take precedence over pip versions
+    image = image.env({"LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"})
 
-here = pathlib.Path(__file__).parent.resolve()
+with image.imports():
+    from ray.job_submission import JobSubmissionClient
+    from modal_helpers.utils import (
+        build_train_cmd,
+        get_modal_cluster_context,
+        prepare_miles_config,
+        start_ray_head,
+    )
 
-APP_NAME = os.environ.get("MILES_APP_NAME", "miles-modal")
-MILES_IMAGE = os.environ.get("MILES_IMAGE", "radixark/miles:dev-202603231227")
-CLUSTER_NODES = int(os.environ.get("MILES_N_NODES", "1"))
-DEFAULT_GPU = os.environ.get("MILES_GPU", "H100:8")
-LOCAL_MILES_PATH = os.environ.get("USE_LOCAL_MILES", "")
+# ── Volumes ───────────────────────────────────────────────────────────────────
 
-HF_CACHE_PATH = pathlib.Path("/root/.cache/huggingface")
-DATA_PATH = pathlib.Path("/data")
-CHECKPOINTS_PATH = pathlib.Path("/checkpoints")
-REMOTE_RECIPES_DIR = pathlib.Path("/root/recipes")
-REMOTE_PATCH_DIR = pathlib.Path("/root/miles-modal-patches")
-REMOTE_MILES_DIR = pathlib.Path("/root/miles")
-REMOTE_TRAIN_SCRIPT = REMOTE_MILES_DIR / "train.py"
+hf_cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+data_volume = modal.Volume.from_name("miles-data", create_if_missing=True)
+checkpoints_volume = modal.Volume.from_name("miles-checkpoints", create_if_missing=True)
+
+modal_volumes = {
+    str(HF_CACHE_PATH): hf_cache_volume,
+    str(DATA_PATH): data_volume,
+    str(CHECKPOINTS_PATH): checkpoints_volume,
+}
+
+# ── App ──────────────────────────────────────────────────────────────────────
+
+app = modal.App(experiment)
 
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
-hf_cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-data_volume = modal.Volume.from_name("miles-example-data", create_if_missing=True)
-checkpoints_volume = modal.Volume.from_name(
-    "miles-example-checkpoints", create_if_missing=True
-)
 
-
-def _parse_gpus_per_node(gpu: str) -> int:
-    try:
-        return int(gpu.rsplit(":", 1)[1])
-    except (IndexError, ValueError) as exc:
-        raise ValueError(
-            f"GPU spec must include a per-node count like 'H100:8'; got {gpu!r}"
-        ) from exc
-
-
-def _resolve_model_id(recipe: Recipe | None, model_id: str) -> str:
-    if model_id:
-        return model_id
-    if recipe:
-        return recipe.model_id
-    raise ValueError("Pass --recipe or --model-id.")
-
-
-def _sanitize_path_component(value: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
-    return sanitized or "run"
-
-
-def _resolve_run_label(recipe: Recipe | None, *, model_id: str, run_name: str) -> str:
-    if run_name:
-        return _sanitize_path_component(run_name)
-    if recipe:
-        return recipe.name
-    return _sanitize_path_component(model_id)
-
-
-def _resolve_base_args_text(
-    recipe: Recipe | None,
-    *,
-    args_text: str,
-    recipes_dir: pathlib.Path,
-) -> str:
-    parts: list[str] = []
-    if recipe:
-        parts.append(load_recipe_text(recipe, base_dir=recipes_dir))
-    if args_text:
-        parts.append(args_text)
-    return merge_arg_texts(*parts)
-
-
-def _build_enforced_args(
-    *,
-    model_path: str,
-    actor_nodes: int,
-    gpus_per_node: int,
-    checkpoint_dir: pathlib.Path,
-    custom_config_path: Optional[str],
-    wandb_key: Optional[str],
-    colocate: bool,
-    rollout_num_gpus: Optional[int],
-) -> list[str]:
-    if actor_nodes < 1:
-        raise ValueError(f"actor_nodes must be >= 1, got {actor_nodes}")
-
-    args = [
-        "--train-backend",
-        "megatron",
-        "--hf-checkpoint",
-        model_path,
-        "--ref-load",
-        model_path,
-        "--save",
-        checkpoint_dir.as_posix(),
-        "--actor-num-nodes",
-        str(actor_nodes),
-        "--actor-num-gpus-per-node",
-        str(gpus_per_node),
-        "--num-gpus-per-node",
-        str(gpus_per_node),
-    ]
-    if colocate:
-        args.append("--colocate")
-    else:
-        if rollout_num_gpus is None or rollout_num_gpus < 1:
-            raise ValueError(
-                "rollout_num_gpus must be >= 1 when launching non-colocated rollout."
-            )
-        args.extend(["--rollout-num-gpus", str(rollout_num_gpus)])
-    if custom_config_path:
-        args.extend(["--custom-config-path", custom_config_path])
-    if wandb_key:
-        args.extend(["--use-wandb", "--wandb-key", wandb_key])
-    return args
-
-
-def _build_miles_argv(
-    *,
-    base_args_text: str,
-    model_path: str,
-    actor_nodes: int,
-    gpus_per_node: int,
-    checkpoint_dir: pathlib.Path,
-    extra_args_text: str,
-    custom_config_path: Optional[str],
-    wandb_key: Optional[str],
-    colocate: bool,
-    rollout_num_gpus: Optional[int],
-) -> list[str]:
-    base_args = parse_arg_text(base_args_text)
-    extra_args = parse_arg_text(extra_args_text)
-    enforced_args = _build_enforced_args(
-        model_path=model_path,
-        actor_nodes=actor_nodes,
-        gpus_per_node=gpus_per_node,
-        checkpoint_dir=checkpoint_dir,
-        custom_config_path=custom_config_path,
-        wandb_key=wandb_key,
-        colocate=colocate,
-        rollout_num_gpus=rollout_num_gpus,
-    )
-    return [
-        "python3",
-        REMOTE_TRAIN_SCRIPT.as_posix(),
-        *base_args,
-        *extra_args,
-        *enforced_args,
-    ]
-
-
-def _resolve_actor_nodes(
-    cluster_nodes: int, *, colocate: bool, actor_nodes: int
-) -> int:
-    if colocate:
-        return cluster_nodes
-    if actor_nodes > 0:
-        return actor_nodes
-    if cluster_nodes < 2:
-        raise ValueError(
-            "Non-colocated rollout needs spare cluster capacity. "
-            "Set MILES_N_NODES>=2 or pass --colocate."
-        )
-    return cluster_nodes - 1
-
-
-def _resolve_rollout_num_gpus(
-    cluster_nodes: int,
-    *,
-    actor_nodes: int,
-    gpus_per_node: int,
-    colocate: bool,
-    rollout_num_gpus: int,
-) -> Optional[int]:
-    if colocate:
-        return None
-    if rollout_num_gpus > 0:
-        return rollout_num_gpus
-    spare_gpus = (cluster_nodes - actor_nodes) * gpus_per_node
-    if spare_gpus < 1:
-        raise ValueError(
-            "Non-colocated rollout needs spare GPUs after reserving actor nodes. "
-            f"cluster_nodes={cluster_nodes}, actor_nodes={actor_nodes}, "
-            f"gpus_per_node={gpus_per_node}"
-        )
-    return spare_gpus
-
-
-def _build_runtime_env(master_addr: str, wandb_key: Optional[str]) -> dict:
-    env_vars = {
-        "MASTER_ADDR": master_addr,
-        "MILES_HOST_IP": master_addr,
-        "no_proxy": master_addr,
-        "PYTHONPATH": f"{REMOTE_PATCH_DIR.as_posix()}:/root/Megatron-LM",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "NCCL_ALGO": "Ring",
-        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-    }
-    if wandb_key:
-        env_vars["WANDB_API_KEY"] = wandb_key
-    return {"env_vars": env_vars}
-
-
-def _print_recipe_table():
-    print("Available recipes:")
-    for line in format_recipe_table():
-        print(line)
-
-
-image = (
-    modal.Image.from_registry(MILES_IMAGE)
-    .entrypoint([])
-    .add_local_dir(here / "recipes", remote_path=REMOTE_RECIPES_DIR.as_posix())
-    .add_local_dir(
-        here / "modal_patches",
-        remote_path=REMOTE_PATCH_DIR.as_posix(),
-    )
-)
-
-if LOCAL_MILES_PATH:
-    image = image.add_local_dir(
-        LOCAL_MILES_PATH,
-        remote_path=REMOTE_MILES_DIR.as_posix(),
-        copy=True,
-        ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
-    ).run_commands(f"pip install -e {REMOTE_MILES_DIR} --no-deps")
-
-
-with image.imports():
-    import ray
-    from huggingface_hub import snapshot_download
-    from ray.job_submission import JobSubmissionClient
-
-
-app = modal.App(APP_NAME)
-
-
-# ---- Training Cluster Cls ---- #
-
-
-@app.cls(
-    image=image,
-    gpu=DEFAULT_GPU,
-    volumes={
-        HF_CACHE_PATH.as_posix(): hf_cache_volume,
-        DATA_PATH.as_posix(): data_volume,
-        CHECKPOINTS_PATH.as_posix(): checkpoints_volume,
-    },
-    timeout=24 * 60 * 60,
-    scaledown_window=60 * 60,
-    retries=2,
-    experimental_options={"efa_enabled": True},
-)
-@modal.experimental.clustered(size=CLUSTER_NODES, rdma=True)
-class MilesCluster:
-    @modal.enter()
-    def bootstrap_ray(self):
-        hf_cache_volume.reload()
-        data_volume.reload()
-        checkpoints_volume.reload()
-        self.rank = None
-        self.node_ips = []
-        self.main_addr = None
-        self.node_addr = None
-        self.client = None
-        self._ray_ready = False
-
-    def _ensure_ray_started(self):
-        if self._ray_ready:
-            return
-
-        cluster_info = modal.experimental.get_cluster_info()
-        self.rank = cluster_info.rank
-        if cluster_info.container_ipv4_ips:
-            self.node_ips = cluster_info.container_ipv4_ips
-        elif CLUSTER_NODES == 1:
-            # Modal may omit container IPv4s for size-1 clustered functions.
-            self.node_ips = ["127.0.0.1"]
-        else:
-            raise RuntimeError(
-                "Modal did not provide container IPv4s for a multi-node cluster."
-            )
-
-        self.main_addr = self.node_ips[0]
-        self.node_addr = self.node_ips[min(self.rank, len(self.node_ips) - 1)]
-
-        if self.rank == 0:
-            print(f"Starting Ray head at {self.node_addr}")
-            subprocess.Popen(
-                [
-                    "ray",
-                    "start",
-                    "--head",
-                    f"--node-ip-address={self.node_addr}",
-                    "--dashboard-host=0.0.0.0",
-                    "--disable-usage-stats",
-                ]
-            )
-
-            for _ in range(30):
-                try:
-                    ray.init(address="auto")
-                    break
-                except Exception:
-                    time.sleep(1)
-            else:
-                raise RuntimeError("Failed to connect to the Ray head node")
-
-            for _ in range(60):
-                alive_nodes = [node for node in ray.nodes() if node["Alive"]]
-                print(f"Alive nodes: {len(alive_nodes)}/{len(self.node_ips)}")
-                if len(alive_nodes) == len(self.node_ips):
-                    break
-                time.sleep(1)
-            else:
-                raise RuntimeError("Not all Ray worker nodes connected")
-
-            self.client = JobSubmissionClient(f"http://127.0.0.1:{RAY_DASHBOARD_PORT}")
-            print("Ray cluster is ready.")
-        else:
-            print(f"Starting Ray worker at {self.node_addr}, head={self.main_addr}")
-            subprocess.Popen(
-                [
-                    "ray",
-                    "start",
-                    f"--node-ip-address={self.node_addr}",
-                    "--address",
-                    f"{self.main_addr}:{RAY_PORT}",
-                    "--disable-usage-stats",
-                ]
-            )
-        self._ray_ready = True
-
-    @modal.method()
-    async def submit_training(
-        self,
-        recipe_name: str = "",
-        *,
-        model_id: str = "",
-        base_args_text: str = "",
-        gpus_per_node: int,
-        extra_args_text: str = "",
-        custom_config_yaml: str = "",
-        wandb_key: str = "",
-        run_name: str = "",
-        actor_nodes: int | None = None,
-        colocate: bool = True,
-        rollout_num_gpus: int | None = None,
-    ) -> dict:
-        self._ensure_ray_started()
-
-        if self.rank != 0:
-            while True:
-                time.sleep(10)
-
-        recipe = get_optional_recipe(recipe_name)
-        resolved_model_id = _resolve_model_id(recipe, model_id)
-        resolved_base_args_text = _resolve_base_args_text(
-            recipe,
-            args_text=base_args_text,
-            recipes_dir=REMOTE_RECIPES_DIR,
-        )
-        if not resolved_base_args_text:
-            raise ValueError(
-                "No training args were provided. Choose a recipe or pass --args/--args-file."
-            )
-        run_label = _resolve_run_label(
-            recipe,
-            model_id=resolved_model_id,
-            run_name=run_name,
-        )
-
-        try:
-            model_path = snapshot_download(
-                repo_id=resolved_model_id, local_files_only=True
-            )
-        except Exception as exc:
-            recipe_hint = (
-                f"Run `modal run miles/modal_train.py::download_model --recipe {recipe.name}` first."
-                if recipe
-                else f"Run `modal run miles/modal_train.py::download_model --model-id {resolved_model_id}` first."
-            )
-            raise RuntimeError(
-                f"Model {resolved_model_id} is not present in the shared HF cache. "
-                f"{recipe_hint}"
-            ) from exc
-
-        run_id = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        checkpoint_dir = CHECKPOINTS_PATH / run_label / run_id
-        custom_config_path = None
-        if custom_config_yaml:
-            custom_config_path = f"/tmp/{run_label}-{run_id}-overrides.yaml"
-            pathlib.Path(custom_config_path).write_text(custom_config_yaml)
-
-        resolved_actor_nodes = actor_nodes if actor_nodes is not None else CLUSTER_NODES
-        resolved_rollout_num_gpus = rollout_num_gpus
-        argv = _build_miles_argv(
-            base_args_text=resolved_base_args_text,
-            model_path=model_path,
-            actor_nodes=resolved_actor_nodes,
-            gpus_per_node=gpus_per_node,
-            checkpoint_dir=checkpoint_dir,
-            extra_args_text=extra_args_text,
-            custom_config_path=custom_config_path,
-            wandb_key=wandb_key or None,
-            colocate=colocate,
-            rollout_num_gpus=resolved_rollout_num_gpus,
-        )
-        entrypoint = shlex.join(argv)
-        runtime_env = _build_runtime_env(self.main_addr, wandb_key or None)
-
-        print(f"Recipe: {recipe.name if recipe else '<none>'}")
-        print(f"Model: {resolved_model_id}")
-        print(f"Run label: {run_label}")
-        print(f"Cluster nodes: {CLUSTER_NODES}")
-        print(f"Actor nodes: {resolved_actor_nodes}")
-        print(f"Colocate: {colocate}")
-        if not colocate:
-            print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
-        print(f"GPUs per node: {gpus_per_node}")
-        print(f"Checkpoint dir: {checkpoint_dir}")
-        print(f"Entrypoint: {entrypoint}")
-
-        with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
-            print(f"Dashboard URL: {tunnel.url}")
-            job_id = self.client.submit_job(
-                entrypoint=entrypoint, runtime_env=runtime_env
-            )
-            print(f"Submitted Ray job: {job_id}")
-
-            async for line in self.client.tail_job_logs(job_id):
-                print(line, end="", flush=True)
-
-        status = self.client.get_job_status(job_id).value
-        checkpoints_volume.commit()
-        print(f"\nFinal status: {status}")
-        return {
-            "job_id": job_id,
-            "status": status,
-            "recipe": recipe.name if recipe else None,
-            "model_id": resolved_model_id,
-            "run_name": run_label,
-            "checkpoint_dir": checkpoint_dir.as_posix(),
-        }
-
-
-# ---- Model Download Utility ---- #
+@app.local_entrypoint()
+def list_configs():
+    """Print all available experiments."""
+    _skip = {"base", "__init__"}
+    names = sorted(f.stem for f in _CONFIGS_DIR.glob("*.py") if f.stem not in _skip)
+    print("Available experiments:")
+    for name in names:
+        mod = get_module(name)
+        nodes = mod.miles.total_nodes()
+        gpu = f"{mod.modal.gpu}:{mod.miles.actor_num_gpus_per_node}"
+        mode = "async" if mod.miles.async_mode else "sync"
+        print(f"  {name:<40} {nodes} node(s) × {gpu}  ({mode})")
 
 
 @app.function(
     image=image,
-    volumes={HF_CACHE_PATH.as_posix(): hf_cache_volume},
+    volumes={str(HF_CACHE_PATH): hf_cache_volume},
+    timeout=2 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=24 * 60 * 60,
 )
-def download_model(
-    recipe: str = "qwen3-30b-a3b-lora",
-    revision: Optional[str] = None,
-    model_id: Optional[str] = None,
-):
-    from huggingface_hub import snapshot_download
-
-    selected_recipe = get_optional_recipe(recipe)
-    resolved_model_id = model_id or (
-        selected_recipe.model_id if selected_recipe else ""
-    )
-    if not resolved_model_id:
-        raise ValueError("Pass --recipe or --model-id.")
+def prepare_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run the experiment's prepare_model() against the HF cache volume."""
+    miles_cfg = get_module(experiment).miles
     hf_cache_volume.reload()
-    path = snapshot_download(
-        repo_id=resolved_model_id,
-        revision=revision,
-        token=os.environ.get("HF_TOKEN"),
-    )
-    print(f"Downloaded {resolved_model_id} to {path}")
+    miles_cfg.prepare_model()
     hf_cache_volume.commit()
 
 
-# ---- Dataset Processing Utility ---- #
+@app.function(
+    image=image,
+    volumes={str(DATA_PATH): data_volume},
+    timeout=2 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def prepare_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run the prepare_data() to populate the data volume."""
+    miles_cfg = get_module(experiment).miles
+    data_volume.reload()
+    miles_cfg.prepare_data()
+    data_volume.commit()
 
 
 @app.function(
     image=image,
-    volumes={DATA_PATH.as_posix(): data_volume},
-    timeout=24 * 60 * 60,
+    gpu="H200:1",
+    volumes=modal_volumes,
+    timeout=4 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def prepare_dataset(
-    hf_dataset: str = "zhuzilin/gsm8k",
-    data_folder: str = "gsm8k",
-    train_limit: int = 0,
-    test_limit: int = 0,
+def convert_kimi_int4_to_bf16(
+    model: str = "moonshotai/Kimi-K2.5",
+    output_dir: str = str(CHECKPOINTS_PATH / "Kimi-K2.5-bf16"),
 ):
-    from datasets import load_dataset
+    """Convert Kimi native INT4 weights to BF16 for INT4 QAT training.
 
-    data_volume.reload()
-    dataset = load_dataset(hf_dataset)
-    train_split = dataset["train"]
-    test_split = dataset["test"]
-    if train_limit > 0:
-        train_split = train_split.select(range(min(train_limit, len(train_split))))
-    if test_limit > 0:
-        test_split = test_split.select(range(min(test_limit, len(test_split))))
-    output_dir = DATA_PATH / data_folder
-    output_dir.mkdir(parents=True, exist_ok=True)
-    train_split.to_parquet((output_dir / "train.parquet").as_posix())
-    test_split.to_parquet((output_dir / "test.parquet").as_posix())
-    data_volume.commit()
+    The BF16 checkpoint is used as --hf-checkpoint with INT4 QAT env vars
+    (OPEN_TRAINING_INT4_FAKE_QAT_FLAG=1, OPEN_TRAINING_INT4_GROUP_SIZE=32).
+
+    Run: modal run modal_train.py::convert_kimi_int4_to_bf16
+    """
+    from huggingface_hub import snapshot_download
+
+    hf_cache_volume.reload()
+    checkpoints_volume.reload()
+
+    if model.startswith("/"):
+        model_dir = model
+    else:
+        model_dir = snapshot_download(model, local_files_only=True)
+    print(f"Source: {model_dir}")
+
+    print(f"\n=== INT4 → BF16: {output_dir} ===")
+    subprocess.run(
+        ["python", f"{MILES_ROOT}/tools/convert_kimi_int4_to_bf16.py",
+         "--model-dir", model_dir, "--output-dir", output_dir],
+        check=True,
+    )
+
+    checkpoints_volume.commit()
+    print(f"\n=== Done: {output_dir} ===")
+
+
+@app.function(
+    image=image,
+    gpu=f"{modal_cfg.gpu}:{miles_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
+    volumes=modal_volumes,
+    timeout=4 * 60 * 60,
+    experimental_options={"efa_enabled": True},
+)
+@(
+    modal.experimental.clustered(
+        get_checkpoint_conversion_policy(miles_cfg)[0], rdma=True
+    )
+    if miles_cfg
+    else lambda fn: fn
+)
+def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw."""
+    from huggingface_hub import snapshot_download
+
+    miles_cfg = get_module(experiment).miles
+
+    if getattr(miles_cfg, "megatron_to_hf_mode", None) == "bridge":
+        print(f"Experiment {experiment!r} is in bridge mode — no conversion needed.")
+        return
+
+    hf_cache_volume.reload()
+    checkpoints_volume.reload()
+
+    hf_path = snapshot_download(miles_cfg.hf_checkpoint, local_files_only=True)
+    save_path = str(miles_cfg.ref_load)
+    num_nodes, nproc_per_node, extra_args = get_checkpoint_conversion_policy(miles_cfg)
+    node_rank, master_addr, _, nnodes = get_modal_cluster_context(num_nodes)
+
+    torchrun_args = [f"--nproc-per-node={nproc_per_node}"]
+    if nnodes > 1:
+        torchrun_args += [
+            f"--nnodes={nnodes}",
+            f"--node-rank={node_rank}",
+            f"--master-addr={master_addr}",
+            "--master-port=12355",
+        ]
+
+    # For multi-node, use our wrapper that honours SKIP_RELEASE_RENAME to
+    # prevent volume corruption (see modal_helpers/convert_hf_to_torch_dist.py).
+    # Single-node uses the upstream script directly.
+    import importlib.util
+    convert_script = (
+        importlib.util.find_spec("modal_helpers.convert_hf_to_torch_dist").origin
+        if num_nodes > 1
+        else f"{MILES_ROOT}/tools/convert_hf_to_torch_dist.py"
+    )
+
+    cmd = (
+        f"source {MILES_ROOT}/{miles_cfg.miles_model_script} && "
+        f"torchrun {' '.join(torchrun_args)} {convert_script} "
+        f"${{MODEL_ARGS[@]}} {' '.join(extra_args)} "
+        f"--hf-checkpoint {shlex.quote(hf_path)} --save {shlex.quote(save_path)}"
+    )
+
+    env = {**os.environ, **miles_cfg.environment}
+    if num_nodes > 1:
+        env["SKIP_RELEASE_RENAME"] = "1"
+
     print(
-        f"Prepared dataset {hf_dataset} under {output_dir} "
-        f"(train_rows={len(train_split)}, test_rows={len(test_split)})"
+        f"Conversion layout for {experiment!r}: nodes={num_nodes}, "
+        f"nproc_per_node={nproc_per_node}, node_rank={node_rank}"
+    )
+    print(f"Running: bash -c {cmd!r}")
+    subprocess.run(["bash", "-c", cmd], check=True, env=env)
+    checkpoints_volume.commit()
+
+    if node_rank == 0:
+        print(f"Saved torch_dist checkpoint to {save_path}")
+
+
+@app.function(
+    image=image,
+    gpu=f"{modal_cfg.gpu}:{miles_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
+    memory=modal_cfg.memory if modal_cfg and modal_cfg.memory else None,
+    volumes=modal_volumes,
+    secrets=[modal.Secret.from_name("wandb-secret")],
+    timeout=24 * 60 * 60,
+    experimental_options={"efa_enabled": True},
+)
+@(
+    modal.experimental.clustered(miles_cfg.total_nodes(), rdma=True)
+    if miles_cfg
+    else lambda fn: fn
+)
+async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    await asyncio.gather(
+        hf_cache_volume.reload.aio(),
+        data_volume.reload.aio(),
+        checkpoints_volume.reload.aio(),
+    )
+    exp_mod = get_module(experiment)
+    miles_cfg = exp_mod.miles
+    modal_cfg = exp_mod.modal
+
+    rank, master_addr, my_ip, n_nodes = get_modal_cluster_context(
+        miles_cfg.total_nodes()
     )
 
+    os.environ["MILES_HOST_IP"] = my_ip
+    os.environ["SGLANG_HOST_IP"] = my_ip
+    os.environ["HOST_IP"] = my_ip
 
-# ---- Local Entrypoint ---- #
+    if rank != 0:
+        # Worker node: join the Ray cluster and keep the container alive.
+        subprocess.Popen(
+            [
+                "ray",
+                "start",
+                f"--node-ip-address={my_ip}",
+                "--address",
+                f"{master_addr}:{RAY_PORT}",
+            ]
+        )
+        while True:
+            await asyncio.sleep(10)
 
+    # Head node: start Ray, prepare config, submit job, stream logs.
+    start_ray_head(my_ip, n_nodes)
+    prepare_miles_config(miles_cfg, tempfile.mkdtemp())
 
-@app.local_entrypoint()
-def main(
-    recipe: str = "",
-    model_id: str = "",
-    gpu: str = "",
-    args: str = "",
-    args_file: str = "",
-    extra_args: str = "",
-    extra_args_file: str = "",
-    custom_config: str = "",
-    list_recipes: bool = False,
-    dry_run: bool = False,
-    allow_cluster_mismatch: bool = False,
-    run_name: str = "",
-    colocate: bool = True,
-    actor_nodes: int = 0,
-    rollout_num_gpus: int = 0,
-):
-    if list_recipes:
-        _print_recipe_table()
-        return
-
-    selected_recipe = get_optional_recipe(recipe)
-    resolved_model_id = _resolve_model_id(selected_recipe, model_id)
-    selected_gpu = gpu or (selected_recipe.gpu if selected_recipe else DEFAULT_GPU)
-    gpus_per_node = _parse_gpus_per_node(selected_gpu)
-    resolved_actor_nodes = _resolve_actor_nodes(
-        CLUSTER_NODES,
-        colocate=colocate,
-        actor_nodes=actor_nodes,
-    )
-    resolved_rollout_num_gpus = _resolve_rollout_num_gpus(
-        CLUSTER_NODES,
-        actor_nodes=resolved_actor_nodes,
-        gpus_per_node=gpus_per_node,
-        colocate=colocate,
-        rollout_num_gpus=rollout_num_gpus,
-    )
-
-    if (
-        selected_recipe
-        and not allow_cluster_mismatch
-        and CLUSTER_NODES != selected_recipe.recommended_nodes
+    if (wandb_key := os.environ.get("WANDB_API_KEY", "")) and getattr(
+        miles_cfg, "use_wandb", False
     ):
-        raise ValueError(
-            f"Recipe {selected_recipe.name} expects MILES_N_NODES={selected_recipe.recommended_nodes}, "
-            f"but this process was started with MILES_N_NODES={CLUSTER_NODES}. "
-            f"Rerun with the recommended value or pass --allow-cluster-mismatch."
-        )
+        miles_cfg.wandb_key = wandb_key
 
-    base_args_text = merge_arg_texts(args, read_arg_file(args_file))
-    resolved_base_args_text = _resolve_base_args_text(
-        selected_recipe,
-        args_text=base_args_text,
-        recipes_dir=here / "recipes",
-    )
-    if not resolved_base_args_text:
-        raise ValueError(
-            "No training args were provided. Choose a recipe or pass --args/--args-file."
-        )
-    merged_extra_args = merge_arg_texts(extra_args, read_arg_file(extra_args_file))
-    custom_config_yaml = read_arg_file(custom_config)
-    wandb_key = os.environ.get("WANDB_API_KEY", "")
-    resolved_run_label = _resolve_run_label(
-        selected_recipe,
-        model_id=resolved_model_id,
-        run_name=run_name,
-    )
-    checkpoint_dir = CHECKPOINTS_PATH / resolved_run_label / "DRY_RUN"
+    cmd = build_train_cmd(miles_cfg, MILES_ROOT)
+    runtime_env = {
+        "env_vars": {
+            "no_proxy": f"127.0.0.1,{master_addr}",
+            "MASTER_ADDR": master_addr,
+            **miles_cfg.environment,
+        }
+    }
 
-    if dry_run:
-        argv = _build_miles_argv(
-            base_args_text=resolved_base_args_text,
-            model_path="$MODEL_PATH",
-            actor_nodes=resolved_actor_nodes,
-            gpus_per_node=gpus_per_node,
-            checkpoint_dir=checkpoint_dir,
-            extra_args_text=merged_extra_args,
-            custom_config_path="/tmp/custom-config.yaml"
-            if custom_config_yaml
-            else None,
-            wandb_key="$WANDB_API_KEY" if wandb_key else None,
-            colocate=colocate,
-            rollout_num_gpus=resolved_rollout_num_gpus,
-        )
-        print(f"Recipe: {selected_recipe.name if selected_recipe else '<none>'}")
-        print(f"Model: {resolved_model_id}")
-        print(f"Run label: {resolved_run_label}")
-        print(f"Cluster nodes: {CLUSTER_NODES}")
-        print(f"Actor nodes: {resolved_actor_nodes}")
-        print(f"Colocate: {colocate}")
-        if not colocate:
-            print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
-        print(f"GPU: {selected_gpu}")
-        print(shlex.join(argv))
-        return
+    client = JobSubmissionClient("http://127.0.0.1:8265")
+    job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
+    nodes = miles_cfg.total_nodes()
+    gpu = f"{modal_cfg.gpu}:{miles_cfg.actor_num_gpus_per_node}"
+    mode = "async" if miles_cfg.async_mode else "sync"
+    print(f"Job submitted: {job_id}")
+    print(f"Training {experiment:<40} {nodes} node(s) × {gpu}  ({mode})")
+    print(f"Command: {cmd}, runtime_env: {runtime_env}")
 
-    print(f"Recipe: {selected_recipe.name if selected_recipe else '<none>'}")
-    print(f"Model: {resolved_model_id}")
-    print(f"Run label: {resolved_run_label}")
-    print(f"Cluster nodes: {CLUSTER_NODES}")
-    print(f"Actor nodes: {resolved_actor_nodes}")
-    print(f"Colocate: {colocate}")
-    if not colocate:
-        print(f"Rollout GPUs: {resolved_rollout_num_gpus}")
-    print(f"GPU: {selected_gpu}")
-
-    submit_kwargs = dict(
-        recipe_name=selected_recipe.name if selected_recipe else "",
-        model_id=resolved_model_id,
-        base_args_text=base_args_text,
-        gpus_per_node=gpus_per_node,
-        extra_args_text=merged_extra_args,
-        custom_config_yaml=custom_config_yaml,
-        wandb_key=wandb_key,
-        run_name=resolved_run_label,
-        actor_nodes=resolved_actor_nodes,
-        colocate=colocate,
-        rollout_num_gpus=resolved_rollout_num_gpus,
-    )
-
-    try:
-        cluster = modal.Cls.from_name(APP_NAME, "MilesCluster").with_options(
-            gpu=selected_gpu
-        )()
-        print(f"Using deployed Modal class: {APP_NAME}.MilesCluster")
-        result = cluster.submit_training.remote(**submit_kwargs)
-    except modal.exception.NotFoundError:
-        print(
-            f"No deployed Modal class found for {APP_NAME}.MilesCluster; using an ephemeral app."
-        )
-        cluster = MilesCluster.with_options(gpu=selected_gpu)()
-        result = cluster.submit_training.remote(**submit_kwargs)
-
-    print(result)
+    async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
+        print(f"Ray dashboard: {tunnel.url}")
+        async for line in client.tail_job_logs(job_id):
+            print(line, end="", flush=True)

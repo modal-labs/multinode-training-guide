@@ -1,121 +1,225 @@
-# Miles on Modal
+# miles — Modal launcher for Miles training
 
-Run Miles RL training on Modal with recipe files stored under [`recipes/`](./recipes/).
-The wrapper handles Modal and Ray orchestration; model and training flags stay in
-recipe arg files.
+Thin Modal launcher that runs [Miles](https://github.com/radixark/miles) RL training on GPU clusters.
 
 ## Prerequisites
 
-- A Modal account with multi-node access.
-- A `huggingface-secret` Modal secret containing `HF_TOKEN`.
-- Optional: `WANDB_API_KEY` in your local shell for Weights & Biases logging.
-- Optional: `modal deploy miles/modal_train.py`. The local entrypoint will try
-  the deployed `MilesCluster` first and fall back to an ephemeral app if it is
-  not deployed.
+- Modal CLI installed and authenticated
+- Set your Modal environment: `export MODAL_ENVIRONMENT=<your-env>`
+- Modal secrets:
+  - `huggingface-secret` — required for `prepare_model` and `prepare_data`
+  - `wandb-secret` — required only for experiments with `use_wandb = True`
 
-## Prepare Shared Assets
+## Running an experiment
 
-Prepare the default GSM8K dataset:
+All commands take the experiment name via `EXPERIMENT_CONFIG`. Run from the repo root.
 
-```bash
-modal run miles/modal_train.py::prepare_dataset
-```
-
-Download a model for a built-in recipe:
+### 1. List available experiments
 
 ```bash
-modal run miles/modal_train.py::download_model --recipe qwen3-30b-a3b-lora
+modal run miles/modal_train.py::list_configs
 ```
 
-Or download any model directly:
+### 2. Prepare model (one-time)
+
+Downloads the experiment's HF checkpoint to the `huggingface-cache` volume and applies any experiment-specific model fixes.
 
 ```bash
-modal run miles/modal_train.py::download_model --model-id Qwen/Qwen3-30B-A3B
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_model
 ```
 
-## Recipes
+### 3. Prepare data (one-time)
 
-List the available recipes:
+Downloads and preprocesses the training dataset to the `miles-data` volume.
+Only required if the experiment defines a `prepare_data()` function (see [Adding an experiment](#adding-an-experiment)).
 
 ```bash
-modal run miles/modal_train.py --list-recipes
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_data
 ```
 
-Recommended starting points:
+### 4. Convert checkpoint (one-time, raw mode only)
 
-- `qwen3-30b-a3b-lora`: default Qwen3 recipe.
-- `qwen3-30b-a3b-lora-fewstep`: smallest end-to-end Qwen3 validation recipe.
-- `qwen3-30b-a3b-experts-lora`: explicit expert-target variant.
-- `qwen3-30b-a3b-experts-fewstep`: trimmed expert-target validation recipe.
-- `qwen25-0p5b-lora`: small smoke test.
-
-Testing and debug recipes live under [`recipes/tests/`](./recipes/tests).
-
-## Train
-
-Set `MILES_N_NODES` in the same shell invocation as `modal run`.
-
-Single-node Qwen3 few-step validation:
+Converts the HF checkpoint to `torch_dist` format. Only required when `megatron_to_hf_mode = "raw"`.
+Skip this step if using bridge mode.
 
 ```bash
-MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-lora-fewstep
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::convert_checkpoint
 ```
 
-Single-node Qwen3 default recipe:
+### 5. Run training
 
 ```bash
-MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-lora
+EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run -d miles/modal_train.py::train
 ```
 
-Single-node expert-target follow-up:
+Use `-d` (detached) to keep training running after you close your terminal.
+
+## Docker Image
+
+Uses `radixark/miles:dev-202604101227` as the base image.
+
+## Architecture
+
+Each experiment defines two module-level objects in `configs/<name>.py`:
+
+- `modal` — `ModalConfig` instance (GPU type, dev overlays, image patches)
+- `miles` — `MilesConfig` subclass instance (all Miles CLI arguments)
+
+`MilesConfig` attributes are automatically converted to CLI flags:
+- `lora_rank = 64` → `--lora-rank 64`
+- `colocate = True` → `--colocate`
+- `colocate = False` → omitted
+
+### Special Fields
+
+These `MilesConfig` fields are **not** passed as CLI args:
+
+| Field | Purpose |
+|-------|---------|
+| `environment` | Injected into the Ray job runtime env |
+| `async_mode` | Selects `train_async.py` vs `train.py` |
+| `miles_model_script` | Shell script sourced for `MODEL_ARGS` (e.g., `scripts/models/qwen3-4B.sh`) |
+
+### Volumes
+
+| Volume | Mount Path | Purpose |
+|--------|-----------|---------|
+| `huggingface-cache` | `/root/.cache/huggingface` | Model checkpoints |
+| `miles-data` | `/data` | Training datasets |
+| `miles-checkpoints` | `/checkpoints` | Converted checkpoints |
+
+## Adding an experiment
+
+### 1. Create the config file
+
+Create `configs/<your_experiment>.py`. Each config file must expose two module-level instances:
+- `modal` — a `ModalConfig` instance (GPU type, image patches)
+- `miles` — a `MilesConfig` subclass instance (all Miles training arguments)
+
+```python
+from configs.base import ModalConfig, MilesConfig, DATA_PATH
+
+modal = ModalConfig(gpu="H200")
+
+
+class _Miles(MilesConfig):
+    # Launcher instructions (not passed to Miles CLI)
+    miles_model_script = "scripts/models/qwen3-4B.sh"  # sources MODEL_ARGS
+    async_mode = False
+
+    # Model
+    hf_checkpoint = "Qwen/Qwen3-4B"
+    megatron_to_hf_mode = "bridge"  # or "raw" (requires convert_checkpoint)
+
+    # Infrastructure
+    actor_num_nodes = 1
+    actor_num_gpus_per_node = 4
+    colocate = True
+
+    # Data
+    prompt_data = f"{DATA_PATH}/my_dataset/train.jsonl"
+    input_key = "prompt"
+    label_key = "label"
+    rm_type = "deepscaler"
+
+    # ... all other Miles args as snake_case attributes
+
+
+miles = _Miles()
+```
+
+Every attribute on `_Miles` (except `environment`, `async_mode`, `miles_model_script`) is forwarded to
+Miles as a CLI argument: `field_name` → `--field-name`. See `configs/base.py` for full rules.
+
+### 2. Add `prepare_model()` / `prepare_data()` methods (if needed)
+
+Override `prepare_model()` if your experiment needs model-specific preparation beyond a plain HF download.
+The base implementation already calls `snapshot_download(self.hf_checkpoint)`.
+
+```python
+class _Miles(MilesConfig):
+    ...
+    def prepare_model(self) -> None:
+        super().prepare_model()
+        # apply model-specific local patches if needed
+```
+
+If your experiment needs to download or preprocess a dataset, override `prepare_data()` on `_Miles`.
+It runs inside the Modal container with the `miles-data` volume mounted at `DATA_PATH`.
+
+```python
+class _Miles(MilesConfig):
+    ...
+    def prepare_data(self) -> None:
+        import os
+        from huggingface_hub import snapshot_download
+
+        os.makedirs(f"{DATA_PATH}/my_dataset", exist_ok=True)
+        snapshot_download(
+            repo_id="org/my-dataset",
+            repo_type="dataset",
+            local_dir=f"{DATA_PATH}/my_dataset",
+        )
+```
+
+If `prepare_data()` is not overridden, `prepare_data` will raise `NotImplementedError` — simply skip that step.
+
+### 3. Run the workflow
+
+`EXPERIMENT_CONFIG` is the config filename without `.py`:
 
 ```bash
-MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen3-30b-a3b-experts-fewstep
+EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_model
+EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_data  # if prepare_data() defined
+EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
+EXPERIMENT_CONFIG=my_experiment modal run -d miles/modal_train.py::train
 ```
 
-Non-colocated Qwen3 validation:
+No registration step needed — the launcher discovers configs automatically from the `configs/` directory.
 
-```bash
-MILES_N_NODES=2 modal run miles/modal_train.py \
-  --recipe qwen3-30b-a3b-lora-fewstep \
-  --no-colocate \
-  --actor-nodes 1 \
-  --allow-cluster-mismatch
+## YAML config fields
+
+`eval_config`, `custom_config_path`, and `sglang_config` normally take file paths in Miles.
+In Python configs you can write them as inline dicts — the launcher materializes them to temp YAML files automatically:
+
+```python
+class _Miles(MilesConfig):
+    eval_config = {
+        "eval": {
+            "defaults": {"max_response_len": 16384},
+            "datasets": [
+                {"name": "aime", "path": "/data/aime.jsonl", "rm_type": "deepscaler"},
+            ],
+        }
+    }
 ```
 
-Small smoke test:
+## JSON config fields
 
-```bash
-MILES_N_NODES=1 modal run miles/modal_train.py --recipe qwen25-0p5b-lora
+`train_env_vars`, `apply_chat_template_kwargs`, and `multimodal_keys` are parsed by Miles with `json.loads()`.
+If set as dicts in Python configs, the launcher serializes them with `json.dumps()` automatically.
+
+## Dev overlay
+
+To test local Miles changes without rebuilding the image, set `local_miles` in your `ModalConfig`:
+
+```python
+modal = ModalConfig(
+    gpu="H200",
+    local_miles="/path/to/your/miles",
+)
 ```
 
-## Ad Hoc Runs
+## Applying patches to the image
 
-You can launch without a predefined recipe by passing args directly:
+To inject local patch files into the image (e.g. to patch SGLang), use `patch_files` and `image_run_commands`:
 
-```bash
-MILES_N_NODES=1 modal run miles/modal_train.py \
-  --model-id Qwen/Qwen3-30B-A3B \
-  --args-file miles/recipes/qwen3-30b-a3b-lora.args \
-  --extra-args "--train-samples 8 --eval-interval 1" \
-  --run-name qwen3-adhoc
+```python
+modal = ModalConfig(
+    gpu="H200",
+    patch_files=["patches/sglang_fix.patch"],
+    image_run_commands=["cd /sgl-workspace/sglang && git apply /tmp/sglang_fix.patch"],
+)
 ```
 
-## Useful Options
-
-- `--dry-run`: print the assembled Miles command without launching a job.
-- `--args` / `--args-file`: provide the base Miles CLI args.
-- `--extra-args` / `--extra-args-file`: append overrides to a recipe or ad hoc run.
-- `--custom-config`: pass a YAML override file through to Miles.
-- `--run-name`: override the checkpoint subdirectory name.
-- `--allow-cluster-mismatch`: bypass recipe node-count checks.
-- `USE_LOCAL_MILES=/path/to/miles`: overlay a local Miles checkout.
-- `MILES_IMAGE=radixark/miles:...`: override the pinned container image.
-
-## Notes
-
-- The default Qwen3 recipes use standard all-layer LoRA over
-  `linear_qkv`, `linear_proj`, `linear_fc1`, and `linear_fc2`.
-- Start with the few-step recipes when validating a new environment.
-- Modal-specific runtime compatibility patches live in
-  [`modal_patches/sitecustomize.py`](./modal_patches/sitecustomize.py).
+Each file in `patch_files` is added to the image at `/tmp/<filename>`.
