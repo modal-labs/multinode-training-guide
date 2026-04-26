@@ -1,5 +1,5 @@
 diff --git a/src/megatron/bridge/data/vlm_datasets/collate.py b/src/megatron/bridge/data/vlm_datasets/collate.py
-index eef2a2d2..bb4e0cbb 100644
+index eef2a2d2..45f41578 100644
 --- a/src/megatron/bridge/data/vlm_datasets/collate.py
 +++ b/src/megatron/bridge/data/vlm_datasets/collate.py
 @@ -17,6 +17,7 @@ Collation utilities for building VLM training batches from conversation examples
@@ -44,7 +44,7 @@ index eef2a2d2..bb4e0cbb 100644
      return batch
  
  
-@@ -507,11 +517,246 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
+@@ -507,11 +517,242 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
      return batch
  
  
@@ -183,15 +183,11 @@ index eef2a2d2..bb4e0cbb 100644
 +
 +        # Pre-expand image tokens if we have grid_thws
 +        if "grid_thws" in sample_batch and sample_batch["grid_thws"] is not None:
-+            # print(f"using grid_thws: {sample_batch['grid_thws']} and pre-expand mode")
 +            grid_thws = sample_batch["grid_thws"]
-+            # print(f"before expand input_ids: {input_ids.shape}")
-+
 +            input_ids, attention_mask = _expand_image_tokens(
 +                input_ids, attention_mask, grid_thws, media_token_id, merge_kernel_size
 +            )
 +            all_grid_thws.append(grid_thws)
-+            # print(f"after expand input_ids: {input_ids.shape}")
 +
 +        if "pixel_values" in sample_batch:
 +            all_pixel_values.append(sample_batch["pixel_values"])
@@ -1184,10 +1180,10 @@ index 00000000..f3a852e4
 +]
 diff --git a/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
 new file mode 100644
-index 00000000..f023f91c
+index 00000000..15a788cd
 --- /dev/null
 +++ b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
-@@ -0,0 +1,633 @@
+@@ -0,0 +1,592 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -1340,11 +1336,7 @@ index 00000000..f023f91c
 +        show_progress: bool = True,
 +    ):
 +        """Stream adapter weights with mixed-side emission for shared-outer grouped expert LoRA."""
-+        import os
 +        from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
-+
-+        rank = int(os.environ.get("RANK", "0"))
-+        print(f"[BRIDGE_DBG rank={rank}] stream_adapter_weights_megatron_to_hf ENTER (KimiK25VLBridge override)", flush=True)
 +
 +        if not isinstance(megatron_model, list):
 +            megatron_model = [megatron_model]
@@ -1352,14 +1344,12 @@ index 00000000..f023f91c
 +        num_moe_experts = megatron_model[0].config.num_moe_experts
 +        adapter_tasks_by_base = self.build_adapter_conversion_tasks(megatron_model)
 +        adapter_tasks = list(itertools.chain.from_iterable(adapter_tasks_by_base.values()))
-+        print(f"[BRIDGE_DBG rank={rank}] num_moe_experts={num_moe_experts}, num_adapter_tasks={len(adapter_tasks)}", flush=True)
 +        if not adapter_tasks:
 +            return
 +
 +        assert hasattr(self, "mapping_registry"), "MegatronModelBridge must define mapping_registry"
 +        mapping_registry = self.mapping_registry()
 +
-+        _task_idx = 0
 +        for adapter_task in self._with_progress_tracking(
 +            adapter_tasks, "Streaming adapter weights", show_progress
 +        ):
@@ -1373,18 +1363,6 @@ index 00000000..f023f91c
 +            is_grouped_expert = (
 +                is_expert and ".local_experts." not in adapter_task.global_base_prefix
 +            )
-+
-+            if _task_idx < 3 or "linear_fc1" in adapter_task.global_base_prefix and _task_idx < 8:
-+                print(
-+                    f"[BRIDGE_DBG rank={rank}] task#{_task_idx} "
-+                    f"prefix={adapter_task.global_base_prefix} "
-+                    f"adapter_key={adapter_task.adapter_key} "
-+                    f"is_expert={is_expert} is_grouped={is_grouped_expert} "
-+                    f"lin_in.shape={tuple(linear_in_tensor.shape)} ndim={linear_in_tensor.ndim} "
-+                    f"lin_out.shape={tuple(linear_out_tensor.shape)} ndim={linear_out_tensor.ndim}",
-+                    flush=True,
-+                )
-+            _task_idx += 1
 +
 +            if not is_grouped_expert:
 +                # Non-grouped adapter: delegate to the default per-suffix loop.
@@ -1402,11 +1380,18 @@ index 00000000..f023f91c
 +                continue
 +
 +            # Grouped expert: mixed 2D (shared) / 3D (per-expert) emission.
-+            linear_in_gathered = self._gather_expert_adapter_weight(linear_in_tensor)
-+            linear_out_gathered = self._gather_expert_adapter_weight(linear_out_tensor)
-+
++            # Only gather across EP for per-expert sides; the shared-side
++            # emission path reads ``side_tensor`` directly and never touches
++            # ``side_gathered``, so allocating ep_size empty_like buffers +
++            # running an all_gather for shared sides is pure waste.
 +            linear_in_shared = linear_in_tensor.ndim == 2
 +            linear_out_shared = linear_out_tensor.ndim == 2
++            linear_in_gathered = (
++                None if linear_in_shared else self._gather_expert_adapter_weight(linear_in_tensor)
++            )
++            linear_out_gathered = (
++                None if linear_out_shared else self._gather_expert_adapter_weight(linear_out_tensor)
++            )
 +
 +            # Emit linear_in side.
 +            yield from self._emit_grouped_adapter_side(
@@ -1460,22 +1445,14 @@ index 00000000..f023f91c
 +        Per-expert (3D): emit ``num_moe_experts`` times, one 2D slice per
 +        expert under ``.weight0..weight{N-1}``.
 +        """
-+        import os
 +        from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
-+
-+        rank = int(os.environ.get("RANK", "0"))
-+        _should_log = (
-+            "linear_fc1" in adapter_task.global_base_prefix
-+            and ".layers.0." in adapter_task.global_base_prefix
-+        )
 +
 +        if side_is_shared:
 +            suffixes = [".weight0"]
 +        else:
 +            suffixes = [f".weight{i}" for i in range(num_moe_experts)]
 +
-+        _emitted_names = []
-+        # The shared side is now a fully-replicated ReplicatedSharedLinear
++        # The shared side is a fully-replicated ReplicatedSharedLinear
 +        # (see peft/utils.py); every rank holds the full [out, in] tensor.
 +        # No TP gather is needed — emit ``side_tensor`` directly.
 +        for base_suffix in suffixes:
@@ -1512,16 +1489,6 @@ index 00000000..f023f91c
 +                self._make_lora_param_name(bn, side_suffix) for bn in base_hf_names
 +            ]
 +
-+            if _should_log:
-+                print(
-+                    f"[BRIDGE_DBG rank={rank}] _emit side: prefix={adapter_task.global_base_prefix} "
-+                    f"side_suffix={side_suffix} side_is_shared={side_is_shared} "
-+                    f"is_linear_out={is_linear_out} base_suffix={base_suffix} "
-+                    f"base_hf_names={base_hf_names} side_hf_names={side_hf_names} "
-+                    f"current.shape={tuple(current.shape)}",
-+                    flush=True,
-+                )
-+
 +            # Handle fused adapters (e.g., linear_fc1 splitting into
 +            # gate_proj/up_proj). Only applies to linear_out side.
 +            if is_linear_out and adapter_task.adapter_key is None:
@@ -1535,7 +1502,6 @@ index 00000000..f023f91c
 +                    for index, base_name in enumerate(base_hf_names):
 +                        chunk = per_base.get(base_name)
 +                        assert chunk is not None, "unknown projection name"
-+                        _emitted_names.append(side_hf_names[index])
 +                        yield HFWeightTuple(side_hf_names[index], chunk, megatron_side_name)
 +                    continue
 +
@@ -1550,21 +1516,10 @@ index 00000000..f023f91c
 +            # ``_emit_default_adapter``.
 +            if side_is_shared and len(side_hf_names) > 1:
 +                for hf_name in side_hf_names:
-+                    _emitted_names.append(hf_name)
 +                    yield HFWeightTuple(hf_name, current, megatron_side_name)
 +                continue
 +
-+            _emitted_names.append(side_hf_names[0] if side_hf_names else "<EMPTY!>")
 +            yield HFWeightTuple(side_hf_names[0], current, megatron_side_name)
-+
-+        if _should_log:
-+            print(
-+                f"[BRIDGE_DBG rank={rank}] _emit DONE: prefix={adapter_task.global_base_prefix} "
-+                f"side_suffix={side_suffix} side_is_shared={side_is_shared} "
-+                f"is_linear_out={is_linear_out} emitted={len(_emitted_names)} names "
-+                f"first3={_emitted_names[:3]}",
-+                flush=True,
-+            )
 +
 +    def _emit_default_adapter(
 +        self,
@@ -2649,10 +2604,10 @@ index 48d4057e..c54931b6 100644
                  attrs.in_features,
                  attrs.out_features,
 diff --git a/src/megatron/bridge/peft/lora_layers.py b/src/megatron/bridge/peft/lora_layers.py
-index d5404c64..2eaa138b 100644
+index d5404c64..dd948b7b 100644
 --- a/src/megatron/bridge/peft/lora_layers.py
 +++ b/src/megatron/bridge/peft/lora_layers.py
-@@ -62,6 +62,71 @@ class LoRALinear(AdapterWrapper):
+@@ -62,6 +62,25 @@ class LoRALinear(AdapterWrapper):
          return linear_output + adapter_output, bias
  
  
@@ -2664,61 +2619,15 @@ index d5404c64..2eaa138b 100644
 +    per-expert GroupedLinear side. Plumb it through.
 +    """
 +
-+    # Per-process counter for diagnostic logging (ordered per-layer trace).
-+    _MEM_TRACE_COUNTER = 0
-+
 +    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-+        # Diagnostic logging — no-op unless ``MILES_MEM_TRACE=1``.
-+        import os as _os
-+        _trace = _os.environ.get("MILES_MEM_TRACE", "").strip().lower() not in ("", "0", "false", "no")
-+        _tag = ""
-+        _rank = 0
-+        _alloc0 = _alloc1 = _alloc2 = 0
-+        if _trace:
-+            LoRAGroupedExpertLinear._MEM_TRACE_COUNTER += 1
-+            _tag = f"lora_grouped#{LoRAGroupedExpertLinear._MEM_TRACE_COUNTER}"
-+            _alloc0 = torch.cuda.memory_allocated()
-+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-+            print(
-+                f"[MEM rank={_rank} alloc={_alloc0/1024**3:6.2f}GiB] {_tag} enter "
-+                f"x.requires_grad={x.requires_grad} grad_enabled={torch.is_grad_enabled()}",
-+                flush=True,
-+            )
-+
 +        linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
-+
-+        if _trace:
-+            _alloc1 = torch.cuda.memory_allocated()
-+            print(
-+                f"[MEM rank={_rank} alloc={_alloc1/1024**3:6.2f}GiB Δ={(_alloc1-_alloc0)/1024**3:+.2f}GiB] {_tag} post_base "
-+                f"linear_output.requires_grad={linear_output.requires_grad}",
-+                flush=True,
-+            )
-+
 +        if not self._adapter_enabled:
 +            return linear_output, bias
 +        # TEGroupedMLP calls linear_fc1(x, tokens_per_expert) positionally.
 +        m_splits = args[0] if args else kwargs.get("m_splits", kwargs.get("tokens_per_expert"))
 +        adapter_output = self.adapter(layernorm_output.contiguous(), m_splits=m_splits)
 +        adapter_output = adapter_output.reshape(linear_output.shape)
-+
-+        if _trace:
-+            _alloc2 = torch.cuda.memory_allocated()
-+            print(
-+                f"[MEM rank={_rank} alloc={_alloc2/1024**3:6.2f}GiB Δ={(_alloc2-_alloc1)/1024**3:+.2f}GiB] {_tag} post_adapter "
-+                f"adapter_output.requires_grad={adapter_output.requires_grad}",
-+                flush=True,
-+            )
-+
-+        out = linear_output + adapter_output
-+        if _trace:
-+            _alloc3 = torch.cuda.memory_allocated()
-+            print(
-+                f"[MEM rank={_rank} alloc={_alloc3/1024**3:6.2f}GiB Δ={(_alloc3-_alloc2)/1024**3:+.2f}GiB] {_tag} post_add "
-+                f"out.requires_grad={out.requires_grad} has_grad_fn={out.grad_fn is not None}",
-+                flush=True,
-+            )
-+        return out, bias
++        return linear_output + adapter_output, bias
 +
 +
  class LoRATopKRouter(AdapterWrapper):

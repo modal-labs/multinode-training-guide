@@ -314,10 +314,10 @@ index 9fb8aa14d..10c2e45b8 100644
          # Run the only lora moe runner (Triton)
          combine_input = self._lora_runner.run(
 diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
-index 082d1fb0a..9568f9e3e 100644
+index 082d1fb0a..13c8dc27b 100644
 --- a/python/sglang/srt/lora/lora.py
 +++ b/python/sglang/srt/lora/lora.py
-@@ -88,12 +88,100 @@ class LoRAAdapter(nn.Module):
+@@ -88,11 +88,46 @@ class LoRAAdapter(nn.Module):
  
          self._normalize_weights()
  
@@ -331,23 +331,12 @@ index 082d1fb0a..9568f9e3e 100644
 +        :meth:`update_weights_from_tensors` calls can contribute more tensors
 +        before fusion (qkv / gate_up) runs over the complete set.
 +        """
-+        import os as _os
-+        _rank = _os.environ.get("RANK", "0")
-+        _dbg_names = list(tensors.keys())
-+        _layer0_names = [n for n in _dbg_names if ".layers.0." in n or "layers.0." in n.split(".model.")[-1]]
-+        _gate_up_names = [n for n in _dbg_names if ("gate_proj" in n or "up_proj" in n or "gate_up" in n) and "experts" in n]
-+        print(
-+            f"[LORA_ADAPTER_DBG rank={_rank}] initialize_weights_from_tensors: total={len(_dbg_names)}, finalize={finalize}, "
-+            f"sample_first5={_dbg_names[:5]}, "
-+            f"layer0_count={len(_layer0_names)}, layer0_first10={_layer0_names[:10]}, "
-+            f"expert_gate_up_count={len(_gate_up_names)}, expert_gate_up_first5={_gate_up_names[:5]}",
-+            flush=True,
-+        )
-+        for name, tensor in tensors.items():
-+            self._process_weight(name, tensor)
-+
+         for name, tensor in tensors.items():
+             self._process_weight(name, tensor)
+ 
+-        self._normalize_weights()
 +        if finalize:
-+            self._finalize_weights_with_dbg(_rank)
++            self._normalize_weights()
 +
 +    def update_weights_from_tensors(
 +        self,
@@ -363,62 +352,20 @@ index 082d1fb0a..9568f9e3e 100644
 +        don't collide with this sync's pre-normalize names. When ``finalize``
 +        is True, run ``_normalize_weights`` after writing.
 +        """
-+        import os as _os
-+        _rank = _os.environ.get("RANK", "0")
-+        _dbg_names = list(tensors.keys())
-+        print(
-+            f"[LORA_ADAPTER_DBG rank={_rank}] update_weights_from_tensors: total={len(_dbg_names)}, "
-+            f"reset={reset}, finalize={finalize}, sample_first5={_dbg_names[:5]}",
-+            flush=True,
-+        )
 +        if reset:
 +            for layer in self.layers:
 +                layer.weights.clear()
 +            self.embedding_layers.clear()
 +            self.added_tokens_embeddings.clear()
 +
-         for name, tensor in tensors.items():
-             self._process_weight(name, tensor)
- 
++        for name, tensor in tensors.items():
++            self._process_weight(name, tensor)
++
 +        if finalize:
-+            self._finalize_weights_with_dbg(_rank)
-+
-+    def _finalize_weights_with_dbg(self, _rank: str):
-+        # Log layer 0 weight names BEFORE normalize
-+        if len(self.layers) > 0:
-+            pre_names = sorted(list(self.layers[0].weights.keys()))
-+            pre_A = [n for n in pre_names if "lora_A" in n and ("gate_proj" in n or "up_proj" in n or "gate_up_proj" in n)]
-+            pre_B = [n for n in pre_names if "lora_B" in n and ("gate_proj" in n or "up_proj" in n or "gate_up_proj" in n)]
-+            print(
-+                f"[LORA_ADAPTER_DBG rank={_rank}] layer0 PRE_NORMALIZE: "
-+                f"total={len(pre_names)} gate_up_A_count={len(pre_A)} gate_up_A_first5={pre_A[:5]} "
-+                f"gate_up_B_count={len(pre_B)} gate_up_B_first5={pre_B[:5]}",
-+                flush=True,
-+            )
-+            if pre_A:
-+                _shape = self.layers[0].weights[pre_A[0]].shape
-+                print(f"[LORA_ADAPTER_DBG rank={_rank}] layer0 first A shape: {pre_A[0]} -> {tuple(_shape)}", flush=True)
-+
-         self._normalize_weights()
++            self._normalize_weights()
  
-+        # Log layer 0 weight names AFTER normalize
-+        if len(self.layers) > 0:
-+            post_names = sorted(list(self.layers[0].weights.keys()))
-+            post_A = [n for n in post_names if "lora_A" in n and ("gate_up_proj" in n or "gate_proj" in n or "up_proj" in n)]
-+            post_B = [n for n in post_names if "lora_B" in n and ("gate_up_proj" in n or "gate_proj" in n or "up_proj" in n)]
-+            print(
-+                f"[LORA_ADAPTER_DBG rank={_rank}] layer0 POST_NORMALIZE: "
-+                f"total={len(post_names)} gate_up_A_count={len(post_A)} gate_up_A_first5={post_A[:5]} "
-+                f"gate_up_B_count={len(post_B)} gate_up_B_first5={post_B[:5]}",
-+                flush=True,
-+            )
-+            if post_A:
-+                _shape = self.layers[0].weights[post_A[0]].shape
-+                print(f"[LORA_ADAPTER_DBG rank={_rank}] layer0 first POST A shape: {post_A[0]} -> {tuple(_shape)}", flush=True)
-+
      def _process_weight(self, name: str, loaded_weight: torch.Tensor):
          from sglang.srt.lora.utils import get_normalized_target_modules
- 
 diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
 index 58d00551a..cd2a4fac1 100644
 --- a/python/sglang/srt/lora/lora_manager.py
@@ -587,7 +534,7 @@ index 983064154..94475b871 100644
  
  def _compute_lora_alignment(
 diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
-index 34444edfc..55dd6f469 100644
+index 34444edfc..0c520c375 100644
 --- a/python/sglang/srt/lora/mem_pool.py
 +++ b/python/sglang/srt/lora/mem_pool.py
 @@ -157,6 +157,66 @@ class LoRAMemoryPool:
@@ -707,41 +654,7 @@ index 34444edfc..55dd6f469 100644
  
          # Check if MoE module and return appropriate shape
          if self.is_moe_module(module_name):
-@@ -572,6 +641,8 @@ class LoRAMemoryPool:
-             else:
-                 logger.warning(msg)
- 
-+        import os as _os
-+        _rank = _os.environ.get("RANK", "0")
-         for layer_id in range(self.num_layer):
-             layer_weights = lora_adapter.layers[layer_id].weights
-             # - Standard: module_name -> torch.Tensor
-@@ -583,6 +654,24 @@ class LoRAMemoryPool:
-                 target_module: None for target_module in self.B_buffer
-             }
- 
-+            if layer_id == 0:
-+                _lw_keys = sorted(list(layer_weights.keys()))
-+                _lw_A_gateup = [n for n in _lw_keys if "lora_A" in n and ("gate_up_proj" in n or "gate_proj" in n or "up_proj" in n)]
-+                _lw_B_gateup = [n for n in _lw_keys if "lora_B" in n and ("gate_up_proj" in n or "gate_proj" in n or "up_proj" in n)]
-+                print(
-+                    f"[MEMPOOL_DBG rank={_rank}] layer 0 in load_lora_weight_to_buffer: "
-+                    f"total_weights={len(_lw_keys)} "
-+                    f"A_buffer_keys={sorted(self.A_buffer.keys())} "
-+                    f"target_modules={sorted(self.target_modules)} "
-+                    f"experts_shared_outer_loras={self.experts_shared_outer_loras} "
-+                    f"gate_up_A_count={len(_lw_A_gateup)} gate_up_A_first5={_lw_A_gateup[:5]} "
-+                    f"gate_up_B_count={len(_lw_B_gateup)} gate_up_B_first10={_lw_B_gateup[:10]}",
-+                    flush=True,
-+                )
-+                if _lw_A_gateup:
-+                    _sh = layer_weights[_lw_A_gateup[0]].shape
-+                    print(f"[MEMPOOL_DBG rank={_rank}] layer 0 first gate_up A: {_lw_A_gateup[0]} -> shape={tuple(_sh)}", flush=True)
-+
-             for name, weights in layer_weights.items():
-                 target_module = get_target_module_name(name, self.target_modules)
- 
-@@ -590,16 +679,21 @@ class LoRAMemoryPool:
+@@ -590,16 +659,21 @@ class LoRAMemoryPool:
                  expert_match = re.search(r"experts\.(\d+)\.", name)
  
                  if expert_match:
@@ -1044,7 +957,7 @@ index 9ff683a7e..cfa7e1965 100644
                  "Start unload Lora adapter. Lora name=%s",
                  obj.lora_name,
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index fb56de158..c3e9869f6 100644
+index fb56de158..a027d7932 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
 @@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
@@ -1055,17 +968,57 @@ index fb56de158..c3e9869f6 100644
      PostProcessWeightsReqInput,
      SendWeightsToRemoteInstanceReqInput,
      UnloadLoRAAdapterReqInput,
-@@ -211,9 +212,31 @@ class BaseTpWorker(ABC):
+@@ -158,12 +159,20 @@ class BaseTpWorker(ABC):
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+ 
+         monkey_patch_torch_reductions()
++        named_tensors = MultiprocessingSerializer.deserialize(
++            recv_req.serialized_named_tensors[self.tp_rank]
++        )
+         success, message = self.model_runner.update_weights_from_tensor(
+-            named_tensors=MultiprocessingSerializer.deserialize(
+-                recv_req.serialized_named_tensors[self.tp_rank]
+-            ),
++            named_tensors=named_tensors,
+             load_format=recv_req.load_format,
+         )
++        # Drop local refs to imported IPC tensors, run gc so PyTorch's IPC table
++        # entries become collectable, then ipc_collect to signal source release
++        # via the shmem refcount file.
++        del named_tensors
++        import gc
++        gc.collect()
++        torch.cuda.ipc_collect()
+         return success, message
+ 
+     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+@@ -195,6 +204,8 @@ class BaseTpWorker(ABC):
+     ):
+         # The LoRA code handles TP sharding internally using slice_lora_a_weights
+         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
++        flattened_data = None
++        bucket = None
+         if recv_req.load_format == "flattened_bucket":
+             flattened_data = MultiprocessingSerializer.deserialize(
+                 recv_req.serialized_tensors
+@@ -211,7 +222,41 @@ class BaseTpWorker(ABC):
              tensors,
              recv_req.config_dict,
              recv_req.added_tokens_config,
 +            finalize=recv_req.finalize,
-         )
-         return result
- 
++        )
++        # Drop importer refs + collect IPC table so source can free its export.
++        del tensors, bucket, flattened_data
++        import gc
++        gc.collect()
++        torch.cuda.ipc_collect()
++        return result
++
 +    def update_lora_adapter_from_tensors(
 +        self, recv_req: UpdateLoRAAdapterFromTensorsReqInput
 +    ):
++        flattened_data = None
++        bucket = None
 +        if recv_req.load_format == "flattened_bucket":
 +            flattened_data = MultiprocessingSerializer.deserialize(
 +                recv_req.serialized_tensors
@@ -1077,16 +1030,19 @@ index fb56de158..c3e9869f6 100644
 +            tensors = dict(bucket.reconstruct_tensors())
 +        else:
 +            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
-+        return self.model_runner.update_lora_adapter_from_tensors(
++        result = self.model_runner.update_lora_adapter_from_tensors(
 +            recv_req.to_ref(),
 +            tensors,
 +            reset=recv_req.reset,
 +            finalize=recv_req.finalize,
-+        )
-+
+         )
++        del tensors, bucket, flattened_data
++        import gc
++        gc.collect()
++        torch.cuda.ipc_collect()
+         return result
+ 
      def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-         logits_output = self.model_runner.forward(forward_batch).logits_output
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
 index 7a68e69c4..31e9c4b16 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
