@@ -21,6 +21,7 @@ image = (
         "equinox==0.13.6",
         "optax==0.2.6",
         "matplotlib~=3.10.8",
+        "tiktoken==0.12.0",
     )
     .add_local_dir(LOCAL_CODE_DIR, remote_path="/root")
 )
@@ -154,7 +155,7 @@ def train_rnn(
         dataset_path = rnn_lib.DATASET_PATH
 
     mesh, nproc = _init_distributed_mesh()
-    model, stoi, itos = rnn_lib.train_loop(
+    model, tokenizer = rnn_lib.train_loop(
         checkpoint_dir=CHECKPOINT_DIR,
         mesh=mesh,
         nproc=nproc,
@@ -168,7 +169,7 @@ def train_rnn(
         seed=seed,
     )
     rnn_volume.commit()
-    return model, stoi, itos
+    return model, tokenizer.name
 
 
 @app.function(
@@ -177,19 +178,15 @@ def train_rnn(
     timeout=60 * 60,
 )
 def predict_rnn(
-    prompt: str = "The whale ",
-    length: int = 500,
+    prompt: str = "The greatest creature in the sea",
+    length: int = 100,
     seed: int = 0,
     hidden_dim: int = 512,
-    dataset_path: str | None = None,
 ):
     """Load the latest RNN checkpoint from the volume and sample from it.
 
     `hidden_dim` must match what the checkpoint was trained with.
     """
-    if dataset_path is None:
-        dataset_path = rnn_lib.DATASET_PATH
-
     rnn_volume.reload()
     ckpt_path, epoch = rnn_lib.find_latest_checkpoint(CHECKPOINT_DIR)
     if ckpt_path is None:
@@ -199,9 +196,8 @@ def predict_rnn(
         )
     print(f"Loading checkpoint: {ckpt_path} (epoch {epoch + 1})")
 
-    text = rnn_lib.load_dataset(dataset_path)
-    stoi, itos = rnn_lib.build_vocab(text)
-    vocab_size = len(stoi)
+    tokenizer = rnn_lib.get_tokenizer()
+    vocab_size = tokenizer.n_vocab
 
     template = RNN(
         in_shape=vocab_size,
@@ -213,7 +209,7 @@ def predict_rnn(
 
     key = jax.random.PRNGKey(seed)
     return rnn_lib.generate(
-        model, prompt=prompt, stoi=stoi, itos=itos, length=length, key=key
+        model, prompt=prompt, tokenizer=tokenizer, length=length, key=key
     )
 
 

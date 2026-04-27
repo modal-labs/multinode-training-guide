@@ -11,12 +11,14 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 import equinox as eqx
 import optax
 import matplotlib.pyplot as plt
+import tiktoken
 
 from models import RNN
 
 
 LOCAL_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(LOCAL_CODE_DIR, "moby_dick_cetology.txt")
+TIKTOKEN_ENCODING = "gpt2"  # 50257-token BPE vocab
 
 
 def load_dataset(path: str = DATASET_PATH) -> str:
@@ -24,19 +26,10 @@ def load_dataset(path: str = DATASET_PATH) -> str:
         return f.read()
 
 
-def build_vocab(text: str):
-    chars = sorted(set(text))
-    stoi = {c: i for i, c in enumerate(chars)}
-    itos = {i: c for i, c in enumerate(chars)}
-    return stoi, itos
-
-
-def encode(text: str, stoi: dict) -> jax.Array:
-    return jnp.array([stoi[c] for c in text], dtype=jnp.int32)
-
-
-def decode(tokens, itos: dict) -> str:
-    return "".join(itos[int(t)] for t in tokens)
+def get_tokenizer(name: str = TIKTOKEN_ENCODING) -> tiktoken.Encoding:
+    """Return a tiktoken `Encoding`. Use `tokenizer.n_vocab`,
+    `tokenizer.encode(text)`, and `tokenizer.decode(tokens)` to interact."""
+    return tiktoken.get_encoding(name)
 
 
 def sample_batch(key, data: jax.Array, batch_size: int, seq_len: int):
@@ -91,9 +84,16 @@ def update(model, opt_state, x, y, optimizer, vocab_size):
     return model, opt_state, loss
 
 
-def generate(model: RNN, prompt: str, stoi: dict, itos: dict, length: int, key):
-    vocab_size = len(stoi)
-    tokens = [stoi[c] for c in prompt]
+def generate(
+    model: RNN,
+    prompt: str,
+    tokenizer: tiktoken.Encoding,
+    length: int,
+    key,
+) -> str:
+    """Autoregressive sampling. `length` is the number of new tokens to draw."""
+    vocab_size = tokenizer.n_vocab
+    tokens = tokenizer.encode(prompt)
 
     prompt_onehot = jax.nn.one_hot(jnp.array(tokens), vocab_size)
     _, hidden = run_sequence(model, prompt_onehot)
@@ -107,7 +107,7 @@ def generate(model: RNN, prompt: str, stoi: dict, itos: dict, length: int, key):
         last_token = int(jax.random.categorical(sub, logits))
         out.append(last_token)
 
-    return decode(out, itos)
+    return tokenizer.decode(out)
 
 
 def save_checkpoint(model, epoch, path):
@@ -154,7 +154,7 @@ def train_loop(
     mesh,
     nproc: int,
     dataset_path: str = DATASET_PATH,
-    learning_rate: float = 3e-3,
+    learning_rate: float = 1e-3,
     batch_size: int = 64,
     seq_len: int = 128,
     epochs: int = 25,
@@ -166,15 +166,19 @@ def train_loop(
     initialized and that `mesh` is a ready-to-use `jax.Mesh`.
 
     Writes per-epoch checkpoints to `checkpoint_dir`. Returns
-    `(model, stoi, itos)`.
+    `(model, tokenizer)`.
     """
     text = load_dataset(dataset_path)
-    stoi, itos = build_vocab(text)
-    vocab_size = len(stoi)
-    data = encode(text, stoi)
-    print(f"vocab_size={vocab_size}, dataset_len={data.shape[0]}")
+    tokenizer = get_tokenizer()
+    vocab_size = tokenizer.n_vocab
+    data = jnp.array(tokenizer.encode(text), dtype=jnp.int32)
+    if jax.process_index() == 0:
+        print(f"vocab_size={vocab_size}, dataset_len={data.shape[0]}")
 
-    optimizer = optax.adam(learning_rate)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate),
+    )
 
     key = jax.random.PRNGKey(seed)
     key, model_key = jax.random.split(key)
@@ -232,13 +236,13 @@ def train_loop(
 
                 all_losses.append(float(loss))
 
-            print(
-                f"Epoch {epoch + 1}/{epochs}, Loss {all_losses[-1]:.6f}, "
-                f"Average time per step {average_t:.9f}s"
-            )
             if jax.process_index() == 0:
+                print(
+                    f"Epoch {epoch + 1}/{epochs}, Loss {all_losses[-1]:.6f}, "
+                    f"Average time per step {average_t:.9f}s"
+                )
                 save_checkpoint(model, epoch, checkpoint_dir)
 
     if jax.process_index() == 0:
         plot_losses(all_losses, os.path.join(checkpoint_dir, "loss_curve_rnn.png"))
-    return model, stoi, itos
+    return model, tokenizer
