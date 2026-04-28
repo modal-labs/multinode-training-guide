@@ -1,11 +1,12 @@
+import json
+import os
+import re
 import subprocess
+import time
 
+from utils import read_port_counters
 import modal
 import modal.experimental
-
-import time
-import json
-import re
 
 cuda_version = "12.4.0"  # Should be no greater than host CUDA version
 flavor = "devel"  #  Includes full CUDA toolkit
@@ -34,6 +35,7 @@ image = (
         "rm -f /tmp/perftest-25.10.0-0.128.tar.gz",
         "cd /opt/perftest && ./autogen.sh && ./configure --prefix=/usr/local/ && make -j && make install",
     )
+    .add_local_python_source("utils")
 )
 app = modal.App("rdma-bandwidth-ib", image=image)
 
@@ -58,10 +60,27 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
     waits until the Modal dict has 8 IPs, then runs ib_write_bw.
     """
 
+    # Get current cloud provider
+    print(f"Running on {os.environ['MODAL_CLOUD_PROVIDER'].split('_')[2]}", flush=True)
+
     # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
-    print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
+    print(f"[rank {container_rank}] Initializing cluster info", flush=True)
+
+    # Read initial port counters
+    initial_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/*/counters/*",
+        {
+            "port_xmit_data": 0,
+            "port_rcv_data": 0,
+        },
+        multiplier=4,
+    )
+    print(
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
+        flush=True,
+    )
 
     # Get local ib devices (sorted by device index from 0 to 7)
     local_ib_devices = get_local_ib_devices()
@@ -167,6 +186,21 @@ def infiniband_bandwidth_test(server_ip_dict: modal.Dict):
                 flush=True,
             )
             process.wait()
+
+    # Read final port counters and print the delta
+    final_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/*/counters/*",
+        {
+            "port_xmit_data": 0,
+            "port_rcv_data": 0,
+        },
+        multiplier=4,
+    )
+    delta = {k: final_counters[k] - initial_counters[k] for k in initial_counters}
+    print(
+        f"[rank {container_rank}] Counter delta: {json.dumps(delta)} bytes",
+        flush=True,
+    )
 
 
 # Run ib_write_bw command for server
