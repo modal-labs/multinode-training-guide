@@ -23,13 +23,8 @@ class _Miles(_FullParamMiles):
     lora_dropout = 0.0
 
     actor_num_nodes = 16
-    tensor_model_parallel_size = 8
-    sequence_parallel = True
-    pipeline_model_parallel_size = 2
     context_parallel_size = 8
     expert_model_parallel_size = 64
-    expert_tensor_parallel_size = 1
-    decoder_last_pipeline_num_layers = 30
 
     target_modules = "q_a_proj,kv_a_proj_with_mqa,o_proj,gate_proj,up_proj,down_proj"
     experts_shared_outer_loras = True

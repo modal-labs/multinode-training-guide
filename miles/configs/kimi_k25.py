@@ -83,7 +83,7 @@ class _Miles(MilesConfig):
     balance_data = True
     rm_type = "deepscaler"
 
-    num_rollout = 5
+    num_rollout = 10
     rollout_batch_size = 32
     n_samples_per_prompt = 8
     rollout_max_response_len = 16384
@@ -141,6 +141,8 @@ class _Miles(MilesConfig):
     sglang_mem_fraction_static = 0.7
     sglang_ep_size = 8
     sglang_server_concurrency = 1024
+    use_tis = True
+    # use_rollout_routing_replay = True
 
     use_wandb = True
     wandb_project = "miles-kimi-k25"

@@ -367,7 +367,7 @@ index 082d1fb0a..13c8dc27b 100644
      def _process_weight(self, name: str, loaded_weight: torch.Tensor):
          from sglang.srt.lora.utils import get_normalized_target_modules
 diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
-index 58d00551a..cd2a4fac1 100644
+index 58d00551a..d24342ee1 100644
 --- a/python/sglang/srt/lora/lora_manager.py
 +++ b/python/sglang/srt/lora/lora_manager.py
 @@ -630,7 +630,11 @@ class LoRAManager:
@@ -426,7 +426,7 @@ index 58d00551a..cd2a4fac1 100644
  
              self.lora_refs[lora_ref.lora_id] = lora_ref
              self.num_pinned_loras += int(lora_ref.pinned)
-@@ -683,6 +692,40 @@ class LoRAManager:
+@@ -683,6 +692,53 @@ class LoRAManager:
  
          return self.create_lora_update_result(success=True)
  
@@ -457,6 +457,19 @@ index 58d00551a..cd2a4fac1 100644
 +            existing.update_weights_from_tensors(
 +                tensors, reset=reset, finalize=finalize
 +            )
++            if finalize:
++                refreshed = self.memory_pool.refresh_lora_weight_in_buffer(
++                    lora_ref.lora_id,
++                    existing,
++                    self.lora_modules,
++                    self.embed_tokens_module,
++                    self.lm_head_module,
++                )
++                if refreshed:
++                    logger.info(
++                        "LoRA adapter '%s': refreshed resident memory-pool buffer after tensor update.",
++                        lora_ref.lora_id,
++                    )
 +        except Exception as e:
 +            return self.create_lora_update_result(
 +                success=False,
@@ -534,10 +547,16 @@ index 983064154..94475b871 100644
  
  def _compute_lora_alignment(
 diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
-index 34444edfc..0c520c375 100644
+index 34444edfc..888922469 100644
 --- a/python/sglang/srt/lora/mem_pool.py
 +++ b/python/sglang/srt/lora/mem_pool.py
-@@ -157,6 +157,66 @@ class LoRAMemoryPool:
+@@ -1,5 +1,4 @@
+ import logging
+-import re
+ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+ 
+ import torch
+@@ -157,6 +156,66 @@ class LoRAMemoryPool:
              or 1
          )
  
@@ -604,7 +623,7 @@ index 34444edfc..0c520c375 100644
      def _get_standard_shape(
          self,
          module_name: str,
-@@ -169,8 +229,9 @@ class LoRAMemoryPool:
+@@ -169,8 +228,9 @@ class LoRAMemoryPool:
              module_name, self.base_hf_config, base_model, layer_idx
          )
          c = get_stacked_multiply(module_name)
@@ -616,7 +635,7 @@ index 34444edfc..0c520c375 100644
          return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
  
      def get_lora_A_shape(
-@@ -191,12 +252,13 @@ class LoRAMemoryPool:
+@@ -191,12 +251,13 @@ class LoRAMemoryPool:
              module_name, self.base_hf_config, base_model, layer_idx
          )
          c = get_stacked_multiply(module_name)
@@ -632,7 +651,7 @@ index 34444edfc..0c520c375 100644
  
          if self.is_moe_module(module_name):
              num_experts = self._get_num_experts(base_model)
-@@ -247,12 +309,19 @@ class LoRAMemoryPool:
+@@ -247,12 +308,19 @@ class LoRAMemoryPool:
          _, output_dim = get_hidden_dim(
              module_name, self.base_hf_config, base_model, layer_idx
          )
@@ -654,7 +673,41 @@ index 34444edfc..0c520c375 100644
  
          # Check if MoE module and return appropriate shape
          if self.is_moe_module(module_name):
-@@ -590,16 +659,21 @@ class LoRAMemoryPool:
+@@ -499,6 +567,33 @@ class LoRAMemoryPool:
+                 self.uid_to_buffer_id[uid] = buffer_id
+                 self.buffer_id_to_uid[buffer_id] = uid
+ 
++    def refresh_lora_weight_in_buffer(
++        self,
++        uid: str,
++        lora_adapter: LoRAAdapter,
++        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
++        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
++        lora_lm_head_module: Optional[BaseLayerWithLoRA],
++    ) -> bool:
++        """Rewrite a resident adapter's GPU buffer after its CPU weights changed.
++
++        Dynamic tensor updates mutate ``LoRAAdapter.layers[*].weights`` in CPU
++        memory. If the adapter is already loaded in the memory pool, future
++        batches keep using the existing GPU slot unless we explicitly refresh it.
++        """
++        if uid not in self.uid_to_buffer_id:
++            return False
++
++        self.load_lora_weight_to_buffer(
++            uid,
++            self.uid_to_buffer_id[uid],
++            lora_adapter,
++            lora_modules,
++            lora_embed_tokens_module,
++            lora_lm_head_module,
++        )
++        return True
++
+     def load_lora_weight_to_buffer(
+         self,
+         uid: str,
+@@ -590,16 +685,21 @@ class LoRAMemoryPool:
                  expert_match = re.search(r"experts\.(\d+)\.", name)
  
                  if expert_match:
@@ -957,7 +1010,7 @@ index 9ff683a7e..cfa7e1965 100644
                  "Start unload Lora adapter. Lora name=%s",
                  obj.lora_name,
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index fb56de158..a027d7932 100644
+index fb56de158..3a7260ee4 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
 @@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
@@ -968,7 +1021,7 @@ index fb56de158..a027d7932 100644
      PostProcessWeightsReqInput,
      SendWeightsToRemoteInstanceReqInput,
      UnloadLoRAAdapterReqInput,
-@@ -158,12 +159,20 @@ class BaseTpWorker(ABC):
+@@ -158,12 +159,22 @@ class BaseTpWorker(ABC):
      def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
  
          monkey_patch_torch_reductions()
@@ -982,6 +1035,8 @@ index fb56de158..a027d7932 100644
 +            named_tensors=named_tensors,
              load_format=recv_req.load_format,
          )
++        if recv_req.load_format == "flattened_bucket" and torch.cuda.is_available():
++            torch.cuda.synchronize()
 +        # Drop local refs to imported IPC tensors, run gc so PyTorch's IPC table
 +        # entries become collectable, then ipc_collect to signal source release
 +        # via the shmem refcount file.
@@ -992,7 +1047,7 @@ index fb56de158..a027d7932 100644
          return success, message
  
      def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-@@ -195,6 +204,8 @@ class BaseTpWorker(ABC):
+@@ -195,6 +206,8 @@ class BaseTpWorker(ABC):
      ):
          # The LoRA code handles TP sharding internally using slice_lora_a_weights
          # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
@@ -1001,12 +1056,14 @@ index fb56de158..a027d7932 100644
          if recv_req.load_format == "flattened_bucket":
              flattened_data = MultiprocessingSerializer.deserialize(
                  recv_req.serialized_tensors
-@@ -211,7 +222,41 @@ class BaseTpWorker(ABC):
+@@ -211,7 +224,45 @@ class BaseTpWorker(ABC):
              tensors,
              recv_req.config_dict,
              recv_req.added_tokens_config,
 +            finalize=recv_req.finalize,
 +        )
++        if recv_req.load_format == "flattened_bucket" and torch.cuda.is_available():
++            torch.cuda.synchronize()
 +        # Drop importer refs + collect IPC table so source can free its export.
 +        del tensors, bucket, flattened_data
 +        import gc
@@ -1036,6 +1093,8 @@ index fb56de158..a027d7932 100644
 +            reset=recv_req.reset,
 +            finalize=recv_req.finalize,
          )
++        if recv_req.load_format == "flattened_bucket" and torch.cuda.is_available():
++            torch.cuda.synchronize()
 +        del tensors, bucket, flattened_data
 +        import gc
 +        gc.collect()
@@ -1044,10 +1103,10 @@ index fb56de158..a027d7932 100644
  
      def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 7a68e69c4..31e9c4b16 100644
+index 7a68e69c4..9c9c53c0b 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1890,15 +1890,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -1890,15 +1890,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          return result
  
      def load_lora_adapter_from_tensors(
@@ -1083,8 +1142,11 @@ index 7a68e69c4..31e9c4b16 100644
 +        reset: bool = False,
 +        finalize: bool = True,
 +    ):
-+        logger.info(
-+            f"LoRA adapter in-place update from tensors: {lora_ref}, reset={reset}, finalize={finalize}."
++        logger.debug(
++            "LoRA adapter in-place update from tensors: %s, reset=%s, finalize=%s.",
++            lora_ref,
++            reset,
++            finalize,
 +        )
 +        return self.lora_manager.update_lora_adapter_from_tensors(
 +            lora_ref, tensors, reset=reset, finalize=finalize
@@ -1093,7 +1155,7 @@ index 7a68e69c4..31e9c4b16 100644
      def unload_lora_adapter(self, lora_ref: LoRARef):
          """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
  
-@@ -3147,8 +3174,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3147,8 +3177,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              if hasattr(self.model, "post_load_weights"):
                  self.model.post_load_weights()
  
@@ -1109,7 +1171,7 @@ index 7a68e69c4..31e9c4b16 100644
                  quant_method = getattr(module, "quant_method", None)
  
                  # Check if the module supports restoring weights
-@@ -3162,6 +3196,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3162,6 +3199,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          if recv_req.post_process_quantization:
              # Iterate through all modules to apply specific post-loading processing
              for _, module in self.model.named_modules():
