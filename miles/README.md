@@ -79,7 +79,7 @@ modal run -d miles/modal_train.py::train
 For this config:
 
 - `download_model` downloads `source_hf_checkpoint` and applies the Kimi source patch.
-- `post_process_model` creates `/checkpoints/Kimi-K2.5-int4` for training and `/checkpoints/Kimi-K2.5-bf16` for the reference load.
+- `post_process_model` creates `/checkpoints/Kimi-K2.5-int4` for rollout and `/checkpoints/Kimi-K2.5-bf16` for training(`--ref_load`).
 - `download_data` downloads the training dataset to `/data`.
 - `train` launches the bridge-mode training job directly.
 
