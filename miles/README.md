@@ -62,13 +62,13 @@ modal run -d miles/modal_train.py::train
 
 Use `-d` to keep the Modal job running after the terminal disconnects.
 
-## Run Kimi-K2.5
+## Run Kimi-K2.5-LoRA
 
 `kimi_k25` uses bridge mode, so do not run
 `convert_hf_to_megatron_checkpoint`.
 
 ```bash
-export EXPERIMENT_CONFIG=kimi_k25
+export EXPERIMENT_CONFIG=kimi_k25_lora
 
 modal run -d miles/modal_train.py::download_model
 modal run -d miles/modal_train.py::post_process_model
