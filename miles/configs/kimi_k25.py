@@ -1,19 +1,7 @@
-"""Kimi-K2.5 — 8 H200 nodes (8 GPUs each), colocated. NOT real full-param:
-trains only the last 4 layers via ``only_train_params_name_list``.
+"""Kimi-K2.5 — 32 H200 nodes (8 GPUs each), colocated.
 
 Run:
     EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
-
-To train the actual full-param Kimi-K2.5, you need **at least 32 nodes (256
-H200s)** for the parallelism to close. Reference recipe (script + parallelism
-config):
-    https://gist.github.com/GeLee-Q/aa8a5336fa48c5934172aaa6e25ef5e7
-
-To convert this config to real full-param:
-  1. Remove / set ``only_train_params_name_list = None`` so all layers train.
-  2. Bump ``actor_num_nodes`` to 32 and re-size the parallelism accordingly
-     (``tensor_model_parallel_size``, ``pipeline_model_parallel_size``,
-     ``context_parallel_size``, ``expert_model_parallel_size``) — see gist.
 
 Knobs to tune (train/rollout throughput):
   - ``max_tokens_per_gpu`` (+ ``log_probs_max_tokens_per_gpu``)
@@ -67,14 +55,7 @@ class _Miles(MilesConfig):
     megatron_to_hf_mode = "bridge"
     model_name = "kimi_k25"
 
-    only_train_params_name_list = [
-        "layers\\.57\\.",
-        "layers\\.58\\.",
-        "layers\\.59\\.",
-        "layers\\.60\\.",
-    ]
-
-    actor_num_nodes = 8
+    actor_num_nodes = 32
     actor_num_gpus_per_node = 8
     colocate = True
     use_miles_router = True
@@ -89,7 +70,7 @@ class _Miles(MilesConfig):
     balance_data = True
     rm_type = "deepscaler"
 
-    num_rollout = 10
+    num_rollout = 20
     rollout_batch_size = 32
     n_samples_per_prompt = 8
     rollout_max_response_len = 16384
@@ -123,11 +104,11 @@ class _Miles(MilesConfig):
     train_backend = "megatron"
     tensor_model_parallel_size = 8
     sequence_parallel = True
-    pipeline_model_parallel_size = 2
+    pipeline_model_parallel_size = 8
     context_parallel_size = 4
     expert_model_parallel_size = 32
     expert_tensor_parallel_size = 1
-    decoder_last_pipeline_num_layers = 30
+    decoder_last_pipeline_num_layers = 5
 
     recompute_granularity = "full"
     recompute_method = "uniform"
@@ -147,7 +128,7 @@ class _Miles(MilesConfig):
     sglang_mem_fraction_static = 0.7
     sglang_ep_size = 8
     sglang_server_concurrency = 1024
-    # use_rollout_routing_replay = True
+    use_rollout_routing_replay = True
 
     use_wandb = True
     wandb_project = "miles-kimi-k25"

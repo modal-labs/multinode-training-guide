@@ -330,98 +330,6 @@ index 000000000..eafb33bcf
 +
 +    raise ValueError(f"Unknown parameter name: {name}")
 \ No newline at end of file
-diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
-index a9be3696d..95499da60 100644
---- a/miles/backends/megatron_utils/model.py
-+++ b/miles/backends/megatron_utils/model.py
-@@ -38,7 +38,11 @@ from .ci_utils import (
- )
- from .initialize import is_megatron_main_rank
- from .lora_utils import is_lora_enabled, is_lora_model
--from .model_provider import get_model_provider_func
-+from .model_provider import (
-+    freeze_model_params,
-+    get_model_provider_func,
-+    wrap_model_provider_with_freeze,
-+)
- from .parallel import get_packed_seq_params
- 
- logger = logging.getLogger(__name__)
-@@ -122,8 +126,12 @@ def setup_model_and_optimizer(
- 
-     if is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
-         model = _setup_lora_model_via_bridge(args)
-+        freeze_model_params(model, args)
-     else:
--        model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
-+        model = get_model(
-+            wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
-+            ModelType.encoder_or_decoder,
-+        )
- 
-     # Optimizer
-     kwargs = {}
-diff --git a/miles/backends/megatron_utils/model_provider.py b/miles/backends/megatron_utils/model_provider.py
-index 45adc8679..6aee93fc0 100644
---- a/miles/backends/megatron_utils/model_provider.py
-+++ b/miles/backends/megatron_utils/model_provider.py
-@@ -2,6 +2,7 @@
- import argparse
- import inspect
- import logging
-+import re
- from contextlib import nullcontext
- from typing import Literal
- 
-@@ -248,3 +249,48 @@ def get_model_provider_func(
-         return model
- 
-     return model_provider
-+
-+
-+def wrap_model_provider_with_freeze(original_provider, args: argparse.Namespace):
-+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
-+        sig = inspect.signature(original_provider)
-+        call_kwargs: dict = {"pre_process": pre_process, "post_process": post_process}
-+        for key, val in (
-+            ("vp_stage", vp_stage),
-+            ("config", config),
-+            ("pg_collection", pg_collection),
-+        ):
-+            if key in sig.parameters:
-+                call_kwargs[key] = val
-+        model = original_provider(**call_kwargs)
-+
-+        freeze_model_params(model, args)
-+
-+        return model
-+
-+    return wrapped_provider
-+
-+
-+def freeze_model_params(model, args: argparse.Namespace) -> None:
-+    """Set requires_grad from --only-train-params-name-list / --freeze-params-name-list."""
-+    if not getattr(args, "only_train_params_name_list", None) and not getattr(args, "freeze_params_name_list", None):
-+        return
-+
-+    modules = model if isinstance(model, (list, tuple)) else [model]
-+
-+    if args.only_train_params_name_list:
-+        for mod in modules:
-+            for name, param in mod.named_parameters():
-+                param.requires_grad = False
-+                for pattern in args.only_train_params_name_list:
-+                    if re.search(pattern, name):
-+                        param.requires_grad = True
-+                        break
-+
-+    if args.freeze_params_name_list:
-+        for mod in modules:
-+            for name, param in mod.named_parameters():
-+                for pattern in args.freeze_params_name_list:
-+                    if re.search(pattern, name):
-+                        param.requires_grad = False
-+                        break
 diff --git a/miles/backends/megatron_utils/sglang.py b/miles/backends/megatron_utils/sglang.py
 index 73e525975..8f74b60a1 100644
 --- a/miles/backends/megatron_utils/sglang.py
@@ -1076,38 +984,10 @@ index 551021f53..0cea504fc 100644
              k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
          } or None
 diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
-index ab9ef5b23..75d949a80 100644
+index ab9ef5b23..4b003b6fc 100644
 --- a/miles/utils/arguments.py
 +++ b/miles/utils/arguments.py
-@@ -211,6 +211,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
-             parser.add_argument(
-                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
-             )
-+            parser.add_argument(
-+                "--only-train-params-name-list",
-+                type=str,
-+                nargs="*",
-+                default=None,
-+                help=(
-+                    "Regex patterns (re.search on full param names) to train; all others are frozen. "
-+                    "Mutually exclusive with --freeze-params-name-list."
-+                ),
-+            )
-+            parser.add_argument(
-+                "--freeze-params-name-list",
-+                type=str,
-+                nargs="*",
-+                default=None,
-+                help=(
-+                    "Regex patterns (re.search) of parameter names to freeze; others stay trainable. "
-+                    "Mutually exclusive with --only-train-params-name-list. "
-+                    "Example: --freeze-params-name-list embedding output_layer"
-+                ),
-+            )
-             parser.add_argument(
-                 "--allgather-cp",
-                 action="store_true",
-@@ -1092,6 +1113,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+@@ -1092,6 +1092,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                  default=False,
                  help="Sync LoRA weights via tensor instead of file (more efficient)",
              )
@@ -1122,7 +1002,7 @@ index ab9ef5b23..75d949a80 100644
              return parser
  
          def add_router_arguments(parser):
-@@ -1718,7 +1747,7 @@ def parse_args(add_custom_arguments=None):
+@@ -1718,7 +1726,7 @@ def parse_args(add_custom_arguments=None):
          from miles.backends.megatron_utils.arguments import validate_args as megatron_validate_args
  
          args = megatron_parse_args(extra_args_provider=add_miles_arguments)
@@ -1131,19 +1011,7 @@ index ab9ef5b23..75d949a80 100644
              hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
              hf_validate_args(args, hf_config)
  
-@@ -1822,6 +1851,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
- def miles_validate_args(args):
-     args.eval_datasets = _resolve_eval_datasets(args)
- 
-+    if getattr(args, "only_train_params_name_list", None) and getattr(args, "freeze_params_name_list", None):
-+        raise ValueError(
-+            "Use only one of --only-train-params-name-list or --freeze-params-name-list, not both."
-+        )
-+
-     # Normalize --tito-allowed-append-roles: lowercase + deduplicate.
-     raw_roles = getattr(args, "tito_allowed_append_roles", ["tool"])
-     args.tito_allowed_append_roles = sorted(set(r.lower() for r in raw_roles))
-@@ -1907,6 +1941,14 @@ def miles_validate_args(args):
+@@ -1907,6 +1915,14 @@ def miles_validate_args(args):
  
          args.target_modules = modules
  

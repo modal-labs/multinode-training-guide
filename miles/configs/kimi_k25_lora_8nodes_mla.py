@@ -13,8 +13,6 @@ from configs.kimi_k25 import _Miles as _FullParamMiles, modal  # noqa: F401
 
 
 class _Miles(_FullParamMiles):
-    only_train_params_name_list = None
-    
     lora_rank = 32
     lora_alpha = 32
     lora_dropout = 0.0
