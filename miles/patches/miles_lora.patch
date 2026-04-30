@@ -1,0 +1,1206 @@
+diff --git a/miles/backends/megatron_utils/bridge_lora_helpers.py b/miles/backends/megatron_utils/bridge_lora_helpers.py
+index 1aa4293e1..45d7103a3 100644
+--- a/miles/backends/megatron_utils/bridge_lora_helpers.py
++++ b/miles/backends/megatron_utils/bridge_lora_helpers.py
+@@ -93,9 +93,14 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
+     provider.sequence_parallel = args.sequence_parallel
+     provider.virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
+     provider.context_parallel_size = args.context_parallel_size
++    provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+     provider.variable_seq_lengths = True
+     provider.moe_token_dispatcher_type = "alltoall"
+     provider.moe_router_load_balancing_type = "none"
++    if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
++        provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
++    if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
++        provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+     provider.finalize()
+ 
+     lora = create_lora_instance(args)
+diff --git a/miles/backends/megatron_utils/lora_utils.py b/miles/backends/megatron_utils/lora_utils.py
+index 2c48c08fd..823f3f8ad 100644
+--- a/miles/backends/megatron_utils/lora_utils.py
++++ b/miles/backends/megatron_utils/lora_utils.py
+@@ -73,6 +73,19 @@ _MEGATRON_TO_HF_MODULES = {
+ 
+ _HF_MODULE_NAMES = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+ 
++# DeepSeek / Kimi MLA (HF names on checkpoint; Megatron uses linear_* from Megatron-Bridge mappings).
++_MLA_HF_TO_MEGATRON = {
++    "q_a_proj": "linear_q_down_proj",
++    "kv_a_proj_with_mqa": "linear_kv_down_proj",
++    "q_b_proj": "linear_q_up_proj",
++    "kv_b_proj": "linear_kv_up_proj",
++}
++_MEGATRON_MLA_TO_HF = {v: k for k, v in _MLA_HF_TO_MEGATRON.items()}
++
++# SGLang default get_hidden_dim (lora/utils.py) handles fused_qkv_a_proj_with_mqa via q_a / kv_a mapping,
++# but not separate q_b_proj / kv_b_proj yet — omit from rollout adapter config to avoid init crashes.
++_SGLANG_UNSUPPORTED_HF_TARGETS = frozenset({"q_b_proj", "kv_b_proj"})
++
+ 
+ # ---------------------------------------------------------------------------
+ # Core helpers
+@@ -182,14 +195,20 @@ def convert_target_modules_to_megatron(
+         if hf_modules[0] in ("all", "all-linear", "all_linear"):
+             return list(all_modules)
+ 
+-    # Check if already in Megatron format
+-    if all(m not in _HF_MODULE_NAMES for m in hf_modules if "*" not in m):
+-        return hf_modules
++    if isinstance(hf_modules, tuple):
++        hf_modules = list(hf_modules)
++
++    # Check if already in Megatron format (standard / canonical / Kimi MLA linear_*).
++    if all(m not in _HF_MODULE_NAMES and m not in _MLA_HF_TO_MEGATRON for m in hf_modules if "*" not in m):
++        return list(hf_modules)
+ 
+     # Convert HF names to Megatron names (dedup while preserving order)
+     megatron_modules: list[str] = []
+     for module in hf_modules:
+-        megatron_name = hf_to_megatron.get(module, module)
++        if module in _MLA_HF_TO_MEGATRON:
++            megatron_name = _MLA_HF_TO_MEGATRON[module]
++        else:
++            megatron_name = hf_to_megatron.get(module, module)
+         if megatron_name not in megatron_modules:
+             megatron_modules.append(megatron_name)
+ 
+@@ -205,14 +224,60 @@ def convert_target_modules_to_hf(megatron_modules: list[str]) -> list[str]:
+     Megatron canonical:  linear_q, linear_k, linear_v, linear_proj,
+                          linear_fc1_up, linear_fc1_gate, linear_fc2
+     HF:                  q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
++    Kimi MLA Megatron:   linear_q_down_proj -> q_a_proj, linear_kv_down_proj -> kv_a_proj_with_mqa, ...
++
++    Wildcard patterns (e.g. ``*.layers.2.mlp.experts.linear_fc1``) have their
++    last dotted segment extracted and mapped to HF leaf names; the layer-
++    scoping information is dropped. Rationale: SGLang consumes this list to
++    decide which adapter-buffer TYPES to allocate (``gate_proj``/``up_proj``
++    /``down_proj``/...). It does not scope by layer — per-layer LoRA
++    enablement is enforced on the training side by Megatron-Bridge's
++    :class:`ModuleMatcher`. If we passed wildcards through verbatim, SGLang
++    would fail to allocate MoE LoRA buffers when the config only has
++    wildcards (no plain HF names) for MoE modules.
+     """
++    if isinstance(megatron_modules, tuple):
++        megatron_modules = list(megatron_modules)
+     hf_modules: list[str] = []
+     for module in megatron_modules:
+-        if module in _MEGATRON_TO_HF_MODULES:
+-            hf_modules.extend(_MEGATRON_TO_HF_MODULES[module])
++        # Wildcards: extract the last path segment so lookups hit the map
++        # tables. Non-wildcards go through as-is.
++        lookup_key = module.rsplit(".", 1)[-1] if "*" in module else module
++        if lookup_key in _MEGATRON_MLA_TO_HF:
++            hf_modules.append(_MEGATRON_MLA_TO_HF[lookup_key])
++        elif lookup_key in _MEGATRON_TO_HF_MODULES:
++            hf_modules.extend(_MEGATRON_TO_HF_MODULES[lookup_key])
+         else:
++            # Unknown wildcard tail or already-HF name — pass through as-is.
+             hf_modules.append(module)
+-    return hf_modules
++    # Dedup preserving order.
++    seen: set[str] = set()
++    unique: list[str] = []
++    for m in hf_modules:
++        if m not in seen:
++            seen.add(m)
++            unique.append(m)
++    return unique
++
++
++def target_modules_hf_for_sglang_rollout(args: Namespace) -> list[str]:
++    """HF-style target_modules for SGLang LoRA init / sync (after Megatron→HF name map).
++
++    Drops MLA tensors that SGLang's default ``get_hidden_dim`` does not implement yet, so colocated
++    engines can build LoRAMemoryPool without NotImplementedError. Keep Megatron ``target_modules``
++    aligned with this list if you rely on online adapter sync.
++    """
++    raw = list(args.target_modules) if args.target_modules else []
++    hf = convert_target_modules_to_hf(raw)
++    out = [m for m in hf if m not in _SGLANG_UNSUPPORTED_HF_TARGETS]
++    dropped = set(hf) - set(out)
++    if dropped:
++        logger.warning(
++            "target_modules_hf_for_sglang_rollout: omitting %s for SGLang (unsupported by default "
++            "get_hidden_dim); Megatron should not train LoRA on these if rollout sync is required.",
++            sorted(dropped),
++        )
++    return out
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -252,7 +317,7 @@ def create_lora_instance(args: Namespace):
+     target_modules = convert_target_modules_to_megatron(args.target_modules, lora_type=lora_cls)
+     exclude_modules = parse_exclude_modules(args, lora_type=lora_cls)
+ 
+-    lora = lora_cls(
++    lora_kwargs = dict(
+         target_modules=target_modules,
+         exclude_modules=exclude_modules,
+         dim=args.lora_rank,
+@@ -261,6 +326,12 @@ def create_lora_instance(args: Namespace):
+         lora_A_init_method=getattr(args, "lora_A_init_method", "xavier"),
+         lora_B_init_method=getattr(args, "lora_B_init_method", "zero"),
+     )
++    # Opt-in to SGLang PR #21466's shared-outer grouped-expert LoRA. Only the
++    # standard ``LoRA`` class supports the flag today.
++    if lora_cls is LoRA and getattr(args, "experts_shared_outer_loras", False):
++        lora_kwargs["experts_shared_outer_loras"] = True
++
++    lora = lora_cls(**lora_kwargs)
+ 
+     logger.info(
+         f"Created {lora_cls.__name__}: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+@@ -491,7 +562,7 @@ def _load_training_state(
+ def build_lora_sync_config(args: Namespace) -> dict[str, Any]:
+     """Build LoRA config dict for syncing weights to SGLang engines."""
+     target_modules_hf = (
+-        convert_target_modules_to_hf(list(args.target_modules))
++        target_modules_hf_for_sglang_rollout(args)
+         if args.target_modules
+         else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+     )
+diff --git a/miles/backends/megatron_utils/megatron_to_hf/__init__.py b/miles/backends/megatron_utils/megatron_to_hf/__init__.py
+index 888ade1f9..ac780826b 100644
+--- a/miles/backends/megatron_utils/megatron_to_hf/__init__.py
++++ b/miles/backends/megatron_utils/megatron_to_hf/__init__.py
+@@ -1,6 +1,7 @@
+ from .deepseekv3 import convert_deepseekv3_to_hf
+ from .glm4 import convert_glm4_to_hf
+ from .glm4moe import convert_glm4moe_to_hf
++from .kimi_vl import convert_kimi_k25_to_hf, convert_kimivl_to_hf
+ from .llama import convert_llama_to_hf
+ from .mimo import convert_mimo_to_hf
+ from .processors import quantize_params, remove_padding
+@@ -50,6 +51,10 @@ def _convert_to_hf_core(args, model_name, name, param):
+         converted_named_tensors = convert_llama_to_hf(args, name, param)
+     elif "mimo" in model_name:
+         converted_named_tensors = convert_mimo_to_hf(args, name, param)
++    elif "kimivl" in model_name:
++        converted_named_tensors = convert_kimivl_to_hf(args, name, param)
++    elif "kimi_k25" in model_name:
++        converted_named_tensors = convert_kimi_k25_to_hf(args, name, param)
+     else:
+         raise ValueError(f"Unsupported model: {model_name}")
+ 
+diff --git a/miles/backends/megatron_utils/megatron_to_hf/kimi_vl.py b/miles/backends/megatron_utils/megatron_to_hf/kimi_vl.py
+new file mode 100644
+index 000000000..eafb33bcf
+--- /dev/null
++++ b/miles/backends/megatron_utils/megatron_to_hf/kimi_vl.py
+@@ -0,0 +1,139 @@
++import re
++
++import torch
++
++
++def convert_kimivl_to_hf(args, name, param):
++    if name.startswith("module.module.vision_model."):
++        hf_name = "vision_tower." + name[len("module.module.vision_model.") :]
++        return [(hf_name, param)]
++
++    if name.startswith("module.module.multi_modal_projector."):
++        hf_name = "multi_modal_projector." + name[len("module.module.multi_modal_projector.") :]
++        return [(hf_name, param)]
++
++    return convert_language_model_to_hf(args, name, param)
++
++
++def convert_kimi_k25_to_hf(args, name, param):
++    if name.startswith("module.module.vision_tower."):
++        hf_name = "vision_tower." + name[len("module.module.vision_tower.") :]
++        return [(hf_name, param)]
++
++    if name.startswith("module.module.mm_projector."):
++        hf_name = "mm_projector." + name[len("module.module.mm_projector.") :]
++        return [(hf_name, param)]
++
++    return convert_language_model_to_hf(args, name, param)
++
++
++def convert_language_model_to_hf(args, name, param):
++    if name == "module.module.language_model.embedding.word_embeddings.weight":
++        return [("language_model.model.embed_tokens.weight", param)]
++    if name == "module.module.language_model.output_layer.weight":
++        return [("language_model.lm_head.weight", param)]
++    if name == "module.module.language_model.decoder.final_layernorm.weight":
++        return [("language_model.model.norm.weight", param)]
++
++    try:
++        head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
++    except AttributeError:
++        head_dim = args.hidden_size // args.num_attention_heads
++    value_num_per_group = args.num_attention_heads // args.num_query_groups
++
++    decoder_layers_pattern = r"module\.module\.(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
++    match = re.match(decoder_layers_pattern, name)
++    if match:
++        layer_idx, rest = match.groups()
++
++        # experts
++        expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
++        match = re.match(expert_pattern, rest)
++        if match:
++            rest, expert_idx = match.groups()
++            if rest == "linear_fc1":
++                gate_weight, up_weight = param.chunk(2, dim=0)
++                outputs = [
++                    (
++                        f"language_model.model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight",
++                        gate_weight,
++                    ),
++                    (f"language_model.model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight", up_weight),
++                ]
++                return outputs
++            elif rest == "linear_fc2":
++                outputs = [
++                    (f"language_model.model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight", param),
++                ]
++                return outputs
++            else:
++                raise ValueError(f"Unknown expert parameter name: {name}")
++
++        # shared expert
++        shared_expert_pattern = r"mlp.shared_experts\.(.+)"
++        match = re.match(shared_expert_pattern, rest)
++        if match:
++            # rest = match.groups()[0]
++            rest = match.group(1)
++            if rest == "linear_fc1.weight":
++                gate_weight, up_weight = param.chunk(2, dim=0)
++                return [
++                    (f"language_model.model.layers.{layer_idx}.mlp.shared_experts.gate_proj.weight", gate_weight),
++                    (f"language_model.model.layers.{layer_idx}.mlp.shared_experts.up_proj.weight", up_weight),
++                ]
++            elif rest == "linear_fc2.weight":
++                return [(f"language_model.model.layers.{layer_idx}.mlp.shared_experts.down_proj.weight", param)]
++            else:
++                raise ValueError(f"Unknown shared expert parameter name: {name}")
++
++        if rest == "self_attention.linear_proj.weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.o_proj.weight", param)]
++        elif rest == "self_attention.linear_q_proj.weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.q_proj.weight", param)]
++        elif rest == "self_attention.linear_q_down_proj.weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.q_a_proj.weight", param)]
++        elif rest == "self_attention.linear_q_up_proj.layer_norm_weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.q_a_layernorm.weight", param)]
++        elif rest == "self_attention.linear_q_up_proj.weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.q_b_proj.weight", param)]
++        elif rest == "self_attention.linear_qkv.bias":
++            param = param.view(args.num_query_groups, -1)
++            q_bias, k_bias, v_bias = torch.split(
++                param,
++                split_size_or_sections=[value_num_per_group * head_dim, head_dim, head_dim],
++                dim=1,
++            )
++            q_bias = q_bias.contiguous().flatten()
++            k_bias = k_bias.contiguous().flatten()
++            v_bias = v_bias.contiguous().flatten()
++            return [
++                (f"language_model.model.layers.{layer_idx}.self_attn.q_proj.bias", q_bias),
++                (f"language_model.model.layers.{layer_idx}.self_attn.k_proj.bias", k_bias),
++                (f"language_model.model.layers.{layer_idx}.self_attn.v_proj.bias", v_bias),
++            ]
++        elif rest == "mlp.linear_fc1.weight":
++            gate_weight, up_weight = param.chunk(2, dim=0)
++            return [
++                (f"language_model.model.layers.{layer_idx}.mlp.gate_proj.weight", gate_weight),
++                (f"language_model.model.layers.{layer_idx}.mlp.up_proj.weight", up_weight),
++            ]
++        elif rest == "mlp.linear_fc2.weight":
++            return [(f"language_model.model.layers.{layer_idx}.mlp.down_proj.weight", param)]
++        elif rest == "self_attention.linear_qkv.layer_norm_weight" or rest == "input_layernorm.weight":
++            return [(f"language_model.model.layers.{layer_idx}.input_layernorm.weight", param)]
++        elif rest == "mlp.linear_fc1.layer_norm_weight":
++            return [(f"language_model.model.layers.{layer_idx}.post_attention_layernorm.weight", param)]
++        elif rest == "self_attention.linear_kv_down_proj.weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa.weight", param)]
++        elif rest == "self_attention.linear_kv_up_proj.layer_norm_weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight", param)]
++        elif rest == "self_attention.linear_kv_up_proj.weight":
++            return [(f"language_model.model.layers.{layer_idx}.self_attn.kv_b_proj.weight", param)]
++        elif rest == "pre_mlp_layernorm.weight":
++            return [(f"language_model.model.layers.{layer_idx}.post_attention_layernorm.weight", param)]
++        elif rest == "mlp.router.weight":
++            return [(f"language_model.model.layers.{layer_idx}.mlp.gate.weight", param)]
++        elif rest == "mlp.router.expert_bias":
++            return [(f"language_model.model.layers.{layer_idx}.mlp.gate.e_score_correction_bias", param)]
++
++    raise ValueError(f"Unknown parameter name: {name}")
+\ No newline at end of file
+diff --git a/miles/backends/megatron_utils/sglang.py b/miles/backends/megatron_utils/sglang.py
+index 73e525975..8f74b60a1 100644
+--- a/miles/backends/megatron_utils/sglang.py
++++ b/miles/backends/megatron_utils/sglang.py
+@@ -21,9 +21,15 @@ except ImportError:
+ from sglang.srt.utils import MultiprocessingSerializer
+ 
+ try:
+-    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
++    from sglang.srt.weight_sync.tensor_bucket import (  # type: ignore[import]
++        FlattenedTensorBucket,
++        FlattenedTensorMetadata,
++    )
+ except ImportError:
+-    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
++    from sglang.srt.model_executor.model_runner import (  # type: ignore[import]
++        FlattenedTensorBucket,
++        FlattenedTensorMetadata,
++    )
+ 
+ __all__ = [
+     "mxfp8_group_quantize",
+@@ -33,4 +39,5 @@ __all__ = [
+     "monkey_patch_torch_reductions",
+     "MultiprocessingSerializer",
+     "FlattenedTensorBucket",
++    "FlattenedTensorMetadata",
+ ]
+diff --git a/miles/backends/megatron_utils/update_weight/common.py b/miles/backends/megatron_utils/update_weight/common.py
+index c61f26487..ffa91e6de 100644
+--- a/miles/backends/megatron_utils/update_weight/common.py
++++ b/miles/backends/megatron_utils/update_weight/common.py
+@@ -201,7 +201,7 @@ def _named_params_and_buffers_global(
+             if not name.startswith("module.module."):
+                 name = "module." + name
+ 
+-            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
++            decoder_layers_pattern = r"module\.module\.(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
+             match = re.match(decoder_layers_pattern, name)
+             if not match:
+                 # MTP (Multi-Token Prediction) layers for speculative decoding
+@@ -246,7 +246,7 @@ def _named_params_and_buffers_global(
+             if not name.startswith("module.module."):
+                 name = "module." + name
+ 
+-            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
++            decoder_layers_pattern = r"module\.module\.(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
+             match = re.match(decoder_layers_pattern, name)
+             if not match:
+                 yield name, buffer
+diff --git a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
+index 10c3c8fb6..bbdefd0a6 100644
+--- a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
++++ b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
+@@ -36,6 +36,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+                     self.model,
+                     cpu=False,
+                     conversion_tasks=conversion_tasks,
++                    merge_adapter_weights=False,
+                 )
+ 
+             # TODO: verify if postprocess_hf_param is needed for LoRA weights
+@@ -53,7 +54,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+             )
+ 
+             if weight_type == "base":
+-                named_weights = ((n, t) for n, t in named_weights if not is_lora_weight_name(n))
++                named_weights = (
++                    (n.replace(".base_layer.", "."), t)
++                    for n, t in named_weights
++                    if not is_lora_weight_name(n)
++                )
+             elif weight_type == "lora":
+                 named_weights = ((n, t) for n, t in named_weights if is_lora_weight_name(n))
+ 
+diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+index e045b5f27..0e8d7c5be 100644
+--- a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
++++ b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+@@ -1,3 +1,4 @@
++import gc
+ import logging
+ from argparse import Namespace
+ from collections.abc import Callable, Mapping, Sequence
+@@ -14,7 +15,7 @@ from miles.backends.megatron_utils.lora_utils import LORA_ADAPTER_NAME, build_lo
+ from miles.backends.training_utils.parallel import get_parallel_state
+ from miles.utils.distributed_utils import get_gloo_group
+ 
+-from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
++from ..sglang import FlattenedTensorBucket, FlattenedTensorMetadata, MultiprocessingSerializer
+ from .common import post_process_weights
+ from .hf_weight_iterator_base import HfWeightIteratorBase
+ from .update_weight_from_distributed.broadcast import (
+@@ -25,6 +26,67 @@ from .update_weight_from_distributed.broadcast import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++_IPC_STAGING_BUFFERS: dict[tuple[str, int | None, Any], torch.Tensor] = {}
++
++
++def _get_ipc_staging_buffer(
++    *,
++    num_bytes: int,
++    device: torch.device,
++    bucket_key: Any,
++) -> torch.Tensor:
++    if num_bytes <= 0:
++        raise ValueError("Cannot create empty tensor bucket")
++
++    key = (device.type, device.index, bucket_key)
++    buffer = _IPC_STAGING_BUFFERS.get(key)
++    if buffer is None or buffer.numel() < num_bytes:
++        buffer = torch.empty(num_bytes, dtype=torch.uint8, device=device)
++        _IPC_STAGING_BUFFERS[key] = buffer
++
++    return buffer[:num_bytes]
++
++
++def _flatten_named_tensors_for_ipc(
++    named_tensors: list[tuple[str, torch.Tensor]],
++    *,
++    bucket_key: Any,
++) -> tuple[torch.Tensor, list[FlattenedTensorMetadata]]:
++    if not named_tensors:
++        raise ValueError("Cannot create empty tensor bucket")
++
++    device = named_tensors[0][1].device
++    if any(tensor.device != device for _, tensor in named_tensors):
++        devices = sorted({str(tensor.device) for _, tensor in named_tensors})
++        raise RuntimeError(f"Cannot flatten tensors from multiple devices into one IPC bucket: {devices}")
++
++    total_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in named_tensors)
++    flattened_tensor = _get_ipc_staging_buffer(
++        num_bytes=total_bytes,
++        device=device,
++        bucket_key=bucket_key,
++    )
++
++    metadata: list[FlattenedTensorMetadata] = []
++    current_idx = 0
++    for name, tensor in named_tensors:
++        flattened = tensor.flatten().view(torch.uint8)
++        numel = flattened.numel()
++        flattened_tensor[current_idx : current_idx + numel].copy_(flattened)
++        metadata.append(
++            FlattenedTensorMetadata(
++                name=name,
++                shape=tensor.shape,
++                dtype=tensor.dtype,
++                start_idx=current_idx,
++                end_idx=current_idx + numel,
++                numel=numel,
++            )
++        )
++        current_idx += numel
++
++    return flattened_tensor, metadata
++
+ 
+ class UpdateWeightFromTensor:
+     """
+@@ -168,6 +230,10 @@ class UpdateWeightFromTensor:
+             if start <= dist.get_rank() < end:
+                 self._ipc_engine = engine
+ 
++    def _ipc_chunk_barrier(self) -> None:
++        if self._ipc_gather_group is not None:
++            dist.barrier(group=self._ipc_gather_group)
++
+     @torch.no_grad()
+     def update_weights(self) -> None:
+         """
+@@ -197,16 +263,38 @@ class UpdateWeightFromTensor:
+             ):
+                 refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
+                 results = ray.get(refs)
++                self._ipc_chunk_barrier()
+                 _check_weight_sync_results(results, is_lora=False)
+                 del long_lived_tensors
+ 
+         if self.is_lora:
+-            lora_sync_chunk_count = 0
+-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(
++            # Stream chunks with 1-ahead lookahead so we know which chunk is the
++            # last. SGLang writes raw pre-normalized LoRA names for each chunk;
++            # only the last chunk sets finalize=True so qkv / gate_up fusion runs
++            # once over the accumulated adapter state.
++            chunk_stream = self._hf_weight_iterator.get_hf_weight_chunks(
+                 megatron_local_weights, weight_type="lora"
+-            ):
+-                refs, long_lived_tensors = self._send_lora_params(hf_named_tensors)
++            )
++            lora_sync_chunk_count = 0
++            pending = None
++            next_chunk = None
++            for next_chunk in chunk_stream:
++                if pending is not None:
++                    refs, long_lived_tensors = self._send_lora_params(
++                        pending, chunk_idx=lora_sync_chunk_count, is_last=False
++                    )
++                    results = ray.get(refs)
++                    self._ipc_chunk_barrier()
++                    _check_weight_sync_results(results, is_lora=True)
++                    del long_lived_tensors
++                    lora_sync_chunk_count += 1
++                pending = next_chunk
++            if pending is not None:
++                refs, long_lived_tensors = self._send_lora_params(
++                    pending, chunk_idx=lora_sync_chunk_count, is_last=True
++                )
+                 results = ray.get(refs)
++                self._ipc_chunk_barrier()
+                 _check_weight_sync_results(results, is_lora=True)
+                 del long_lived_tensors
+                 lora_sync_chunk_count += 1
+@@ -255,7 +343,13 @@ class UpdateWeightFromTensor:
+                 refs = (refs or []) + refs_distributed
+         return refs or [], long_lived_tensors
+ 
+-    def _send_lora_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
++    def _send_lora_params(
++        self,
++        hf_named_tensors,
++        *,
++        chunk_idx: int,
++        is_last: bool,
++    ) -> tuple[list[ObjectRef], Any]:
+         if not any(is_lora_weight_name(n) for n, _ in hf_named_tensors):
+             raise RuntimeError(
+                 "LoRA weight sync failed: chunk contains no LoRA weights "
+@@ -263,18 +357,28 @@ class UpdateWeightFromTensor:
+             )
+         if self.use_distribute and self._is_distributed_src_rank:
+             raise NotImplementedError("LoRA weight sync is not yet supported for distributed (non-colocated) engines")
+-        else:
+-            refs, long_lived_tensors = _send_to_colocated_engine(
+-                hf_named_tensors=hf_named_tensors,
+-                ipc_engine=self._ipc_engine,
+-                ipc_gather_src=self._ipc_gather_src,
+-                ipc_gather_group=self._ipc_gather_group,
+-                lora_config=self._lora_config,
+-                lora_name=LORA_ADAPTER_NAME,
+-                lora_loaded=self._lora_loaded,
+-            )
++
++        is_first_chunk = chunk_idx == 0
++        # Mirror base weight sync: "load" creates the adapter (first sync only),
++        # "update" does in-place writes into the existing adapter's CPU state.
++        # The first chunk of every sync uses reset=True to drop stale post-
++        # normalize entries from the previous sync.
++        # The last chunk sets finalize=True so SGLang runs normalize_gate_up_proj
++        # / qkv fusion over the accumulated state.
++        refs, long_lived_tensors = _send_to_colocated_engine(
++            hf_named_tensors=hf_named_tensors,
++            ipc_engine=self._ipc_engine,
++            ipc_gather_src=self._ipc_gather_src,
++            ipc_gather_group=self._ipc_gather_group,
++            lora_config=self._lora_config,
++            lora_name=LORA_ADAPTER_NAME,
++            lora_mode="load" if (not self._lora_loaded and is_first_chunk) else "update",
++            lora_reset=is_first_chunk,
++            lora_finalize=is_last,
++        )
++        if is_last:
+             self._lora_loaded = True
+-            return refs or [], long_lived_tensors
++        return refs or [], long_lived_tensors
+ 
+ 
+ def _send_to_colocated_engine(
+@@ -286,7 +390,9 @@ def _send_to_colocated_engine(
+     weight_version=None,
+     lora_config: dict | None = None,
+     lora_name: str | None = None,
+-    lora_loaded: bool = False,
++    lora_mode: str = "load",   # "load" (first sync only) or "update"
++    lora_reset: bool = False,
++    lora_finalize: bool = True,
+ ) -> tuple[list[ObjectRef], Any]:
+     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
+     # gather_object is only collective among group members, so we skip entirely.
+@@ -308,13 +414,17 @@ def _send_to_colocated_engine(
+ 
+     serialized_tensors = []
+     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
++        flattened_tensor, metadata = _flatten_named_tensors_for_ipc(
++            named_tensors,
++            bucket_key=_dtype,
++        )
+         flattened_tensor_data = {
+-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+-            "metadata": flattened_tensor_bucket.get_metadata(),
++            "flattened_tensor": flattened_tensor,
++            "metadata": metadata,
+         }
+         long_live_tensors.append(flattened_tensor_data)
+-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
++        serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
++        serialized_tensors.append(serialized)
+ 
+     serialized_named_tensors = (
+         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
+@@ -329,22 +439,34 @@ def _send_to_colocated_engine(
+     refs = []
+     if dist.get_rank() == ipc_gather_src:
+         if is_lora:
+-            if lora_loaded:
+-                ray.get(ipc_engine.unload_lora_adapter.remote(lora_name=lora_name))
+-
+-            # (Yusheng) to-do-1: update lora weights from tensors should support multiple dtypes (bf16, fp8, fp16, fp32)
+-            # currently, we only support 1 type. If there are multiple dtypes, we need to serialize the tensors for each dtype.
+-            # Thus, we need to apply the same way as `ipc_engine.update_weights_from_tensor` in future
+-            # (Yusheng) to-do-2: need to add ci test acc here - now it will pass but fail to update lora weights
+-
+-            refs.append(
+-                ipc_engine.load_lora_adapter_from_tensors.remote(
+-                    lora_name=lora_name,
+-                    config_dict=lora_config,
+-                    serialized_tensors=serialized_named_tensors[0][0],
+-                    load_format="flattened_bucket",
++            # Two endpoints, mirroring base's load/update split:
++            #   - lora_mode="load":   first sync ever — creates the adapter uid,
++            #                         config, and writes chunk-0 weights.
++            #   - lora_mode="update": in-place weight write into the existing
++            #                         adapter (every subsequent chunk). Parallel
++            #                         to update_weights_from_tensor for base.
++            if lora_mode == "load":
++                refs.append(
++                    ipc_engine.load_lora_adapter_from_tensors.remote(
++                        lora_name=lora_name,
++                        config_dict=lora_config,
++                        serialized_tensors=serialized_named_tensors[0][0],
++                        load_format="flattened_bucket",
++                        finalize=lora_finalize,
++                    )
+                 )
+-            )
++            elif lora_mode == "update":
++                refs.append(
++                    ipc_engine.update_lora_adapter_from_tensors.remote(
++                        lora_name=lora_name,
++                        serialized_tensors=serialized_named_tensors[0][0],
++                        load_format="flattened_bucket",
++                        reset=lora_reset,
++                        finalize=lora_finalize,
++                    )
++                )
++            else:
++                raise ValueError(f"Unknown lora_mode: {lora_mode!r}")
+ 
+         else:
+             num_dtypes = len(serialized_named_tensors[0])
+diff --git a/miles/backends/sglang_utils/sglang_engine.py b/miles/backends/sglang_utils/sglang_engine.py
+index ee76b3872..df292f1cd 100644
+--- a/miles/backends/sglang_utils/sglang_engine.py
++++ b/miles/backends/sglang_utils/sglang_engine.py
+@@ -339,13 +339,20 @@ class SGLangEngine(RayActor):
+         load_format: str | None = None,
+         pinned: bool = False,
+         added_tokens_config: dict | None = None,
++        finalize: bool = True,
+     ):
+-        """Load a LoRA adapter from serialized tensor data."""
++        """Create a LoRA adapter from tensors + config (once per uid lifetime).
++
++        For chunked syncs, pass ``finalize=False`` on chunk 0 and call
++        :meth:`update_lora_adapter_from_tensors` for remaining chunks with
++        ``finalize=True`` on the last one.
++        """
+         payload = {
+             "lora_name": lora_name,
+             "serialized_tensors": serialized_tensors,
+             "config_dict": config_dict,
+             "pinned": pinned,
++            "finalize": finalize,
+         }
+         if load_format is not None:
+             payload["load_format"] = load_format
+@@ -357,6 +364,36 @@ class SGLangEngine(RayActor):
+             payload,
+         )
+ 
++    def update_lora_adapter_from_tensors(
++        self,
++        lora_name: str,
++        serialized_tensors: str,
++        load_format: str | None = None,
++        reset: bool = False,
++        finalize: bool = True,
++    ):
++        """In-place weight update for an already-loaded LoRA adapter.
++
++        Parallel to :meth:`update_weights_from_tensor` for base weights:
++        no config, no uid allocation, just writes tensors. ``reset=True`` on
++        the first chunk of a sync clears stale post-normalize entries from
++        the previous sync. ``finalize=True`` on the last chunk triggers
++        normalize over the accumulated state.
++        """
++        payload = {
++            "lora_name": lora_name,
++            "serialized_tensors": serialized_tensors,
++            "reset": reset,
++            "finalize": finalize,
++        }
++        if load_format is not None:
++            payload["load_format"] = load_format
++
++        return self._make_request(
++            "update_lora_adapter_from_tensors",
++            payload,
++        )
++
+     def flush_cache(self):
+         """Flush the cache of the server."""
+         if self.node_rank != 0:
+diff --git a/miles/backends/training_utils/data.py b/miles/backends/training_utils/data.py
+index 3bda887b2..cc7b735fc 100644
+--- a/miles/backends/training_utils/data.py
++++ b/miles/backends/training_utils/data.py
+@@ -12,12 +12,183 @@ from miles.utils.types import RolloutBatch
+ 
+ from ...utils.data import process_rollout_data
+ from ...utils.ray_utils import Box
+-from .cp_utils import slice_log_prob_with_cp, slice_with_cp
++from .cp_utils import all_gather_with_cp, slice_log_prob_with_cp, slice_with_cp
+ from .parallel import get_parallel_state
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _num_image_tokens_from_grid(grid_thw: torch.Tensor, merge_h: int = 2, merge_w: int = 2) -> int:
++    _, h, w = grid_thw.tolist()
++    # tpool_patch_merger averages over the temporal dimension T, so the
++    # actual number of tokens per image depends only on the spatial grid.
++    return (h // merge_h) * (w // merge_w)
++
++
++def _expand_image_tokens_for_sample(
++    tokens: torch.Tensor,
++    loss_mask: torch.Tensor,
++    grid_thws: torch.Tensor,
++    media_token_id: int = 163605,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if grid_thws is None or len(grid_thws) == 0:
++        return tokens, loss_mask
++
++    placeholder_positions = (tokens == media_token_id).nonzero(as_tuple=True)[0]
++    if len(placeholder_positions) == 0:
++        return tokens, loss_mask
++
++    num_placeholders = len(placeholder_positions)
++    num_grids = len(grid_thws)
++    expected_total_image_tokens = sum(_num_image_tokens_from_grid(grid_thw) for grid_thw in grid_thws)
++    if num_placeholders == expected_total_image_tokens:
++        # Already pre-expanded. Keep this helper idempotent because the same
++        # rollout batch may pass through multiple normalization paths.
++        return tokens, loss_mask
++    if num_placeholders != num_grids:
++        logger.warning(
++            "K25 multimodal token mismatch before training: placeholders=%s, grids=%s",
++            num_placeholders,
++            num_grids,
++        )
++
++    merge_h, merge_w = 2, 2
++    prompt_len = len(tokens) - len(loss_mask)
++
++    expanded_tokens = tokens.clone()
++    expanded_mask = loss_mask.clone()
++
++    for i, pos in enumerate(reversed(placeholder_positions)):
++        pos = pos.item()
++        grid_idx = num_placeholders - 1 - i
++        if grid_idx >= num_grids:
++            continue
++
++        _, h, w = grid_thws[grid_idx].tolist()
++        num_image_tokens = (h // merge_h) * (w // merge_w)
++
++        expanded_placeholder = torch.full(
++            (num_image_tokens,), media_token_id, dtype=expanded_tokens.dtype, device=expanded_tokens.device
++        )
++        expanded_tokens = torch.cat([expanded_tokens[:pos], expanded_placeholder, expanded_tokens[pos + 1 :]])
++
++        if pos >= prompt_len:
++            mask_pos = pos - prompt_len
++            expanded_mask_tokens = torch.zeros(
++                num_image_tokens, dtype=expanded_mask.dtype, device=expanded_mask.device
++            )
++            expanded_mask = torch.cat([expanded_mask[:mask_pos], expanded_mask_tokens, expanded_mask[mask_pos + 1 :]])
++
++    return expanded_tokens, expanded_mask
++
++
++def _collect_multimodal_grid_inputs(
++    multimodal_train_inputs: Sequence[dict[str, torch.Tensor] | None] | None,
++) -> list[dict[str, torch.Tensor] | None]:
++    if multimodal_train_inputs is None:
++        return []
++
++    mm_inputs_list = []
++    for mm_dict in multimodal_train_inputs:
++        if mm_dict is not None and "grid_thws" in mm_dict:
++            mm_inputs_list.append(mm_dict)
++        else:
++            mm_inputs_list.append(None)
++    return mm_inputs_list
++
++
++def _batch_has_media_placeholders(
++    tokens: Sequence[torch.Tensor],
++    media_token_id: int = 163605,
++) -> bool:
++    return any((token_tensor == media_token_id).any().item() for token_tensor in tokens)
++
++
++def expand_multimodal_rollout_data_in_place(
++    rollout_data: RolloutBatch,
++    media_token_id: int = 163605,
++    qkv_format: str = "thd",
++) -> None:
++    multimodal_train_inputs = rollout_data.get("multimodal_train_inputs", None)
++    mm_inputs_list = _collect_multimodal_grid_inputs(multimodal_train_inputs)
++    if not mm_inputs_list or not any(mm is not None for mm in mm_inputs_list):
++        return
++
++    tokens = rollout_data["tokens"]
++    if not _batch_has_media_placeholders(tokens, media_token_id=media_token_id):
++        return
++
++    loss_masks = rollout_data["loss_masks"]
++    old_total_lengths = list(rollout_data["total_lengths"])
++    old_response_lengths = list(rollout_data["response_lengths"])
++
++    token_or_mask_changed = False
++    expanded_tokens = []
++    expanded_loss_masks = []
++    expanded_total_lengths = []
++    expanded_response_lengths = []
++
++    for i, (token_tensor, loss_mask_tensor) in enumerate(zip(tokens, loss_masks, strict=False)):
++        if mm_inputs_list[i] is not None:
++            new_tokens, new_loss_mask = _expand_image_tokens_for_sample(
++                token_tensor,
++                loss_mask_tensor,
++                mm_inputs_list[i]["grid_thws"],
++                media_token_id=media_token_id,
++            )
++            token_or_mask_changed = token_or_mask_changed or (
++                (new_tokens.size(0) != token_tensor.size(0)) or (new_loss_mask.size(0) != loss_mask_tensor.size(0))
++            )
++            expanded_tokens.append(new_tokens)
++            expanded_loss_masks.append(new_loss_mask)
++            expanded_total_lengths.append(new_tokens.size(0))
++            expanded_response_lengths.append(new_loss_mask.size(0))
++        else:
++            expanded_tokens.append(token_tensor)
++            expanded_loss_masks.append(loss_mask_tensor)
++            expanded_total_lengths.append(old_total_lengths[i])
++            expanded_response_lengths.append(old_response_lengths[i])
++
++    rollout_data["tokens"] = expanded_tokens
++    rollout_data["loss_masks"] = expanded_loss_masks
++    rollout_data["total_lengths"] = expanded_total_lengths
++    rollout_data["response_lengths"] = expanded_response_lengths
++
++    metadata_changed = (expanded_total_lengths != old_total_lengths) or (
++        expanded_response_lengths != old_response_lengths
++    )
++    if metadata_changed:
++        parallel_state = get_parallel_state()
++        cp_size = parallel_state.cp.size
++        if cp_size > 1 and qkv_format == "thd":
++            for key in ("rollout_log_probs", "teacher_log_probs"):
++                values = rollout_data.get(key)
++                if not values:
++                    continue
++                rollout_data[key] = [
++                    slice_log_prob_with_cp(
++                        all_gather_with_cp(value, old_total_length, old_response_length),
++                        new_total_length,
++                        new_response_length,
++                        qkv_format,
++                    )
++                    for value, old_total_length, old_response_length, new_total_length, new_response_length in zip(
++                        values,
++                        old_total_lengths,
++                        old_response_lengths,
++                        expanded_total_lengths,
++                        expanded_response_lengths,
++                        strict=False,
++                    )
++                ]
++        logger.info(
++            "Adjusted multimodal rollout metadata for Kimi VL: "
++            f"token_or_mask_changed={token_or_mask_changed}, "
++            f"total_lengths_changed={expanded_total_lengths != old_total_lengths}, "
++            f"response_lengths_changed={expanded_response_lengths != old_response_lengths}"
++        )
++
++
+ def get_rollout_data(args: Namespace, rollout_data_ref: Box) -> RolloutBatch:
+     parallel_state = get_parallel_state()
+     # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
+@@ -120,6 +291,9 @@ def get_batch(
+     if "dynamic_global_batch_size" in data_iterator.rollout_data:
+         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
+ 
++    # No-op safety net if batches reach get_batch without rollout-level preprocessing.
++    expand_multimodal_rollout_data_in_place(batch, qkv_format=qkv_format)
++
+     tokens = batch["tokens"]
+     # use 0 as the pad token id should be fine?
+     pad_token_id = 0
+@@ -342,6 +516,8 @@ def get_data_iterator(
+     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
+     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
+     """
++    expand_multimodal_rollout_data_in_place(rollout_data, qkv_format=args.qkv_format)
++
+     parallel_state = get_parallel_state()
+     dp_size = parallel_state.intra_dp.size
+     dp_group = parallel_state.intra_dp.group
+diff --git a/miles/rollout/sglang_rollout.py b/miles/rollout/sglang_rollout.py
+index 551021f53..0cea504fc 100644
+--- a/miles/rollout/sglang_rollout.py
++++ b/miles/rollout/sglang_rollout.py
+@@ -24,7 +24,7 @@ from miles.utils.eval_config import EvalDatasetConfig
+ from miles.utils.http_utils import get, post
+ from miles.utils.misc import SingletonMeta, load_function
+ from miles.utils.processing_utils import (
+-    build_processor_kwargs,
++    call_processor,
+     encode_image_for_rollout_engine,
+     load_processor,
+     load_tokenizer,
+@@ -141,9 +141,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
+     ), f"Sample status is {sample.status}"
+ 
+     if state.processor and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
+-        processor_kwargs = build_processor_kwargs(sample.multimodal_inputs)
+-        processor_output = state.processor(text=sample.prompt, **processor_kwargs)
++        processor_output = call_processor(state.processor, sample.prompt, sample.multimodal_inputs)
+         prompt_ids = processor_output["input_ids"][0]
++        prompt_ids = (
++            prompt_ids.tolist()
++            if hasattr(prompt_ids, "tolist")
++            else list(prompt_ids)
++        )
+         sample.multimodal_train_inputs = {
+             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
+         } or None
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index ab9ef5b23..4b003b6fc 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -1092,6 +1092,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                 default=False,
+                 help="Sync LoRA weights via tensor instead of file (more efficient)",
+             )
++            parser.add_argument(
++                "--experts-shared-outer-loras",
++                action="store_true",
++                default=False,
++                help="Enable shared-outer grouped-expert LoRA (gate_up lora_A and "
++                "down lora_B shared across experts, expert_dim=1). Matches SGLang "
++                "PR #21466's experts_shared_outer_loras=True serving contract.",
++            )
+             return parser
+ 
+         def add_router_arguments(parser):
+@@ -1718,7 +1726,7 @@ def parse_args(add_custom_arguments=None):
+         from miles.backends.megatron_utils.arguments import validate_args as megatron_validate_args
+ 
+         args = megatron_parse_args(extra_args_provider=add_miles_arguments)
+-        if args.hf_checkpoint:
++        if args.hf_checkpoint and not getattr(args, "debug_rollout_only", False):
+             hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+             hf_validate_args(args, hf_config)
+ 
+@@ -1907,6 +1915,14 @@ def miles_validate_args(args):
+ 
+         args.target_modules = modules
+ 
++        # Training and serving must agree on shared-outer grouped-expert LoRA
++        # (expert_dim=1 buffers in SGLang).
++        if args.experts_shared_outer_loras:
++            args.sglang_experts_shared_outer_loras = True
++        assert args.experts_shared_outer_loras == bool(args.sglang_experts_shared_outer_loras), (
++            "experts_shared_outer_loras and sglang_experts_shared_outer_loras must agree"
++        )
++
+     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+ 
+     if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
+diff --git a/miles/utils/data.py b/miles/utils/data.py
+index 6e64ef678..35642764d 100644
+--- a/miles/utils/data.py
++++ b/miles/utils/data.py
+@@ -13,6 +13,7 @@ try:
+ except ImportError:
+     pq = None
+ 
++from miles.utils.processing_utils import call_processor
+ from miles.utils.types import MultimodalTypes, Sample
+ 
+ from .timer import Timer
+@@ -94,7 +95,7 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
+             from miles.utils.processing_utils import process_vision_info
+ 
+             multimodal_inputs = process_vision_info(sample.prompt, processor)
+-            processor_output = processor(text=sample.prompt, **multimodal_inputs)
++            processor_output = call_processor(processor, sample.prompt, multimodal_inputs)
+             input_ids = processor_output["input_ids"][0]
+             if len(input_ids) <= max_length:
+                 filtered_samples.append(sample)
+diff --git a/miles/utils/processing_utils.py b/miles/utils/processing_utils.py
+index 9d12eed8b..e3eea47f6 100644
+--- a/miles/utils/processing_utils.py
++++ b/miles/utils/processing_utils.py
+@@ -1,4 +1,5 @@
+ import base64
++import inspect
+ import io
+ import logging
+ import os
+@@ -66,6 +67,30 @@ def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
+     return result
+ 
+ 
++def processor_requires_medias(processor) -> bool:
++    try:
++        params = inspect.signature(processor.__call__).parameters
++        return "medias" in params and "text" in params
++    except (TypeError, ValueError):
++        return hasattr(processor, "media_processor")
++
++
++def call_processor(processor, text, multimodal_inputs: dict | None = None):
++    multimodal_inputs = multimodal_inputs or {}
++
++    # for kimi-vl & kimi-2.5
++    if processor_requires_medias(processor):
++        medias = []
++        if images := multimodal_inputs.get("images"):
++            medias.extend({"type": "image", "image": image} for image in images)
++        if videos := multimodal_inputs.get("videos"):
++            medias.extend({"type": "video", "video": video} for video in videos)
++        return processor(text=text, medias=medias)
++
++    kwargs = build_processor_kwargs(multimodal_inputs)
++    return processor(text=text, **kwargs)
++
++
+ def load_processor(name_or_path: str, **kwargs):
+     try:
+         proc = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+@@ -87,7 +112,7 @@ def process_vision_info(prompt, processor):
+     if hasattr(processor.image_processor, "patch_size"):
+         image_patch_size = processor.image_processor.patch_size
+     else:
+-        logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
++        # logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
+         image_patch_size = DEFAULT_PATCH_SIZE
+     images, videos = qwen_process_vision_info(prompt, image_patch_size=image_patch_size)
+     multimodal_inputs = {"images": images, "videos": videos}
+diff --git a/miles/utils/reloadable_process_group.py b/miles/utils/reloadable_process_group.py
+index af4878b4e..7a3b27452 100644
+--- a/miles/utils/reloadable_process_group.py
++++ b/miles/utils/reloadable_process_group.py
+@@ -70,6 +70,7 @@ def monkey_patch_torch_dist():
+     dist.all_to_all = get_new_function(dist.all_to_all)
+     dist.all_to_all_single = get_new_function(dist.all_to_all_single)
+     dist.broadcast = get_new_function(dist.broadcast)
++    dist.broadcast_object_list = get_new_function(dist.broadcast_object_list)
+     dist.reduce = get_new_function(dist.reduce)
+     dist.reduce_scatter = get_new_function(dist.reduce_scatter)
+     dist.reduce_scatter_tensor = get_new_function(dist.reduce_scatter_tensor)
+diff --git a/tools/convert_hf_to_fp8.py b/tools/convert_hf_to_fp8.py
+index 7754e7dea..4043025e5 100644
+--- a/tools/convert_hf_to_fp8.py
++++ b/tools/convert_hf_to_fp8.py
+@@ -137,6 +137,8 @@ def process_file(input_path, output_path, filename, strategy, block_size, result
+             and "lm_head" not in key
+             and "eh_proj" not in key
+             and "weights_proj" not in key
++            and "vision_tower" not in key
++            and "mm_projector" not in key
+         ):
+             qw, s = quant_fp8(weights[key], strategy, block_size)
+             q_weights[key] = qw
+diff --git a/tools/convert_hf_to_int4.py b/tools/convert_hf_to_int4.py
+index 3dbf075eb..7876af9c0 100644
+--- a/tools/convert_hf_to_int4.py
++++ b/tools/convert_hf_to_int4.py
+@@ -77,6 +77,8 @@ def main():
+         "re:.*shared_experts.*",
+         "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
+         "re:.*mlp\\.gate\\.*",
++        "re:vision_tower.*",
++        "re:mm_projector.*",
+     ]
+ 
+     recipe = GPTQModifier(
+diff --git a/tools/convert_hf_to_int4_direct.py b/tools/convert_hf_to_int4_direct.py
+index e741b802d..2fa28e1aa 100644
+--- a/tools/convert_hf_to_int4_direct.py
++++ b/tools/convert_hf_to_int4_direct.py
+@@ -295,6 +295,8 @@ def parse_args():
+             "re:.*shared_experts.*",
+             "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
+             "re:.*mlp\\.gate\\.*",
++            "re:vision_tower.*",
++            "re:mm_projector.*",
+         ],
+         help="Ignore Rules",
+     )
+diff --git a/tools/convert_k2_thinking_int4_to_bf16.py b/tools/convert_kimi_int4_to_bf16.py
+similarity index 92%
+rename from tools/convert_k2_thinking_int4_to_bf16.py
+rename to tools/convert_kimi_int4_to_bf16.py
+index 78c0effc0..31cf6f0e1 100644
+--- a/tools/convert_k2_thinking_int4_to_bf16.py
++++ b/tools/convert_kimi_int4_to_bf16.py
+@@ -1,7 +1,7 @@
+ """
+ Usage:
+ ------
+-python convert_k2_thinking_int4_to_bf16.py [-h] --model-dir MODEL_DIR [--output-dir OUTPUT_DIR]
++python convert_kimi_int4_to_bf16.py [-h] --model-dir MODEL_DIR [--output-dir OUTPUT_DIR]
+                            [--files FILE [FILE ...]] [--config-path CONFIG_PATH]
+                            [--overwrite]
+ options:
+@@ -20,7 +20,8 @@ options:
+ 
+ Example:
+ --------
+-python convert_k2_thinking_int4_to_bf16.py --model-dir /Kimi-K2-Thinking --output-dir /Kimi-K2-Thinking-bf16
++python convert_kimi_int4_to_bf16.py --model-dir /Kimi-K2-Thinking --output-dir /Kimi-K2-Thinking-bf16
++python convert_kimi_int4_to_bf16.py --model-dir /Kimi-K2.5 --output-dir /Kimi-K2.5-bf16
+ """
+ 
+ import argparse
+@@ -40,10 +41,11 @@ def _load_config(model_dir: str, config_path: str | None) -> tuple[int, int, int
+     cfg_path = config_path or os.path.join(model_dir, "config.json")
+     with open(cfg_path) as f:
+         cfg = json.load(f)
+-    hidden_size = int(cfg.get("hidden_size"))
+-    inter_size = int(cfg.get("moe_intermediate_size"))
++    loader = cfg.get("text_config", cfg)
++    hidden_size = int(loader.get("hidden_size"))
++    inter_size = int(loader.get("moe_intermediate_size"))
+     group_size = int(
+-        cfg.get("quantization_config", {})
++        loader.get("quantization_config", {})
+         .get("config_groups", {})
+         .get("group_0", {})
+         .get("weights", {})
+@@ -218,7 +220,13 @@ def main():
+         dst_path = os.path.join(output_dir, fname)
+         if fname == "model.safetensors.index.json":
+             continue
+-        if fname.endswith(".json") or fname.endswith(".py") or fname.startswith("tokenizer"):
++        if (
++            fname.endswith(".json")
++            or fname.endswith(".py")
++            or fname.startswith("tokenizer")
++            or fname.endswith(".jinja")
++            or fname.endswith(".model")
++        ):
+             shutil.copy2(src_path, dst_path)
+ 
+     # Generate new index
