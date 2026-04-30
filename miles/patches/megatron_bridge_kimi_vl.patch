@@ -1,294 +1,5 @@
-diff --git a/src/megatron/bridge/data/vlm_datasets/collate.py b/src/megatron/bridge/data/vlm_datasets/collate.py
-index eef2a2d2..45f41578 100644
---- a/src/megatron/bridge/data/vlm_datasets/collate.py
-+++ b/src/megatron/bridge/data/vlm_datasets/collate.py
-@@ -17,6 +17,7 @@ Collation utilities for building VLM training batches from conversation examples
- """
- 
- import warnings
-+from typing import Any
- 
- import torch
- import torch.nn.functional as F
-@@ -24,7 +25,7 @@ from PIL import Image  # noqa: F401  # may be used downstream by processors
- 
- from megatron.bridge.data.datasets.utils import IGNORE_INDEX
- from megatron.bridge.data.vlm_datasets.token_utils import extract_skipped_token_ids
--from megatron.bridge.training.utils.visual_inputs import Qwen2_5_VLVisualInputs
-+from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs, Qwen2_5_VLVisualInputs
- 
- 
- # Local message used when optional qwen_vl_utils dependency is missing
-@@ -356,7 +357,9 @@ def nemotron_nano_v2_vl_collate_fn(examples: list, processor, start_of_response_
-         )
- 
-     key = "pixel_values_videos" if is_video else "pixel_values"
--    batch["pixel_values"] = batch[key].to(torch.bfloat16)
-+    pv = batch[key].to(torch.bfloat16)
-+    del batch[key]
-+    batch["visual_inputs"] = GenericVisualInputs(pixel_values=pv)
-     # roll label by 1 and fill last token with IGNORE_INDEX
-     labels = batch["input_ids"].clone()[:, 1:]
-     labels = torch.cat([labels, IGNORE_INDEX * torch.ones_like(labels[:, :1])], dim=1)
-@@ -455,6 +458,13 @@ def ministral3_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
-             torch.arange(seq_len, device=batch["input_ids"].device).unsqueeze(0).expand(batch_size, -1).clone()
-         )
- 
-+    # Wrap visual tensors in GenericVisualInputs so vlm_step.py picks them up
-+    visual_kwargs = {}
-+    for vk in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw", "image_sizes"):
-+        if vk in batch:
-+            visual_kwargs[vk] = batch.pop(vk)
-+    batch["visual_inputs"] = GenericVisualInputs(**visual_kwargs) if visual_kwargs else None
-+
-     return batch
- 
- 
-@@ -507,11 +517,242 @@ def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
-     return batch
- 
- 
-+def _expand_image_tokens(
-+    input_ids: torch.Tensor,
-+    attention_mask: torch.Tensor,
-+    grid_thws: torch.Tensor,
-+    media_token_id: int,
-+    merge_kernel_size: tuple[int, int] = (2, 2),
-+) -> tuple[torch.Tensor, torch.Tensor]:
-+    """Expand image placeholder tokens to the correct count based on grid_thws.
-+
-+    For PP, this ensures the sequence length is fixed BEFORE the model forward pass,
-+    eliminating dynamic sequence expansion inside the model.
-+
-+    Args:
-+        input_ids: (seq_len,) tensor with one placeholder per image
-+        attention_mask: (seq_len,) tensor
-+        grid_thws: (num_images, 3) tensor with [t, h, w] for each image
-+        media_token_id: Token ID of the image placeholder
-+        merge_kernel_size: Vision tower's patch merge kernel, default (2, 2)
-+
-+    Returns:
-+        expanded_input_ids: Input IDs with placeholder expanded to N tokens
-+        expanded_attention_mask: Attention mask expanded accordingly
-+    """
-+    merge_h, merge_w = merge_kernel_size
-+
-+    # Calculate number of image tokens for each image: t * (h // merge_h) * (w // merge_w)
-+    feature_counts = []
-+    for grid_thw in grid_thws:
-+        t, h, w = (int(x) for x in grid_thw.tolist())
-+        feature_counts.append(t * (h // merge_h) * (w // merge_w))
-+
-+    # Find placeholder positions
-+    placeholder_positions = (input_ids == media_token_id).nonzero(as_tuple=True)[0]
-+    if len(placeholder_positions) == 0:
-+        # No placeholder found, return as-is
-+        return input_ids, attention_mask
-+
-+    if len(placeholder_positions) != len(feature_counts):
-+        warnings.warn(
-+            "Mismatch between image placeholder count and grid_thws rows during Kimi token expansion; "
-+            "expanding as many placeholders as have corresponding grid metadata.",
-+            stacklevel=2,
-+        )
-+
-+    expanded_input_ids = []
-+    expanded_attention_mask = []
-+    feature_idx = 0
-+
-+    for token_id, mask_value in zip(input_ids.tolist(), attention_mask.tolist()):
-+        if token_id == media_token_id and feature_idx < len(feature_counts):
-+            expanded_input_ids.extend([media_token_id] * feature_counts[feature_idx])
-+            expanded_attention_mask.extend([1] * feature_counts[feature_idx])
-+            feature_idx += 1
-+            continue
-+
-+        expanded_input_ids.append(token_id)
-+        expanded_attention_mask.append(mask_value)
-+
-+    expanded_input_ids = torch.tensor(
-+        expanded_input_ids,
-+        dtype=input_ids.dtype,
-+        device=input_ids.device,
-+    )
-+    expanded_attention_mask = torch.tensor(
-+        expanded_attention_mask,
-+        dtype=attention_mask.dtype,
-+        device=attention_mask.device,
-+    )
-+
-+    return expanded_input_ids, expanded_attention_mask
-+
-+
-+def kimi_k25_vl_collate_fn(
-+    examples: list[dict[str, Any]],
-+    processor,
-+    max_length: int | None = None,
-+) -> dict[str, torch.Tensor]:
-+    """Collate function for Kimi K2.5 VL processors with pre-expanded image tokens.
-+
-+    For pipeline parallelism, this function:
-+    1. Processes each sample to get input_ids with 1 placeholder per image
-+    2. Pre-expands each placeholder to N tokens (N = t*(h//2)*(w//2) from grid_thws)
-+    3. Pads all sequences to fixed max_length
-+    This ensures the model forward pass doesn't change sequence length dynamically.
-+    """
-+    skipped_tokens = extract_skipped_token_ids(processor)
-+    conversations = [example["conversation"] for example in examples]
-+
-+    # Get media token ID
-+    media_token_id = getattr(processor, "media_placeholder_token_id", None)
-+    if media_token_id is None and hasattr(processor, "tokenizer"):
-+        media_token_id = processor.tokenizer.convert_tokens_to_ids("<|media_pad|>")
-+    if media_token_id is None:
-+        media_token_id = 163605  # Default for Kimi K2.5
-+
-+    pad_token_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
-+
-+    # Get actual merge_kernel_size from processor's vision config
-+    merge_kernel_size = (2, 2)  # default fallback
-+    if hasattr(processor, "config") and hasattr(processor.config, "vision_config"):
-+        merge_kernel_size = getattr(processor.config.vision_config, "merge_kernel_size", (2, 2))
-+    elif hasattr(processor, "vision_config"):
-+        merge_kernel_size = getattr(processor.vision_config, "merge_kernel_size", (2, 2))
-+
-+    # Process each sample individually
-+    all_expanded = []
-+    all_pixel_values = []
-+    all_grid_thws = []
-+
-+    for i, conversation in enumerate(conversations):
-+        # Collect medias for this conversation
-+        medias = []
-+        for message in conversation:
-+            content = message.get("content")
-+            if isinstance(content, list):
-+                for item in content:
-+                    if isinstance(item, dict) and item.get("type") == "image":
-+                        medias.append({"type": "image", "image": item.get("image")})
-+
-+        text = processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
-+
-+        processor_kwargs = {
-+            "text": text,
-+            "return_tensors": "pt",
-+        }
-+        if medias:
-+            processor_kwargs["medias"] = medias
-+
-+        sample_batch = processor(**processor_kwargs)
-+
-+        input_ids = sample_batch["input_ids"][0]
-+        attention_mask = sample_batch["attention_mask"][0]
-+
-+        # Pre-expand image tokens if we have grid_thws
-+        if "grid_thws" in sample_batch and sample_batch["grid_thws"] is not None:
-+            grid_thws = sample_batch["grid_thws"]
-+            input_ids, attention_mask = _expand_image_tokens(
-+                input_ids, attention_mask, grid_thws, media_token_id, merge_kernel_size
-+            )
-+            all_grid_thws.append(grid_thws)
-+
-+        if "pixel_values" in sample_batch:
-+            all_pixel_values.append(sample_batch["pixel_values"])
-+
-+        all_expanded.append(
-+            {
-+                "input_ids": input_ids,
-+                "attention_mask": attention_mask,
-+            }
-+        )
-+
-+    # Determine target length for padding
-+    expanded_lens = [b["input_ids"].shape[0] for b in all_expanded]
-+    batch_max = max(expanded_lens)
-+
-+    if max_length is not None:
-+        target_len = max_length
-+    else:
-+        target_len = batch_max
-+
-+    # Pad/truncate to target_len
-+    padded_input_ids = []
-+    padded_attention_mask = []
-+
-+    for batch in all_expanded:
-+        input_ids = batch["input_ids"]
-+        attention_mask = batch["attention_mask"]
-+        seq_len = input_ids.shape[0]
-+
-+        if seq_len < target_len:
-+            # Pad
-+            pad_len = target_len - seq_len
-+            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])
-+            attention_mask = torch.cat([attention_mask, torch.zeros(pad_len, dtype=attention_mask.dtype)])
-+        elif seq_len > target_len:
-+            # Truncate
-+            input_ids = input_ids[:target_len]
-+            attention_mask = attention_mask[:target_len]
-+
-+        padded_input_ids.append(input_ids)
-+        padded_attention_mask.append(attention_mask)
-+
-+    result = {
-+        "input_ids": torch.stack(padded_input_ids),
-+        "attention_mask": torch.stack(padded_attention_mask),
-+    }
-+
-+    if all_pixel_values:
-+        result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
-+    if all_grid_thws:
-+        result["grid_thws"] = torch.cat(all_grid_thws, dim=0)  # (N, 3) with [t, h, w]
-+
-+    labels = result["input_ids"].clone()[:, 1:].contiguous()
-+    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-+    labels[torch.isin(labels, skipped_tokens)] = -100
-+    result["labels"] = labels
-+    # Ensure position_ids exist for the model
-+    if "position_ids" not in result:
-+        result_size, seq_len = result["input_ids"].shape
-+        result["position_ids"] = (
-+            torch.arange(seq_len, device=result["input_ids"].device)
-+            .unsqueeze(0)
-+            .expand(result_size, -1)
-+            .clone()
-+            .contiguous()
-+        )
-+    # Prefer general search-based masking using structured example content (not template-specific)
-+    loss_masks = [
-+        create_multiturn_loss_mask_by_search(example, input_ids, processor, skipped_tokens)
-+        for example, input_ids in zip(examples, result["input_ids"])  # type: ignore[arg-type]
-+    ]
-+    loss_mask_t = torch.tensor(loss_masks, dtype=torch.float, device=result["input_ids"].device)
-+    # Shift loss mask to align with next-token labels timeline
-+    loss_mask_t = torch.cat([loss_mask_t[:, 1:], torch.zeros_like(loss_mask_t[:, :1])], dim=1)
-+    # Enforce label masking to match shifted loss_mask
-+    result["labels"] = result["labels"].masked_fill(loss_mask_t == 0, -100)
-+    result["loss_mask"] = loss_mask_t.contiguous()
-+
-+    # Build visual inputs object and attach to batch; remove raw keys.
-+    # Kimi processor outputs "grid_thws" (N, 3); pass full [t, h, w] as image_grid_thw.
-+    visual_inputs = Qwen2_5_VLVisualInputs(
-+        pixel_values=result.get("pixel_values"),
-+        image_grid_thw=result.get("grid_thws"),
-+    )
-+    for k in ("pixel_values", "grid_thws"):
-+        result.pop(k, None)
-+    result["visual_inputs"] = visual_inputs
-+    return result
-+
-+
- # Mapping of processor types to their collate functions
- COLLATE_FNS = {
-     "Qwen2_5_VLProcessor": qwen2_5_collate_fn,
-     "Qwen3VLProcessor": qwen2_5_collate_fn,
-     "NemotronNanoVLV2Processor": nemotron_nano_v2_vl_collate_fn,
-     "PixtralProcessor": ministral3_collate_fn,  # Ministral3 uses PixtralProcessor
-+    "KimiK25Processor": kimi_k25_vl_collate_fn,
-     "default": default_collate_fn,
- }
 diff --git a/src/megatron/bridge/models/__init__.py b/src/megatron/bridge/models/__init__.py
-index 2400b55f..764b1dee 100644
+index 2400b55f..22d443b1 100644
 --- a/src/megatron/bridge/models/__init__.py
 +++ b/src/megatron/bridge/models/__init__.py
 @@ -61,6 +61,14 @@ from megatron.bridge.models.gpt_oss import (
@@ -306,38 +17,7 @@ index 2400b55f..764b1dee 100644
  from megatron.bridge.models.llama import (
      LlamaBridge,
  )
-@@ -97,30 +105,6 @@ from megatron.bridge.models.olmoe import (
-     OlMoEBridge,
-     OlMoEModelProvider,
- )
--from megatron.bridge.models.qwen import (
--    Qwen2ModelProvider,
--    Qwen2ModelProvider1P5B,
--    Qwen2ModelProvider7B,
--    Qwen2ModelProvider72B,
--    Qwen2ModelProvider500M,
--    Qwen3ModelProvider,
--    Qwen3ModelProvider1P7B,
--    Qwen3ModelProvider4B,
--    Qwen3ModelProvider8B,
--    Qwen3ModelProvider14B,
--    Qwen3ModelProvider32B,
--    Qwen3ModelProvider600M,
--    Qwen3MoEModelProvider,
--    Qwen3MoEModelProvider30B_A3B,
--    Qwen3MoEModelProvider235B_A22B,
--    Qwen25ModelProvider1P5B,
--    Qwen25ModelProvider3B,
--    Qwen25ModelProvider7B,
--    Qwen25ModelProvider14B,
--    Qwen25ModelProvider32B,
--    Qwen25ModelProvider72B,
--    Qwen25ModelProvider500M,
--)
- from megatron.bridge.models.qwen_omni import (
-     Qwen25OmniBridge,
-     Qwen25OmniModel,
-@@ -183,6 +167,10 @@ __all__ = [
+@@ -183,6 +191,10 @@ __all__ = [
      "GPTModelProvider",
      "GPTOSSBridge",
      "T5ModelProvider",
@@ -348,37 +28,102 @@ index 2400b55f..764b1dee 100644
      "LlamaBridge",
      "LlamaNemotronHeterogeneousProvider",
      "LlamaNemotronBridge",
-@@ -197,28 +185,6 @@ __all__ = [
-     "Ministral3ModelProvider14B",
-     "OlMoEBridge",
-     "OlMoEModelProvider",
--    "Qwen2ModelProvider",
--    "Qwen2ModelProvider500M",
--    "Qwen2ModelProvider1P5B",
--    "Qwen2ModelProvider7B",
--    "Qwen2ModelProvider72B",
--    "Qwen25ModelProvider500M",
--    "Qwen25ModelProvider1P5B",
--    "Qwen25ModelProvider3B",
--    "Qwen25ModelProvider7B",
--    "Qwen25ModelProvider14B",
--    "Qwen25ModelProvider32B",
--    "Qwen25ModelProvider72B",
--    "Qwen3ModelProvider",
--    "Qwen3ModelProvider600M",
--    "Qwen3ModelProvider1P7B",
--    "Qwen3ModelProvider4B",
--    "Qwen3ModelProvider8B",
--    "Qwen3ModelProvider14B",
--    "Qwen3ModelProvider32B",
--    "Qwen3MoEModelProvider",
--    "Qwen3MoEModelProvider30B_A3B",
--    "Qwen3MoEModelProvider235B_A22B",
-     "NemotronHBridge",
-     "MambaModelProvider",
-     "MimoBridge",
+diff --git a/src/megatron/bridge/models/common/unimodal.py b/src/megatron/bridge/models/common/unimodal.py
+index c12c175c..027151bb 100644
+--- a/src/megatron/bridge/models/common/unimodal.py
++++ b/src/megatron/bridge/models/common/unimodal.py
+@@ -12,14 +12,12 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from __future__ import annotations
+-
+ import logging
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+-from typing import TYPE_CHECKING, Any, Callable
++from typing import Any, Callable
+ 
+ import torch
+ from megatron.core import tensor_parallel
+@@ -36,9 +34,6 @@ from megatron.core.transformer.module import Float16Module
+ from megatron.core.utils import get_model_config
+ 
+ 
+-if TYPE_CHECKING:
+-    from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
+-
+ try:
+     from megatron.core.fp8_utils import correct_amax_history_if_needed
+ except ImportError:
+@@ -58,7 +53,6 @@ def unimodal_build_distributed_models(
+     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
+     model_type: ModelType = ModelType.encoder_or_decoder,
+-    mixed_precision_config: MixedPrecisionConfig | None = None,
+ ) -> list[MegatronModule]:
+     """Build model stages and wrap for distributed training.
+ 
+@@ -87,7 +81,6 @@ def unimodal_build_distributed_models(
+             Pass ``None`` to skip.
+         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
+         model_type: Deprecated flag, only used for backwards compatibility.
+-        mixed_precision_config: Mixed-precision config for DDP wrapper.
+ 
+     Returns:
+         List of model stages, wrapped and ready for distributed training.
+@@ -151,7 +144,6 @@ def unimodal_build_distributed_models(
+             use_megatron_fsdp=use_megatron_fsdp,
+             use_torch_fsdp2=use_torch_fsdp2,
+             pg_collection=pg_collection,
+-            mixed_precision_config=mixed_precision_config,
+         )
+ 
+     return model_list
+@@ -204,7 +196,6 @@ def _ddp_wrap(
+     overlap_param_gather_with_optimizer_step: bool,
+     use_megatron_fsdp: bool = False,
+     use_torch_fsdp2: bool = False,
+-    mixed_precision_config: MixedPrecisionConfig | None = None,
+     *,
+     pg_collection: ProcessGroupCollection,
+ ) -> list[MegatronModule]:
+@@ -218,23 +209,15 @@ def _ddp_wrap(
+             for overlapping parameter gathering with optimizer step
+         use_megatron_fsdp: Whether to use Megatron FSDP.
+         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
+-        mixed_precision_config: Mixed-precision config for DDP wrapper.
+         pg_collection: Model communication process groups.
+ 
+     Returns:
+         list[MegatronModule]: List of DDP/FSDP wrapped model modules
+     """
+-    ddp_init_kwargs = {}
+     if use_megatron_fsdp:
+         DP = FullyShardedDataParallel
+         if use_torch_fsdp2:
+             raise ValueError("Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported.")
+-        if mixed_precision_config is not None:
+-            # Also pass the mixed-precision arguments for Megatron-FSDP only.
+-            mixed_precision_config.finalize()
+-            ddp_init_kwargs["main_params_dtype"] = mixed_precision_config.megatron_fsdp_main_params_dtype
+-            ddp_init_kwargs["main_grads_dtype"] = mixed_precision_config.megatron_fsdp_main_grads_dtype
+-            ddp_init_kwargs["grad_comm_dtype"] = mixed_precision_config.megatron_fsdp_grad_comm_dtype
+     elif use_torch_fsdp2:
+         DP = TorchFullyShardedDataParallel
+     else:
+@@ -255,7 +238,6 @@ def _ddp_wrap(
+                 # model chunks is overlapped with compute anyway.
+                 disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step,
+                 pg_collection=pg_collection,
+-                **ddp_init_kwargs,
+             )
+             for (model_chunk_idx, model_chunk) in enumerate(model)
+         ]
 diff --git a/src/megatron/bridge/models/conversion/auto_bridge.py b/src/megatron/bridge/models/conversion/auto_bridge.py
-index f11f1081..4c95163e 100644
+index f11f1081..79117bba 100644
 --- a/src/megatron/bridge/models/conversion/auto_bridge.py
 +++ b/src/megatron/bridge/models/conversion/auto_bridge.py
 @@ -15,6 +15,7 @@
@@ -414,12 +159,12 @@ index f11f1081..4c95163e 100644
  
      @classmethod
      def list_supported_models(cls) -> list[str]:
-@@ -162,6 +167,63 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -162,6 +167,71 @@ class AutoBridge(Generic[MegatronModelT]):
              return False
          return any(arch.endswith(SUPPORTED_HF_ARCHITECTURES) for arch in architectures)
  
 +    @classmethod
-+    def from_auto_config(cls, megatron_path: str, hf_model_id: str) -> "AutoBridge":
++    def from_auto_config(cls, megatron_path: str, hf_model_id: str, trust_remote_code: bool = False) -> "AutoBridge":
 +        """
 +        Create a config-only AutoBridge by synthesizing an HF config from a Megatron checkpoint.
 +
@@ -432,6 +177,9 @@ index f11f1081..4c95163e 100644
 +            megatron_path: Directory path where the Megatron checkpoint is stored
 +            hf_model_id: HuggingFace model ID or path to model directory
 +                Examples: "meta-llama/Meta-Llama-3-8B", "./my_model"
++            trust_remote_code: Whether to trust remote code when loading config.
++                Defaults to False for security. Set to True only for models that
++                require custom modeling code from the repository.
 +
 +        Returns:
 +            AutoBridge: Bridge instance configured for the architecture
@@ -463,7 +211,12 @@ index f11f1081..4c95163e 100644
 +
 +        # 1. Load config from both sides
 +        megatron_cfg, _ = load_model_config(str(run_config.parent))
-+        hf_cfg = AutoConfig.from_pretrained(hf_model_id, trust_remote_code=True)
++        if trust_remote_code:
++            logger.warning(
++                "Loading a model with trust_remote_code=True allows arbitrary code execution "
++                "from the model repository. Only use this with models you trust."
++            )
++        hf_cfg = AutoConfig.from_pretrained(hf_model_id, trust_remote_code=trust_remote_code)
 +        # 2. Translate Megatron config -> HF, conforming to reference config
 +        bridge = cls.from_hf_config(hf_cfg)
 +        megatron_hf_cfg_dict = bridge._model_bridge.megatron_to_hf_config(megatron_cfg)
@@ -478,7 +231,42 @@ index f11f1081..4c95163e 100644
      @classmethod
      def from_hf_config(cls, config: PretrainedConfig) -> "AutoBridge":
          """
-@@ -546,6 +608,9 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -249,10 +319,33 @@ class AutoBridge(Generic[MegatronModelT]):
+         """
+         # First load just the config to check architecture support
+         # Use thread-safe config loading to prevent race conditions
+-        config = safe_load_config_with_retry(path, trust_remote_code=kwargs.get("trust_remote_code", False))
++        config_kwargs = dict(kwargs)
++        trust_remote_code = bool(config_kwargs.pop("trust_remote_code", False))
++        if trust_remote_code:
++            logger.warning(
++                "Loading a model with trust_remote_code=True allows arbitrary code execution "
++                "from the model repository. Only use this with models you trust."
++            )
++        config = safe_load_config_with_retry(path, trust_remote_code=trust_remote_code, **config_kwargs)
+ 
+         cls._validate_config(config, str(path))
+ 
++        # Transformers 5.0+ changed `rope_scaling` to a property whose setter
++        # does `self.rope_parameters = value`, replacing the entire dict and
++        # dropping any fields (e.g. `rope_theta`) that were set during initial
++        # construction.  When a `rope_scaling` override is passed as a kwarg,
++        # `PretrainedConfig.from_dict` applies it via `setattr` *after* the
++        # initial construction, so those fields are silently lost and Megatron
++        # falls back to defaults (e.g. `rotary_base=10000`).  Pre-populate the
++        # override dict with all base-config rope fields so the setter
++        # preserves them.
++        if "rope_scaling" in kwargs and isinstance(kwargs["rope_scaling"], dict):
++            base_rope = getattr(config, "rope_scaling", None)
++            if isinstance(base_rope, dict):
++                for key, value in base_rope.items():
++                    if key not in kwargs["rope_scaling"]:
++                        kwargs["rope_scaling"][key] = value
++
+         try:
+             return cls(PreTrainedCausalLM.from_pretrained(path, **kwargs))
+         except Exception as e:
+@@ -546,6 +639,9 @@ class AutoBridge(Generic[MegatronModelT]):
          modeling files (e.g., modeling_*.py, configuration_*.py) will be preserved
          to ensure the saved model can be loaded properly.
  
@@ -488,7 +276,7 @@ index f11f1081..4c95163e 100644
          Args:
              model: Megatron model instance or list of instances
              path: Directory path to save the model
-@@ -577,29 +642,58 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -577,29 +673,58 @@ class AutoBridge(Generic[MegatronModelT]):
              saves the configuration files, while weight saving is coordinated
              across all ranks.
          """
@@ -498,11 +286,6 @@ index f11f1081..4c95163e 100644
 -                "AutoBridge.from_hf_config() creates a config-only bridge; "
 -                "use AutoBridge.from_hf_pretrained(...) instead."
 -            )
--
--        # Get bridge-level ADDITIONAL_FILE_PATTERNS if configured
--        additional_files = None
--        if hasattr(self._model_bridge, "ADDITIONAL_FILE_PATTERNS") and self._model_bridge.ADDITIONAL_FILE_PATTERNS:
--            additional_files = self._model_bridge.ADDITIONAL_FILE_PATTERNS
 +        if not isinstance(self.hf_pretrained, (PreTrainedCausalLM, PretrainedConfig)):
 +            raise ValueError("save_hf_pretrained requires a pretrained HuggingFace model or config.")
 +        is_config_only = isinstance(self.hf_pretrained, PretrainedConfig)
@@ -540,6 +323,11 @@ index f11f1081..4c95163e 100644
 +                            exc,
 +                        )
  
+-        # Get bridge-level ADDITIONAL_FILE_PATTERNS if configured
+-        additional_files = None
+-        if hasattr(self._model_bridge, "ADDITIONAL_FILE_PATTERNS") and self._model_bridge.ADDITIONAL_FILE_PATTERNS:
+-            additional_files = self._model_bridge.ADDITIONAL_FILE_PATTERNS
+-
 -        if dist.is_available() and dist.is_initialized():
 -            # Distributed training, only rank 0 saves artifacts
 -            if dist.get_rank() == 0:
@@ -565,7 +353,7 @@ index f11f1081..4c95163e 100644
  
          self.save_hf_weights(
              model,
-@@ -701,7 +795,34 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -701,7 +826,34 @@ class AutoBridge(Generic[MegatronModelT]):
                  save_every_n_ranks=save_every_n_ranks,
              )
          else:
@@ -601,7 +389,7 @@ index f11f1081..4c95163e 100644
  
          # Save quantizer/amax sidecar after the main generator is consumed (rank 0 only).
          if quant_tensors:
-@@ -896,9 +1017,14 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -896,9 +1048,14 @@ class AutoBridge(Generic[MegatronModelT]):
          megatron_model = bridge.to_megatron_model(wrap_with_ddp=False, use_cpu_initialization=True)
  
          # Save as Megatron checkpoint
@@ -617,7 +405,7 @@ index f11f1081..4c95163e 100644
          bridge.save_megatron_model(
              megatron_model,
              megatron_path,
-@@ -921,8 +1047,9 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -921,8 +1078,9 @@ class AutoBridge(Generic[MegatronModelT]):
          This is a convenience method that loads a Megatron checkpoint and
          exports it to HuggingFace format. This is useful for sharing trained
          models or deploying them with HuggingFace inference tools.
@@ -629,7 +417,7 @@ index f11f1081..4c95163e 100644
  
          Args:
              megatron_path: Directory path where the Megatron checkpoint is stored
-@@ -941,7 +1068,6 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -941,7 +1099,6 @@ class AutoBridge(Generic[MegatronModelT]):
              ...     "./megatron_checkpoints/my_model",
              ...     "./hf_exports/my_model"
              ... )
@@ -637,7 +425,7 @@ index f11f1081..4c95163e 100644
              >>> # Export with specific settings
              >>> bridge.export_ckpt(
              ...     "./megatron_checkpoints/my_model",
-@@ -953,12 +1079,6 @@ class AutoBridge(Generic[MegatronModelT]):
+@@ -953,12 +1110,6 @@ class AutoBridge(Generic[MegatronModelT]):
              >>> from transformers import AutoModelForCausalLM
              >>> hf_model = AutoModelForCausalLM.from_pretrained("./hf_exports/my_model")
          """
@@ -650,8 +438,16 @@ index f11f1081..4c95163e 100644
          try:
              from megatron.bridge.training.model_load_save import temporary_distributed_context
          except ImportError:
+@@ -1046,6 +1197,7 @@ class AutoBridge(Generic[MegatronModelT]):
+                     peft_class = VLMLoRA
+                 allowed_keys = {
+                     "target_modules",
++                    "exclude_modules",
+                     "dim",
+                     "alpha",
+                     "dropout",
 diff --git a/src/megatron/bridge/models/conversion/model_bridge.py b/src/megatron/bridge/models/conversion/model_bridge.py
-index ddd3d31f..3246396d 100644
+index ddd3d31f..99bc4a2b 100644
 --- a/src/megatron/bridge/models/conversion/model_bridge.py
 +++ b/src/megatron/bridge/models/conversion/model_bridge.py
 @@ -34,9 +34,7 @@ from typing import (
@@ -727,15 +523,6 @@ index ddd3d31f..3246396d 100644
          )
  
      def hf_config_to_provider_kwargs(self, hf_config) -> dict:
-@@ -373,7 +364,7 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
-             else:
-                 value = getattr(hf_config, hf_name, None)
-                 has_value = hasattr(hf_config, hf_name)
--            if has_value:
-+            if has_value and megatron_name not in provider_kwargs:
-                 provider_kwargs[megatron_name] = value
- 
-         # Extract rotary_base via compat function (handles both legacy rope_theta
 @@ -391,33 +382,41 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
          is_mla_provider = self.PROVIDER_CLASS is not None and issubclass(self.PROVIDER_CLASS, MLAModelProvider)
          rope_scaling = getattr(hf_config, "rope_scaling", None)
@@ -811,24 +598,18 @@ index ddd3d31f..3246396d 100644
  
          hf_config = hf_pretrained.config
  
-@@ -470,18 +470,25 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -470,18 +470,21 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
  
          # Use specified provider class, defaulting to GPTModelProvider
          provider_class = self.PROVIDER_CLASS if self.PROVIDER_CLASS is not None else GPTModelProvider
--        provider = provider_class(**provider_kwargs)
--
++        is_mla_provider = issubclass(provider_class, MLAModelProvider)
+         provider = provider_class(**provider_kwargs)
+ 
 -        # All models that flow through the base provider_bridge use RoPE.
 -        # YARN is already handled above (hf_config_to_provider_kwargs sets
 -        # position_embedding_type="yarn"), so we only need to guard against
 -        # overwriting it here.  Every other rope_type value (None, "default",
 -        # "llama3", "longrope", …) means plain RoPE.
-+        is_mla_provider = issubclass(provider_class, MLAModelProvider)
-+        # Filter kwargs to only fields the provider dataclass accepts, so that MLA-only None
-+        # values (q_lora_rank, kv_lora_rank, …) are silently dropped for non-MLA providers
-+        # while still being passed through for MLA providers that declare them as fields.
-+        valid_fields = provider_class.__dataclass_fields__
-+        provider = provider_class(**{k: v for k, v in provider_kwargs.items() if k in valid_fields})
-+
 +        # Determine position_embedding_type from HF rope_scaling.
 +        # For GPT providers: rope_type=="yarn" → "yarn"; everything else → "rope".
 +        # For MLA providers: always "rope" — YaRN scaling parameters are applied
@@ -845,120 +626,11 @@ index ddd3d31f..3246396d 100644
              provider.position_embedding_type = "rope"
  
          # Apply MLA rope params via setattr (for MLA models like DeepSeek, Kimi)
-@@ -721,6 +728,70 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
-         """
-         return converted_weights_dict
- 
-+    def _accumulate_grouped_export(
-+        self,
-+        task: "WeightConversionTask",
-+        converted_weights_dict: Dict[str, torch.Tensor],
-+        model_config,
-+        grouped_buffers: Dict[str, Dict[int, torch.Tensor]],
-+        hf_state_dict: Mapping[str, torch.Tensor],
-+    ) -> Optional[Dict[str, torch.Tensor]]:
-+        """Accumulate per-expert weights for grouped export, return merged result when complete.
-+
-+        For fused-expert MoE models where one HF tensor contains all experts, this method
-+        collects individual expert weights produced by per-expert ``megatron_to_hf`` calls
-+        and returns the stacked result once all experts have been accumulated.
-+
-+        Returns:
-+            Merged weights dict when the group is complete, ``None`` otherwise.
-+        """
-+        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
-+
-+        group_key = task.mapping.group_key
-+        if group_key not in grouped_buffers:
-+            grouped_buffers[group_key] = {}
-+
-+        ep_size = parallel_state.get_expert_model_parallel_world_size()
-+        num_experts = model_config.num_moe_experts
-+        experts_per_rank = num_experts // ep_size
-+
-+        try:
-+            local_expert_number = extract_expert_number_from_param(task.param_name) % experts_per_rank
-+        except ValueError:
-+            return None
-+
-+        for _, value in converted_weights_dict.items():
-+            if ep_size == 1:
-+                grouped_buffers[group_key][local_expert_number] = value
-+            else:
-+                if value.ndim > 0 and value.shape[0] == ep_size:
-+                    for i in range(ep_size):
-+                        global_expert_number = local_expert_number + (i * experts_per_rank)
-+                        grouped_buffers[group_key][global_expert_number] = value[i]
-+                else:
-+                    grouped_buffers[group_key][local_expert_number] = value
-+
-+        if len(grouped_buffers[group_key]) == num_experts:
-+            merged = torch.stack([grouped_buffers[group_key][i] for i in range(num_experts)], dim=0)
-+
-+            if getattr(task.mapping, "transpose_on_export", False):
-+                if group_key in hf_state_dict:
-+                    # Adaptive: only transpose when the stacked shape doesn't match the original HF
-+                    # shape but the transposed shape does.  This handles configurations where the
-+                    # per-expert weight is already in [out, in] (PyTorch) rather than [in, out]
-+                    # (TE) layout — e.g. when explicit_expert_comm=False (etp=1, ep=1).
-+                    expected = tuple(hf_state_dict[group_key].shape)
-+                    transposed = merged.transpose(-1, -2).contiguous()
-+                    if tuple(merged.shape) != expected and tuple(transposed.shape) == expected:
-+                        merged = transposed
-+                else:
-+                    merged = merged.transpose(-1, -2).contiguous()
-+
-+            del grouped_buffers[group_key]
-+            return {group_key: merged}
-+
-+        return None
-+
-     def load_weights_hf_to_megatron(
-         self,
-         hf_pretrained: HFPreTrained,
-@@ -784,12 +855,20 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -977,7 +980,14 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
          hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
  
-         description = f"Loading from {hf_pretrained.model_name_or_path}"
-+        _hf_import_cache: Dict[str, torch.Tensor] = {}
-         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
-             # None means megatron module not on current rank, skip if this task is not going to happen
-             if task.megatron_module is None:
-                 continue
--            # 1) Fetch source tensor(s) from HF state dict
--            hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
-+            # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
-+            hf_param_key = str(task.mapping.hf_param)
-+            is_grouped = getattr(task.mapping, "is_grouped_export", False)
-+            if is_grouped and hf_param_key in _hf_import_cache:
-+                hf_weights = _hf_import_cache[hf_param_key]
-+            else:
-+                hf_weights = self.maybe_modify_loaded_hf_weight(task.mapping.hf_param, hf_state_dict)
-+                if is_grouped:
-+                    _hf_import_cache[hf_param_key] = hf_weights
- 
-             # 2) Delegate conversion & distribution to the bridge
-             converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
-@@ -976,15 +1055,36 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
- 
-         hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state if hasattr(hf_pretrained, "state") else {}
- 
-+        # Pre-compute expected expert counts for grouped export mappings
-+        _grouped_task_counts: Dict[str, int] = {}
-+        for task in megatron_to_hf_tasks:
-+            if task is not None and getattr(task.mapping, "is_grouped_export", False):
-+                gk = task.mapping.group_key
-+                _grouped_task_counts[gk] = _grouped_task_counts.get(gk, 0) + 1
-+        _grouped_buffers: Dict[str, Dict[int, torch.Tensor]] = {}
-+
          for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
 -            converted_weights_dict = task.mapping.megatron_to_hf(task.param_weight, task.megatron_module)
--            converted_weights_dict = self.maybe_modify_converted_hf_weight(
--                task,
--                converted_weights_dict,
--                hf_state_dict,
--            )  # dict will be none except for one expert;
--            # All ranks get the full tensor
 +            megatron_weights = task.param_weight
 +            megatron_module = task.megatron_module
 +            if self._should_skip_mtp_duplicate_embedding_export(task, megatron_model):
@@ -967,34 +639,10 @@ index ddd3d31f..3246396d 100644
 +
 +            converted_weights_dict = task.mapping.megatron_to_hf(megatron_weights, megatron_module)
 +
-+            # --- Grouped export path: accumulate per-expert weights, yield when complete ---
-+            if getattr(task.mapping, "is_grouped_export", False):
-+                merged_result = self._accumulate_grouped_export(
-+                    task, converted_weights_dict, model_config, _grouped_buffers, hf_state_dict
-+                )
-+                if merged_result is not None:
-+                    for hf_name, tensor in merged_result.items():
-+                        yield HFWeightTuple(hf_name, tensor.cpu() if cpu else tensor, task.param_name)
-+                continue
- 
-+            # --- Standard export path ---
-+            # Merge LoRA before maybe_modify: post-quantize base (e.g.
-+            # INT4-packed) can't absorb an fp32 `linear_out @ linear_in` delta.
-             adapter_tasks = None
-             if merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
-                 task_global_base_prefix, _, _ = task.global_param_name.partition(".to_wrap.weight")
-@@ -998,11 +1098,22 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
-                     adapter_weights,
-                 )
- 
-+            converted_weights_dict = self.maybe_modify_converted_hf_weight(
-+                task,
-+                converted_weights_dict,
-+                hf_state_dict,
-+            )  # dict will be none except for one expert;
-+            # All ranks get the full tensor
-+
-             for hf_name, tensor in converted_weights_dict.items():
+             converted_weights_dict = self.maybe_modify_converted_hf_weight(
+                 task,
+                 converted_weights_dict,
+@@ -1002,7 +1012,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                  final_tensor = tensor.cpu() if cpu else tensor
  
                  if not merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
@@ -1007,7 +655,7 @@ index ddd3d31f..3246396d 100644
  
                  # Handle tied embeddings case
                  # TODO(yuya): fix this hard coded naming
-@@ -1015,6 +1126,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1015,6 +1029,9 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                          expected_keys = hf_pretrained.state.source.get_all_keys()
                          if "lm_head.weight" in expected_keys:
                              yield HFWeightTuple("lm_head.weight", final_tensor.clone().detach(), task.param_name)
@@ -1017,7 +665,7 @@ index ddd3d31f..3246396d 100644
                  elif embeddings_are_tied and hf_name == "lm_head.weight":
                      # This should not happen when embeddings are tied - assert error
                      raise ValueError(
-@@ -1063,8 +1177,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1063,8 +1080,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
      def dtype_from_str(self, dtype: str) -> torch.dtype:
          """Convert a string precision identifier to equivalent torch dtype.
  
@@ -1028,7 +676,7 @@ index ddd3d31f..3246396d 100644
  
          Args:
              dtype (str): String representation of dtype (e.g., "float16", "fp16",
-@@ -1072,27 +1186,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1072,27 +1089,12 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
  
          Returns:
              torch.dtype: Corresponding PyTorch dtype (defaults to float32 if unknown).
@@ -1061,7 +709,7 @@ index ddd3d31f..3246396d 100644
              return torch.float32
  
      def make_vocab_size_divisible_by(self, vocab_size: int) -> int:
-@@ -1194,6 +1293,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1194,6 +1196,29 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                  if hasattr(unwrapped_model, "output_layer"):
                      unwrapped_model.output_layer.weight.data.copy_(embd_weights)
  
@@ -1091,7 +739,7 @@ index ddd3d31f..3246396d 100644
      def build_conversion_tasks(
          self,
          hf_pretrained: HFPreTrained,
-@@ -1208,11 +1330,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1208,11 +1233,11 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
          populated.
          """
  
@@ -1106,7 +754,7 @@ index ddd3d31f..3246396d 100644
  
          mapping_registry = self.mapping_registry()
          unwrapped_model = unwrap_model(megatron_model)[0]
-@@ -1249,8 +1371,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
+@@ -1249,8 +1274,8 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
                      logger.warning(f"WARNING: No mapping found for megatron_param: {global_name}")
                      continue
  
@@ -1117,7 +765,7 @@ index ddd3d31f..3246396d 100644
                      if isinstance(mapping.hf_param, str):
                          if mapping.hf_param not in hf_keys:
                              logger.warning(f"WARNING: Can't find {mapping.hf_param} in hf_keys")
-@@ -1444,7 +1566,7 @@ def register_bridge_implementation(
+@@ -1444,7 +1469,7 @@ def register_bridge_implementation(
      ) -> Iterable[HFWeightTuple]:
          bridge = bridge_class()
  
@@ -1126,6 +774,1348 @@ index ddd3d31f..3246396d 100644
          bridge.hf_config = hf_pretrained.config if hasattr(hf_pretrained, "config") else hf_pretrained
  
          return bridge.stream_weights_megatron_to_hf(
+diff --git a/src/megatron/bridge/models/conversion/param_mapping.py b/src/megatron/bridge/models/conversion/param_mapping.py
+index a0421273..94038b5d 100644
+--- a/src/megatron/bridge/models/conversion/param_mapping.py
++++ b/src/megatron/bridge/models/conversion/param_mapping.py
+@@ -34,6 +34,7 @@ from megatron.bridge.models.conversion.utils import (
+     is_modelopt_dynamic_module,
+     remove_non_pickleables,
+ )
++from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+ 
+ 
+ WeightType = TypeVar("WeightType", torch.Tensor, Dict[str, torch.Tensor])
+@@ -530,7 +531,8 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
+         torch.distributed.all_gather(gathered, tensor, group=self.tp_group)
+         return gathered
+ 
+-    def _count_wildcard_groups(self, pattern: str) -> int:
++    @staticmethod
++    def _count_wildcard_groups(pattern: str) -> int:
+         """Count the number of wildcard capture groups in a pattern.
+ 
+         Args:
+@@ -557,7 +559,13 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
+         return count
+ 
+     def _validate_patterns(self):
+-        """Validate wildcard consistency between patterns."""
++        """Validate wildcard consistency between patterns.
++
++        Skipped automatically for grouped-export mappings where the megatron
++        side intentionally has more wildcards than the HF side.
++        """
++        if getattr(self, "is_grouped_export", False):
++            return
+         megatron_param_wildcards = self._count_wildcard_groups(self.megatron_param)
+         if isinstance(self.hf_param, str):
+             hf_param_wildcards = self._count_wildcard_groups(self.hf_param)
+@@ -673,13 +681,8 @@ class MegatronParamMapping(ABC, Generic[WeightType]):
+             num_experts_per_rank = num_experts // self.ep_size
+             num_experts_per_rank = self.broadcast_obj_from_pp_rank(num_experts_per_rank, "num_experts_per_rank")
+ 
+-        # Extract local expert number from parameter name
+-        # Handle both .weight and .bias suffixes
+-        local_expert_number = None
+-        for key in (".weight", ".bias"):
+-            if key in self.megatron_param:
+-                global_expert_number = int(self.megatron_param.split(key)[-1])
+-                local_expert_number = global_expert_number % num_experts_per_rank
++        global_expert_number = extract_expert_number_from_param(self.megatron_param)
++        local_expert_number = global_expert_number % num_experts_per_rank
+ 
+         # Compute global expert numbers for all EP ranks
+         # use regex to replace the local expert number with the global expert number
+@@ -809,16 +812,17 @@ class ColumnParallelMapping(MegatronParamMapping[torch.Tensor]):
+             if hf_weights is None:
+                 raise ValueError("hf_weights should not be None on rank 0")
+ 
+-            # For MCore MambaMixer, A_log is initialized in FP32 but cast to BF16 when
+-            # saving ckpts, including the ckpt uploaded to HF. Without this cast,
+-            # self.scatter_to_tp_ranks will try to scatter the HF A_log weights in BF16 to
+-            # the Megatron tensor which is in FP32. This will error. So we cast before the scatter.
++            # Dtype may differ (e.g. MambaMixer A_log is FP32 in MCore but BF16
++            # in HF checkpoints). Cast to match the Megatron parameter so the
++            # scatter doesn't fail on dtype mismatch.
+             if hf_weights.dtype != target_param.dtype:
+-                logger.warning(
+-                    f"Dtype mismatch: HF weights are {hf_weights.dtype} but "
+-                    f"Megatron module expects {target_param.dtype}. "
+-                    f"Casting HF weights to {target_param.dtype}."
+-                )
++                if not getattr(ColumnParallelMapping, "_dtype_warned", False):
++                    ColumnParallelMapping._dtype_warned = True
++                    logger.warning(
++                        f"Dtype mismatch: HF weights are {hf_weights.dtype} but Megatron "
++                        f"module uses {target_param.dtype}. Casting all mismatched weights "
++                        f"to {target_param.dtype} (further warnings suppressed)."
++                    )
+                 hf_weights = hf_weights.to(target_param.dtype)
+ 
+             actual_dim0_size = hf_weights.shape[0]
+@@ -2233,6 +2237,183 @@ class RMSNorm2ZeroCenteredRMSNormMapping(AutoMapping):
+         return {key: value}
+ 
+ 
++def _align_expert_weight_to_shape(
++    weight: torch.Tensor,
++    target_shape: torch.Size,
++    name: str,
++    transpose_hint: bool | None = None,
++) -> torch.Tensor:
++    """Align an expert weight tensor to match a Megatron target shape.
++
++    Args:
++        weight: The weight tensor to align.
++        target_shape: The expected Megatron parameter shape.
++        name: Name used in error messages.
++        transpose_hint: If ``True``, transpose the last two dims unconditionally.
++            If ``False``, return as-is (assert shape already matches).
++            If ``None`` (default), auto-detect: returns the tensor directly if
++            the shape matches, transposes the last two dims if the transposed
++            shape matches, or raises ``ValueError`` otherwise. Auto-detection
++            is ambiguous for square 2-D weights — pass an explicit
++            ``transpose_hint`` in that case.
++    """
++    if transpose_hint is True:
++        result = weight.t().contiguous() if weight.ndim == 2 else weight.transpose(-1, -2).contiguous()
++        if tuple(result.shape) != tuple(target_shape):
++            raise ValueError(
++                f"Unexpected {name} shape after transpose: {tuple(result.shape)}; expected {tuple(target_shape)}."
++            )
++        return result
++    if transpose_hint is False:
++        if tuple(weight.shape) != tuple(target_shape):
++            raise ValueError(f"Unexpected {name} shape {tuple(weight.shape)}; expected {tuple(target_shape)}.")
++        return weight
++    # Auto-detect (transpose_hint is None)
++    if tuple(weight.shape) == tuple(target_shape):
++        return weight
++    if weight.ndim == 2 and weight.shape[0] == weight.shape[1]:
++        raise ValueError(
++            f"Cannot auto-detect transpose for square {name} weight {tuple(weight.shape)}; "
++            f"pass an explicit transpose_hint=True/False."
++        )
++    if weight.ndim == 2 and tuple(weight.t().shape) == tuple(target_shape):
++        return weight.t().contiguous()
++    raise ValueError(f"Unexpected {name} shape {tuple(weight.shape)}; expected {tuple(target_shape)}.")
++
++
++class _LooseGatedMLPMapping(GatedMLPMapping):
++    """GatedMLPMapping that skips wildcard validation for fused expert mappings."""
++
++    is_grouped_export = True
++
++
++class FusedExpertMapping(AutoMapping):
++    """Mapping for fused expert weights: 1 HF tensor [num_experts, ...] <-> N Megatron per-expert tensors.
++
++    HF side: Single tensor with shape [num_experts, ...]
++    Megatron side: Per-expert tensors (one param per expert)
++
++    Import: Extracts single expert from fused HF tensor, auto-aligns shape,
++            delegates to AutoMapping for TP distribution.
++    Export: AutoMapping handles TP/EP gathering per expert, then the conversion
++            loop merges all experts via the ``is_grouped_export`` protocol.
++
++    Replaces per-model expert mapping classes and eliminates the need for
++    ``maybe_modify_converted_hf_weight`` / ``hf_weights_cache`` on bridges.
++    """
++
++    is_grouped_export = True
++
++    def __init__(
++        self,
++        megatron_param: str,
++        hf_param: str,
++        permute_dims: Optional[Tuple[int, ...]] = None,
++        transpose_on_export: bool = False,
++    ):
++        super().__init__(megatron_param, hf_param, permute_dims)
++        self.allow_hf_name_mismatch = True
++        self.transpose_on_export = transpose_on_export
++
++    @property
++    def group_key(self) -> str:
++        """Tasks sharing the same group_key are merged during export."""
++        return self.hf_param
++
++    def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
++        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
++
++        expert_idx = extract_expert_number_from_param(self.megatron_param)
++        expert_weight = hf_weights[expert_idx] if hf_weights.ndim >= 3 else hf_weights
++        # Pass the full (unsharded) expert weight directly to AutoMapping, which handles
++        # TP scatter. We must NOT align against target_param.shape here because that shape
++        # is already TP-sharded and would fail for TP > 1.
++        return super().hf_to_megatron(expert_weight, megatron_module)
++
++
++class FusedGatedExpertMapping(AutoMapping):
++    """Mapping for fused gated expert weights (gate+up projection).
++
++    HF side: Single tensor with shape [num_experts, 2*intermediate, hidden]
++    Megatron side: Per-expert linear_fc1 tensors (with gate+up interleaved)
++
++    Import: Extracts single expert, splits into gate+up, delegates to
++            GatedMLPMapping for interleaved TP distribution.
++    Export: GatedMLPMapping handles TP/EP gathering, gate+up are fused back,
++            conversion loop merges all experts via the ``is_grouped_export`` protocol.
++    """
++
++    is_grouped_export = True
++
++    def __init__(self, megatron_param: str, hf_param: str, permute_dims: Optional[Tuple[int, ...]] = None):
++        super().__init__(megatron_param, hf_param, permute_dims)
++        self.allow_hf_name_mismatch = True
++        self._gated_mapping = _LooseGatedMLPMapping(
++            megatron_param=self.megatron_param,
++            gate=f"{self.hf_param}.gate",
++            up=f"{self.hf_param}.up",
++        )
++
++    @property
++    def group_key(self) -> str:
++        """Tasks sharing the same group_key are merged during export."""
++        return self.hf_param
++
++    def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
++        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
++
++        expert_idx = extract_expert_number_from_param(self.megatron_param)
++        expert_weight = hf_weights[expert_idx] if hf_weights.ndim >= 3 else hf_weights
++
++        normalized_param = self._normalize_expert_param_name(self.megatron_param)
++        _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
++        target_shape = target_param.shape
++
++        if target_shape[0] % 2 != 0:
++            raise ValueError(f"Expected even fused dim for {self.megatron_param}, got {target_shape}.")
++
++        gate_target_shape = (target_shape[0] // 2, target_shape[1])
++        # target_shape is the TP-sharded Megatron shape; compute the full (unsharded) shapes
++        # so that _align_expert_weight_to_shape can correctly match the raw HF weights.
++        # _gated_mapping.hf_to_megatron is responsible for TP scatter.
++        gate_full_shape = (gate_target_shape[0] * self.tp_size, target_shape[1])
++        gate_up_full_shape = (gate_full_shape[0] * 2, target_shape[1])
++
++        if expert_weight.ndim == 3 and expert_weight.shape[0] == 2:
++            gate = _align_expert_weight_to_shape(expert_weight[0], gate_full_shape, "gate")
++            up = _align_expert_weight_to_shape(expert_weight[1], gate_full_shape, "up")
++        else:
++            expert_weight = _align_expert_weight_to_shape(expert_weight, gate_up_full_shape, "gate_up")
++            gate, up = torch.chunk(expert_weight, 2, dim=0)
++
++        return self._gated_mapping.hf_to_megatron({"gate": gate, "up": up}, megatron_module)
++
++    def megatron_to_hf(
++        self,
++        megatron_weights: Optional[torch.Tensor],
++        megatron_module: Optional[nn.Module],
++    ) -> Dict[str, torch.Tensor]:
++        converted = self._gated_mapping.megatron_to_hf(megatron_weights, megatron_module)
++        if not converted:
++            return {}
++
++        fused: Dict[str, torch.Tensor] = {}
++        for name, tensor in converted.items():
++            if not name.endswith(".gate"):
++                continue
++            base_name = name[: -len(".gate")]
++            up_tensor = converted.get(f"{base_name}.up")
++            if up_tensor is None:
++                continue
++            concat_dim = 0 if tensor.ndim == 2 else 1
++            fused[base_name] = torch.cat([tensor, up_tensor], dim=concat_dim)
++        return fused
++
++    def resolve(self, captures: Tuple[str, ...]) -> "MegatronParamMapping":
++        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
++        return type(self)(resolved_megatron_param, resolved_hf_param, self.permute_dims)
++
++
+ def merge_qkv_biases(config: TransformerConfig, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+     """Merge separate Q, K, V bias vectors into Megatron's interleaved QKV format.
+ 
+@@ -2388,13 +2569,19 @@ def merge_qkv_weights(provider: TransformerConfig, q: torch.Tensor, k: torch.Ten
+ 
+ 
+ def split_qkv_weights(
+-    provider: TransformerConfig, qkv: torch.Tensor
++    provider: TransformerConfig,
++    qkv: torch.Tensor,
++    feature_dim: Optional[int] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Split Megatron's interleaved QKV tensor into separate Q, K, V matrices.
+ 
+     Args:
+         provider (TransformerConfig): Model configuration provider.
+         qkv (torch.Tensor): Interleaved QKV weights in Megatron format.
++        feature_dim: Trailing tensor dimension used for reshape/split.
++            Defaults to ``provider.hidden_size`` for base weights, but LoRA
++            paths can pass the adapter rank here to bypass the FP8 scale
++            inference logic.
+ 
+     Returns:
+         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Tuple of (Q, K, V)
+@@ -2415,9 +2602,42 @@ def split_qkv_weights(
+     if is_bias:
+         hidden_size = 1
+         qkv_reshaped = qkv.view(qkv_total_dim, head_size)
+-    else:
+-        hidden_size = qkv.shape[-1]
++    elif feature_dim is not None:
++        # Explicit feature_dim (e.g. LoRA rank) — use it directly, no FP8 inference.
++        hidden_size = feature_dim
+         qkv_reshaped = qkv.view(qkv_total_dim, head_size, hidden_size)
++    else:
++        # NOTE: For standard (BF16/FP16) weights, `head_size` is the usual kv_channels/head_dim.
++        # For blockwise FP8 scale tensors (e.g. Float8BlockwiseQTensor._rowwise_scale_inv),
++        # the last dim is typically compressed by a block-size factor (e.g. 4096 -> 32).
++        # In that case we infer a divisor and scale down `head_size` accordingly so that the
++        # same QKV slicing logic works for both weight tensors and their scale tensors.
++        orig_hidden_size = provider.hidden_size
++        current_last_dim = qkv.shape[-1]
++
++        # If last dim matches the model hidden size, it's a normal weight.
++        # Otherwise, treat it as a "scale-domain" tensor with compressed dims.
++        if current_last_dim == orig_hidden_size:
++            hidden_size = current_last_dim
++            scaled_head_size = head_size
++        else:
++            # Infer block divisor (e.g., 4096 / 32 = 128).
++            if orig_hidden_size % current_last_dim != 0:
++                raise ValueError(
++                    f"Cannot infer block divisor for qkv tensor: "
++                    f"provider.hidden_size={orig_hidden_size} is not divisible by qkv.shape[-1]={current_last_dim}"
++                )
++            divisor = orig_hidden_size // current_last_dim
++            if head_size % divisor != 0:
++                raise ValueError(
++                    f"Cannot scale head_size for qkv tensor: "
++                    f"head_size={head_size} is not divisible by divisor={divisor} "
++                    f"(provider.hidden_size={orig_hidden_size}, qkv.shape[-1]={current_last_dim})"
++                )
++            hidden_size = current_last_dim
++            scaled_head_size = head_size // divisor
++
++        qkv_reshaped = qkv.view(qkv_total_dim, scaled_head_size, hidden_size)
+ 
+     # Extract Q, K, V from interleaved pattern
+     q_slice = torch.cat(
+@@ -2513,12 +2733,26 @@ def merge_gdn_linear_weights(
+     return in_proj
+ 
+ 
+-def split_gdn_linear_weights(provider: TransformerConfig, in_proj: torch.Tensor, tp_size: int = 1) -> torch.Tensor:
+-    """Split GDN linear weights into QKVZ and BA."""
++def split_gdn_linear_weights(
++    provider: TransformerConfig,
++    in_proj: torch.Tensor,
++    tp_size: int = 1,
++    feature_dim: Optional[int] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Split GDN linear weights into QKVZ and BA.
++
++    Args:
++        provider: Transformer config with GDN dimensions.
++        in_proj: Packed in-proj tensor.
++        tp_size: Tensor-parallel world size used for packing layout.
++        feature_dim: Trailing tensor dimension used for reshape/split.
++            Defaults to ``provider.hidden_size`` for base weights, but LoRA
++            paths can pass the adapter rank here.
++    """
+ 
+     assert tp_size >= 1, f"tp_size must be greater than 0, but got {tp_size=}"
+ 
+-    hidden_size = provider.hidden_size
++    feature_dim = provider.hidden_size if feature_dim is None else feature_dim
+     qk_head_dim = provider.linear_key_head_dim
+     v_head_dim = provider.linear_value_head_dim
+     num_qk_heads = provider.linear_num_key_heads
+@@ -2527,7 +2761,7 @@ def split_gdn_linear_weights(provider: TransformerConfig, in_proj: torch.Tensor,
+     qk_dim_local_tp = qk_head_dim * num_qk_heads_local_tp
+     v_dim_local_tp = v_head_dim * num_v_heads_local_tp
+ 
+-    in_proj = in_proj.reshape(tp_size, -1, hidden_size)
++    in_proj = in_proj.reshape(tp_size, -1, feature_dim)
+     q, k, v, z, b, a = torch.split(
+         in_proj,
+         [
+@@ -2541,12 +2775,12 @@ def split_gdn_linear_weights(provider: TransformerConfig, in_proj: torch.Tensor,
+         dim=1,
+     )
+ 
+-    q, k, v, z, b, a = [weight.reshape(num_qk_heads, -1, hidden_size) for weight in [q, k, v, z, b, a]]
++    q, k, v, z, b, a = [weight.reshape(num_qk_heads, -1, feature_dim) for weight in [q, k, v, z, b, a]]
+     qkvz = torch.cat([q, k, v, z], dim=1)
+     ba = torch.cat([b, a], dim=1)
+ 
+-    qkvz = qkvz.reshape(-1, hidden_size)
+-    ba = ba.reshape(-1, hidden_size)
++    qkvz = qkvz.reshape(-1, feature_dim)
++    ba = ba.reshape(-1, feature_dim)
+ 
+     assert qkvz.numel() + ba.numel() == in_proj.numel(), (
+         f"QKVZBA weights are not correctly split, {qkvz.numel()=}, {ba.numel()=}, {in_proj.numel()=}"
+@@ -2619,6 +2853,7 @@ def _split_gdn_grouped_to_separate(
+     config: TransformerConfig,
+     qkvz: torch.Tensor,
+     ba: torch.Tensor,
++    feature_dim: Optional[int] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Convert head-grouped ``qkvz`` and ``ba`` tensors (as produced by
+     :func:`split_gdn_linear_weights`) back into four flat tensors.
+@@ -2626,7 +2861,7 @@ def _split_gdn_grouped_to_separate(
+     Returns:
+         Tuple of (qkv, z, b, a) where each tensor has a flat per-component layout.
+     """
+-    hidden_size = config.hidden_size
++    feature_dim = config.hidden_size if feature_dim is None else feature_dim
+     qk_head_dim = config.linear_key_head_dim
+     v_head_dim = config.linear_value_head_dim
+     num_qk_heads = config.linear_num_key_heads
+@@ -2635,31 +2870,31 @@ def _split_gdn_grouped_to_separate(
+ 
+     expected_qkvz_dim0 = num_qk_heads * (qk_head_dim * 2 + v_per_group * v_head_dim * 2)
+     expected_ba_dim0 = num_qk_heads * v_per_group * 2
+-    if qkvz.ndim != 2 or qkvz.shape[0] != expected_qkvz_dim0 or qkvz.shape[1] != hidden_size:
++    if qkvz.ndim != 2 or qkvz.shape[0] != expected_qkvz_dim0 or qkvz.shape[1] != feature_dim:
+         raise ValueError(
+-            f"qkvz shape mismatch: expected ({expected_qkvz_dim0}, {hidden_size}), got {tuple(qkvz.shape)}"
++            f"qkvz shape mismatch: expected ({expected_qkvz_dim0}, {feature_dim}), got {tuple(qkvz.shape)}"
+         )
+-    if ba.ndim != 2 or ba.shape[0] != expected_ba_dim0 or ba.shape[1] != hidden_size:
+-        raise ValueError(f"ba shape mismatch: expected ({expected_ba_dim0}, {hidden_size}), got {tuple(ba.shape)}")
++    if ba.ndim != 2 or ba.shape[0] != expected_ba_dim0 or ba.shape[1] != feature_dim:
++        raise ValueError(f"ba shape mismatch: expected ({expected_ba_dim0}, {feature_dim}), got {tuple(ba.shape)}")
+ 
+     # --- Split grouped QKVZ ---
+-    qkvz_g = qkvz.reshape(num_qk_heads, -1, hidden_size)
++    qkvz_g = qkvz.reshape(num_qk_heads, -1, feature_dim)
+     q_g, k_g, v_g, z_g = torch.split(
+         qkvz_g,
+         [qk_head_dim, qk_head_dim, v_per_group * v_head_dim, v_per_group * v_head_dim],
+         dim=1,
+     )
+-    q_flat = q_g.reshape(-1, hidden_size)
+-    k_flat = k_g.reshape(-1, hidden_size)
+-    v_flat = v_g.reshape(-1, hidden_size)
+-    z_flat = z_g.reshape(-1, hidden_size)
++    q_flat = q_g.reshape(-1, feature_dim)
++    k_flat = k_g.reshape(-1, feature_dim)
++    v_flat = v_g.reshape(-1, feature_dim)
++    z_flat = z_g.reshape(-1, feature_dim)
+     qkv = torch.cat([q_flat, k_flat, v_flat], dim=0)
+ 
+     # --- Split grouped BA ---
+-    ba_g = ba.reshape(num_qk_heads, -1, hidden_size)
++    ba_g = ba.reshape(num_qk_heads, -1, feature_dim)
+     b_g, a_g = torch.split(ba_g, [v_per_group, v_per_group], dim=1)
+-    b_flat = b_g.reshape(-1, hidden_size)
+-    a_flat = a_g.reshape(-1, hidden_size)
++    b_flat = b_g.reshape(-1, feature_dim)
++    a_flat = a_g.reshape(-1, feature_dim)
+ 
+     return qkv, z_flat, b_flat, a_flat
+ 
+diff --git a/src/megatron/bridge/models/conversion/peft_bridge.py b/src/megatron/bridge/models/conversion/peft_bridge.py
+index d101224f..663f088b 100644
+--- a/src/megatron/bridge/models/conversion/peft_bridge.py
++++ b/src/megatron/bridge/models/conversion/peft_bridge.py
+@@ -30,6 +30,8 @@ from megatron.bridge.models.conversion.param_mapping import (
+     ColumnParallelMapping,
+     ReplicatedMapping,
+     RowParallelMapping,
++    _split_gdn_grouped_to_separate,
++    split_gdn_linear_weights,
+     split_qkv_weights,
+ )
+ from megatron.bridge.models.conversion.utils import (
+@@ -67,6 +69,8 @@ MEGATRON_TO_HF_LORA_SUFFIX = {
+     ".linear_out.weight": ".lora_B.weight",
+ }
+ 
++GDN_IN_PROJ_KEYS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
++
+ 
+ @dataclass(frozen=True)
+ class AdapterWeightConversionTask:
+@@ -109,7 +113,7 @@ def _select_hf_base_param_name(base_mapping, adapter_key: Optional[str], expecte
+ 
+         # For fused qkv/gate_up case, we just need a placeholder here
+         value = next(iter(hf_param.values()))
+-        return value if value.endswith(expected_suffix) else None
++        return value if value.endswith(expected_suffix) or expected_suffix == ".weight" else None
+ 
+     return None
+ 
+@@ -242,6 +246,16 @@ class MegatronPeftBridge:
+         discovered = {token for name in names for token in required if token in name}
+         return discovered == required
+ 
++    def _is_gdn_in_proj_split(self, hf_weight_names: Iterable[str]) -> bool:
++        """Check whether the provided HF names correspond to split GDN in_proj weights."""
++
++        names = list(hf_weight_names)
++        if len(names) != 4:
++            return False
++        required = set(GDN_IN_PROJ_KEYS)
++        discovered = {token for name in names for token in required if token in name}
++        return discovered == required and all("linear_attn" in name for name in names)
++
+     def _is_fused_fc1_gate_up(
+         self,
+         base_hf_weight_names: Iterable[str],
+@@ -280,6 +294,14 @@ class MegatronPeftBridge:
+             return "v_proj"
+         return None
+ 
++    def _infer_gdn_in_proj_projection_from_name(self, hf_name: str) -> Optional[str]:
++        """Return in_proj_qkv/z/b/a identifier based on the HF name."""
++
++        for projection_key in GDN_IN_PROJ_KEYS:
++            if projection_key in hf_name:
++                return projection_key
++        return None
++
+     def _infer_hf_expert_idx(self, hf_name: str) -> Optional[int]:
+         """Return the expert index embedded in an HF MoE weight name."""
+ 
+@@ -296,9 +318,126 @@ class MegatronPeftBridge:
+         """Split a fused LoRA linear_out tensor for QKV adapters."""
+ 
+         model = megatron_model[0] if isinstance(megatron_model, list) else megatron_model
+-        q_out, k_out, v_out = split_qkv_weights(model.config, linear_out_weight)
++        # Pass the LoRA rank as feature_dim so split_qkv_weights doesn't
++        # mistake it for an FP8 compressed hidden_size.
++        feature_dim = linear_out_weight.shape[-1] if linear_out_weight.ndim == 2 else None
++        q_out, k_out, v_out = split_qkv_weights(model.config, linear_out_weight, feature_dim=feature_dim)
+         return {"q_proj": q_out, "k_proj": k_out, "v_proj": v_out}
+ 
++    def _split_gdn_in_proj_linear_out_weight(
++        self,
++        megatron_model: Union[MegatronModel, List[MegatronModel]],
++        linear_out_weight: torch.Tensor,
++    ) -> Dict[str, torch.Tensor]:
++        """Split a fused LoRA linear_out tensor for GDN in_proj adapters."""
++
++        model = megatron_model[0] if isinstance(megatron_model, list) else megatron_model
++        tp_size = parallel_state.get_tensor_model_parallel_world_size()
++        feature_dim = linear_out_weight.shape[1]
++        qkvz, ba = split_gdn_linear_weights(
++            model.config,
++            linear_out_weight,
++            tp_size=tp_size,
++            feature_dim=feature_dim,
++        )
++        qkv, z, b, a = _split_gdn_grouped_to_separate(model.config, qkvz, ba, feature_dim=feature_dim)
++        return {"in_proj_qkv": qkv, "in_proj_z": z, "in_proj_b": b, "in_proj_a": a}
++
++    def _build_lora_hf_names(self, base_hf_weight_names: List[str]) -> tuple[List[str], List[str]]:
++        """Build LoRA A/B names for a list of HF base parameter names."""
++
++        linear_in_hf_names = [
++            self._make_lora_param_name(base_name, ".linear_in.weight") for base_name in base_hf_weight_names
++        ]
++        linear_out_hf_names = [
++            self._make_lora_param_name(base_name, ".linear_out.weight") for base_name in base_hf_weight_names
++        ]
++        return linear_in_hf_names, linear_out_hf_names
++
++    def _collect_packed_expert_adapter_tensors(
++        self,
++        linear_in_tensor: torch.Tensor,
++        linear_out_tensor: torch.Tensor,
++        expert_linear_in_gathered: Optional[List[torch.Tensor]],
++        expert_linear_out_gathered: Optional[List[torch.Tensor]],
++        num_moe_experts: int,
++    ) -> tuple[List[torch.Tensor], List[torch.Tensor]]:
++        """Collect one LoRA A/B tensor per expert for grouped expert exports."""
++
++        per_expert_linear_in: List[torch.Tensor] = []
++        per_expert_linear_out: List[torch.Tensor] = []
++        if linear_in_tensor.ndim > 2 or linear_out_tensor.ndim > 2:
++            # Already carries local expert dim; concatenate across EP ranks if needed.
++            linear_in_all = (
++                torch.cat(expert_linear_in_gathered, dim=0)
++                if expert_linear_in_gathered is not None
++                else linear_in_tensor
++            )
++            linear_out_all = (
++                torch.cat(expert_linear_out_gathered, dim=0)
++                if expert_linear_out_gathered is not None
++                else linear_out_tensor
++            )
++            per_expert_linear_in = list(linear_in_all)
++            per_expert_linear_out = list(linear_out_all)
++            return per_expert_linear_in, per_expert_linear_out
++
++        for expert_idx in range(num_moe_experts):
++            per_expert_linear_in.append(
++                self._select_expert_adapter_weight(
++                    linear_in_tensor,
++                    expert_linear_in_gathered,
++                    expert_idx,
++                    num_moe_experts,
++                )
++            )
++            per_expert_linear_out.append(
++                self._select_expert_adapter_weight(
++                    linear_out_tensor,
++                    expert_linear_out_gathered,
++                    expert_idx,
++                    num_moe_experts,
++                )
++            )
++        return per_expert_linear_in, per_expert_linear_out
++
++    def _build_packed_expert_linear_out_by_base(
++        self,
++        megatron_model: List[MegatronModel],
++        base_hf_weight_names: List[str],
++        per_expert_linear_out: List[torch.Tensor],
++        is_expert: bool,
++    ) -> Dict[str, torch.Tensor]:
++        """Build per-base stacked LoRA-B tensors for packed grouped-expert export."""
++
++        if not per_expert_linear_out:
++            return {}
++
++        # Handle fused adapters (qkv/gate_up/gdn in_proj) by splitting per-expert then stacking.
++        per_base_linear_out = self._get_fused_adapter_linear_out_slices(
++            megatron_model,
++            base_hf_weight_names,
++            per_expert_linear_out[0],
++            is_expert=is_expert,
++        )
++        if per_base_linear_out is None:
++            stacked = torch.stack(per_expert_linear_out, dim=0)
++            return {base_name: stacked for base_name in base_hf_weight_names}
++
++        per_base_stacks: Dict[str, List[torch.Tensor]] = {name: [] for name in base_hf_weight_names}
++        for expert_out in per_expert_linear_out:
++            per_base = self._get_fused_adapter_linear_out_slices(
++                megatron_model,
++                base_hf_weight_names,
++                expert_out,
++                is_expert=is_expert,
++            )
++            assert per_base is not None, "Expected fused adapter split for expert LoRA"
++            for base_name in base_hf_weight_names:
++                per_base_stacks[base_name].append(per_base[base_name])
++
++        return {base_name: torch.stack(parts, dim=0) for base_name, parts in per_base_stacks.items()}
++
+     def _split_fused_fc1_linear_out_weight(
+         self,
+         linear_out_weight: torch.Tensor,
+@@ -661,6 +800,61 @@ class MegatronPeftBridge:
+             if is_grouped_expert:
+                 base_suffixes = self._get_grouped_expert_base_suffixes(num_moe_experts)
+ 
++            # If the HF base names don't include experts.N, emit packed expert weights
++            # (stacked along dim 0) once per HF name instead of duplicating per expert.
++            packed_expert = False
++            base_hf_weight_names: List[str] = []
++            if is_grouped_expert and base_suffixes:
++                base_hf_weight_names = self._get_base_hf_param_names_for_adapter(
++                    mapping_registry,
++                    adapter_task.global_base_prefix,
++                    adapter_task.adapter_key,
++                    base_suffixes[0],
++                )
++                if base_hf_weight_names and not any(
++                    re.search(r"experts\.(\d+)", name) for name in base_hf_weight_names
++                ):
++                    packed_expert = True
++
++            if packed_expert:
++                linear_in_hf_names, linear_out_hf_names = self._build_lora_hf_names(base_hf_weight_names)
++                per_expert_linear_in, per_expert_linear_out = self._collect_packed_expert_adapter_tensors(
++                    linear_in_tensor,
++                    linear_out_tensor,
++                    expert_linear_in_gathered,
++                    expert_linear_out_gathered,
++                    num_moe_experts,
++                )
++
++                if not per_expert_linear_in or not per_expert_linear_out:
++                    raise ValueError(
++                        f"Expected to find per-expert adapter weights for grouped expert "
++                        f"linear layer but none found, global_base_prefix={adapter_task.global_base_prefix}"
++                    )
++                linear_in_stacked = torch.stack(per_expert_linear_in, dim=0)
++                if cpu:
++                    linear_in_stacked = linear_in_stacked.cpu()
++
++                if adapter_task.adapter_key is None:
++                    linear_out_by_base = self._build_packed_expert_linear_out_by_base(
++                        megatron_model,
++                        base_hf_weight_names,
++                        per_expert_linear_out,
++                        is_expert=is_expert_linear(adapter_task.global_base_prefix),
++                    )
++                else:
++                    shared_linear_out = torch.stack(per_expert_linear_out, dim=0)
++                    linear_out_by_base = {base_name: shared_linear_out for base_name in base_hf_weight_names}
++
++                for index, base_name in enumerate(base_hf_weight_names):
++                    linear_out_stacked = linear_out_by_base[base_name]
++                    if cpu:
++                        linear_out_stacked = linear_out_stacked.cpu()
++                    yield HFWeightTuple(linear_in_hf_names[index], linear_in_stacked)
++                    yield HFWeightTuple(linear_out_hf_names[index], linear_out_stacked)
++
++                continue
++
+             for base_suffix in base_suffixes:
+                 current_linear_in_tensor = linear_in_tensor
+                 current_linear_out_tensor = linear_out_tensor
+@@ -689,11 +883,7 @@ class MegatronPeftBridge:
+                     adapter_task.adapter_key,
+                     base_suffix,
+                 )
+-                linear_in_hf_names = []
+-                linear_out_hf_names = []
+-                for base_name in base_hf_weight_names:
+-                    linear_in_hf_names.append(self._make_lora_param_name(base_name, ".linear_in.weight"))
+-                    linear_out_hf_names.append(self._make_lora_param_name(base_name, ".linear_out.weight"))
++                linear_in_hf_names, linear_out_hf_names = self._build_lora_hf_names(base_hf_weight_names)
+                 if adapter_task.adapter_key is None:
+                     # Handle fused adapters (e.g., gate/up or q/k/v) by splitting the fused tensor
+                     # into per-base slices keyed by the HF weight names.
+@@ -744,6 +934,16 @@ class MegatronPeftBridge:
+                 per_base[base_name] = qkv_linear_out_weights[projection_key]
+             return per_base
+ 
++        if self._is_gdn_in_proj_split(base_hf_weight_names):
++            gdn_linear_out_weights = self._split_gdn_in_proj_linear_out_weight(megatron_model, linear_out_tensor)
++            per_base = {}
++            for base_name in base_hf_weight_names:
++                projection_key = self._infer_gdn_in_proj_projection_from_name(base_name)
++                if projection_key is None:
++                    raise ValueError(f"Unknown GDN in_proj base weight name: {base_name}")
++                per_base[base_name] = gdn_linear_out_weights[projection_key]
++            return per_base
++
+         is_fused_fc1 = self._is_fused_fc1_gate_up(base_hf_weight_names, linear_out_tensor)
+         if is_fused_fc1:
+             gate_weight, up_weight = self._split_fused_fc1_linear_out_weight(
+@@ -770,6 +970,10 @@ class MegatronPeftBridge:
+     ) -> Dict[str, torch.Tensor]:
+         """Merge LoRA adapter weights back into the base tensor for HF export."""
+ 
++        if not converted_weights_dict:
++            # Nothing to merge on this rank (e.g., non-owning PP rank or filtered mapping).
++            return converted_weights_dict
++
+         if len(adapter_weights) > 1 and all(
+             w.adapter_key in ADAPTER_NAME_MAP.values() for w in adapter_weights if w.adapter_key
+         ):
+@@ -790,8 +994,41 @@ class MegatronPeftBridge:
+             expert_linear_in_gathered = self._gather_expert_adapter_weight(linear_in_weight)
+             expert_linear_out_gathered = self._gather_expert_adapter_weight(linear_out_weight)
+ 
+-        base_weight_shape = next(iter(converted_weights_dict.values())).shape
++        base_weight = next(iter(converted_weights_dict.values()))
++        base_weight_shape = base_weight.shape
+         weight_names = converted_weights_dict.keys()
++        if self._is_gdn_in_proj_split(weight_names):
++            # GDN in_proj LoRA is defined on the fused Megatron tensor; split it into
++            # the four HF tensors (qkv/z/b/a) before merging.
++            config = unwrap_model(megatron_model)[0].config
++            hidden_size = config.hidden_size
++            qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
++            v_dim = config.linear_value_head_dim * config.linear_num_value_heads
++            num_v_heads = config.linear_num_value_heads
++            fused_dim0 = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
++
++            base_device = base_weight.device
++            linear_out_on_base = (
++                linear_out_weight if linear_out_weight.device == base_device else linear_out_weight.to(base_device)
++            )
++            linear_in_on_base = (
++                linear_in_weight if linear_in_weight.device == base_device else linear_in_weight.to(base_device)
++            )
++            dummy_base = torch.zeros((fused_dim0, hidden_size), device=base_device, dtype=base_weight.dtype)
++            lora_weight = LoRAMerge().merge(dummy_base, linear_out_on_base, linear_in_on_base, alpha, dim)
++
++            tp_size = parallel_state.get_tensor_model_parallel_world_size()
++            qkvz, ba = split_gdn_linear_weights(config, lora_weight, tp_size=tp_size)
++            qkv, z, b, a = _split_gdn_grouped_to_separate(config, qkvz, ba)
++            gdn_slices = {"in_proj_qkv": qkv, "in_proj_z": z, "in_proj_b": b, "in_proj_a": a}
++
++            for hf_name, base_tensor in list(converted_weights_dict.items()):
++                projection_key = self._infer_gdn_in_proj_projection_from_name(hf_name)
++                if projection_key is None:
++                    raise ValueError(f"Unknown GDN in_proj weight name: {hf_name}")
++                converted_weights_dict[hf_name] = base_tensor + gdn_slices[projection_key]
++
++            return converted_weights_dict
+         is_fused_fc1 = self._is_fused_fc1_gate_up(weight_names, linear_out_weight, base_weight_shape)
+         is_fused_qkv = self._is_fused_qkv(weight_names) and not is_expert
+         qkv_linear_out_weights = (
+@@ -809,18 +1046,19 @@ class MegatronPeftBridge:
+             current_linear_out_weight = linear_out_weight
+             if is_grouped_expert:
+                 expert_idx = self._infer_hf_expert_idx(hf_name)
+-                current_linear_in_weight = self._select_expert_adapter_weight(
+-                    linear_in_weight,
+-                    expert_linear_in_gathered,
+-                    expert_idx,
+-                    num_moe_experts,
+-                )
+-                current_linear_out_weight = self._select_expert_adapter_weight(
+-                    linear_out_weight,
+-                    expert_linear_out_gathered,
+-                    expert_idx,
+-                    num_moe_experts,
+-                )
++                if expert_idx is not None:
++                    current_linear_in_weight = self._select_expert_adapter_weight(
++                        linear_in_weight,
++                        expert_linear_in_gathered,
++                        expert_idx,
++                        num_moe_experts,
++                    )
++                    current_linear_out_weight = self._select_expert_adapter_weight(
++                        linear_out_weight,
++                        expert_linear_out_gathered,
++                        expert_idx,
++                        num_moe_experts,
++                    )
+             if is_fused_fc1:
+                 if is_expert:
+                     fc1_gate_weight, fc1_up_weight = self._split_fused_fc1_linear_out_weight(
+@@ -915,18 +1153,19 @@ class MegatronPeftBridge:
+             linear_out_weight = target_adapter.linear_out_weight.weight
+             if is_grouped_expert:
+                 expert_idx = self._infer_hf_expert_idx(hf_name)
+-                linear_in_weight = self._select_expert_adapter_weight(
+-                    linear_in_weight,
+-                    expert_linear_in_gathered.get(target_adapter_key),
+-                    expert_idx,
+-                    num_moe_experts,
+-                )
+-                linear_out_weight = self._select_expert_adapter_weight(
+-                    linear_out_weight,
+-                    expert_linear_out_gathered.get(target_adapter_key),
+-                    expert_idx,
+-                    num_moe_experts,
+-                )
++                if expert_idx is not None:
++                    linear_in_weight = self._select_expert_adapter_weight(
++                        linear_in_weight,
++                        expert_linear_in_gathered.get(target_adapter_key),
++                        expert_idx,
++                        num_moe_experts,
++                    )
++                    linear_out_weight = self._select_expert_adapter_weight(
++                        linear_out_weight,
++                        expert_linear_out_gathered.get(target_adapter_key),
++                        expert_idx,
++                        num_moe_experts,
++                    )
+ 
+             merged_weight = self._merge_single_adapter_weight(
+                 base_weight,
+diff --git a/src/megatron/bridge/models/conversion/utils.py b/src/megatron/bridge/models/conversion/utils.py
+index fb2dea5d..f99df872 100644
+--- a/src/megatron/bridge/models/conversion/utils.py
++++ b/src/megatron/bridge/models/conversion/utils.py
+@@ -274,6 +274,18 @@ def get_causal_lm_class_name_via_auto_map(
+     return None
+ 
+ 
++def conform_config_to_reference(
++    hf_config_dict: dict[str, object], reference_config: dict[str, object]
++) -> dict[str, object]:
++    """Return a projected hf_config_dict onto the reference key set, imputing missing keys with reference values."""
++    reference_config_keys = set(reference_config.keys())
++    filtered_config_dict = {key: value for (key, value) in hf_config_dict.items() if key in reference_config_keys}
++    for key, value in reference_config.items():
++        if key not in filtered_config_dict:
++            filtered_config_dict[key] = value
++    return filtered_config_dict
++
++
+ def persistent_buffers(model: torch.nn.Module) -> Iterable[Tuple[str, torch.Tensor]]:
+     """Return an iterator over persistent module buffers, yielding both the name of the buffer as well as the buffer itself."""
+ 
+diff --git a/src/megatron/bridge/models/deepseek/common.py b/src/megatron/bridge/models/deepseek/common.py
+index f409c9ba..ccbc85ca 100644
+--- a/src/megatron/bridge/models/deepseek/common.py
++++ b/src/megatron/bridge/models/deepseek/common.py
+@@ -15,9 +15,13 @@
+ from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
+ 
+ 
+-def get_common_mapping_list() -> list:
++def get_common_mapping_list(hf_config=None) -> list:
+     """
+     Returns a list of common parameter mappings for the DeepSeek family of models.
++
++    Args:
++        hf_config: Optional HuggingFace config. If provided and contains MTP layers,
++                   MTP mappings will be included.
+     """
+     param_mappings = {
+         # Embed
+@@ -55,8 +59,6 @@ def get_common_mapping_list() -> list:
+         "decoder.layers.*.self_attention.linear_q_proj.weight": "model.layers.*.self_attn.q_proj.weight",
+     }
+ 
+-    # TODO: mtp layers
+-
+     mapping_list = []
+     # Convert each dictionary entry to AutoMapping(hf_param, megatron_param)
+     for megatron_param, hf_param in param_mappings.items():
+@@ -82,4 +84,68 @@ def get_common_mapping_list() -> list:
+         ]
+     )
+ 
++    if hf_config is not None:
++        # Add MTP mappings if config has MTP layers
++        num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
++        if num_mtp_layers > 0:
++            num_transformer_layers = hf_config.num_hidden_layers
++
++            for mtp_layer in range(num_mtp_layers):
++                # Add layer-specific mappings for MTP transformer layers
++                for megatron_param, hf_param in param_mappings.items():
++                    megatron_param_mtp = (
++                        megatron_param.replace(".*", ".*.mtp_model_layer")
++                        .replace("decoder", "mtp")
++                        .replace(".*", f".{mtp_layer}")
++                    )
++                    hf_param_mtp = hf_param.replace("layers.*", f"layers.{mtp_layer + num_transformer_layers}")
++                    mapping_list.append(AutoMapping(megatron_param=megatron_param_mtp, hf_param=hf_param_mtp))
++
++                # Add MTP-specific normalization and projection layers
++                mapping_list.extend(
++                    [
++                        AutoMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.enorm.weight",
++                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.enorm.weight",
++                        ),
++                        AutoMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.hnorm.weight",
++                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.hnorm.weight",
++                        ),
++                        AutoMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.eh_proj.weight",
++                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.eh_proj.weight",
++                        ),
++                        AutoMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.final_layernorm.weight",
++                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.shared_head.norm.weight",
++                        ),
++                        AutoMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.mtp_model_layer.mlp.router.expert_bias",
++                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.gate.e_score_correction_bias",
++                        ),
++                    ]
++                )
++
++                # Add MTP Gated MLP mappings
++                mapping_list.extend(
++                    [
++                        GatedMLPMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.mtp_model_layer.mlp.linear_fc1.weight",
++                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.gate_proj.weight",
++                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.up_proj.weight",
++                        ),
++                        GatedMLPMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.mtp_model_layer.mlp.shared_experts.linear_fc1.weight",
++                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.gate_proj.weight",
++                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.up_proj.weight",
++                        ),
++                        GatedMLPMapping(
++                            megatron_param=f"mtp.layers.{mtp_layer}.mtp_model_layer.mlp.experts.linear_fc1.weight*",
++                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
++                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
++                        ),
++                    ]
++                )
++
+     return mapping_list
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v2_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v2_bridge.py
+index 9f4fb09a..96498f8a 100644
+--- a/src/megatron/bridge/models/deepseek/deepseek_v2_bridge.py
++++ b/src/megatron/bridge/models/deepseek/deepseek_v2_bridge.py
+@@ -62,6 +62,7 @@ class DeepSeekV2Bridge(MegatronModelBridge):
+         provider.moe_permute_fusion = True
+ 
+         provider.apply_rope_fusion = False
++        provider.gradient_accumulation_fusion = True
+         provider.bias_activation_fusion = True
+         provider.bias_dropout_fusion = True
+         provider.cross_entropy_fusion_impl = "te"
+@@ -82,6 +83,44 @@ class DeepSeekV2Bridge(MegatronModelBridge):
+ 
+         return provider
+ 
++    @classmethod
++    def megatron_to_hf_config(cls, provider) -> dict:
++        hf_cfg = super().megatron_to_hf_config(provider)
++
++        # Megatron uses None="not set/disabled", but HF expects integers
++        hf_cfg["num_nextn_predict_layers"] = hf_cfg.get("num_nextn_predict_layers") or 0
++        hf_cfg["n_group"] = hf_cfg.get("n_group") or 1
++        hf_cfg["topk_group"] = hf_cfg.get("topk_group") or 1
++
++        # Reconstruct first_k_dense_replace from moe_layer_freq (count leading dense layers)
++        moe_layer_freq = getattr(provider, "moe_layer_freq", None)
++        if moe_layer_freq is not None and isinstance(moe_layer_freq, list):
++            first_k_dense_replace = 0
++            for val in moe_layer_freq:
++                if val == 0:
++                    first_k_dense_replace += 1
++                else:
++                    break
++            hf_cfg["first_k_dense_replace"] = first_k_dense_replace
++
++        # Reconstruct n_shared_experts from moe_shared_expert_intermediate_size / moe_ffn_hidden_size
++        shared_size = getattr(provider, "moe_shared_expert_intermediate_size", None)
++        moe_ffn = getattr(provider, "moe_ffn_hidden_size", None)
++        if shared_size is not None and moe_ffn is not None and moe_ffn > 0:
++            hf_cfg["n_shared_experts"] = shared_size // moe_ffn
++
++        return hf_cfg
++
++    def build_conversion_tasks(self, hf_pretrained, megatron_model):
++        """Override to store config before mapping_registry is called."""
++        # Store config on instance for use in mapping_registry
++        from transformers import PretrainedConfig
++
++        self._hf_config = hf_pretrained if isinstance(hf_pretrained, PretrainedConfig) else hf_pretrained.config
++        return super().build_conversion_tasks(hf_pretrained, megatron_model)
++
+     def mapping_registry(self) -> MegatronMappingRegistry:
+-        mapping_list = get_common_mapping_list()
++        # Get hf_config if available (set by build_conversion_tasks)
++        hf_config = getattr(self, "_hf_config", None)
++        mapping_list = get_common_mapping_list(hf_config=hf_config)
+         return MegatronMappingRegistry(*mapping_list)
+diff --git a/src/megatron/bridge/models/deepseek/deepseek_v3_bridge.py b/src/megatron/bridge/models/deepseek/deepseek_v3_bridge.py
+index b02b7b2f..3e2969ef 100644
+--- a/src/megatron/bridge/models/deepseek/deepseek_v3_bridge.py
++++ b/src/megatron/bridge/models/deepseek/deepseek_v3_bridge.py
+@@ -69,6 +69,7 @@ class DeepSeekV3Bridge(MegatronModelBridge):
+         provider.moe_aux_loss_coeff = 0.0001
+ 
+         provider.apply_rope_fusion = False
++        provider.gradient_accumulation_fusion = True
+         provider.bias_activation_fusion = True
+         provider.bias_dropout_fusion = True
+         provider.cross_entropy_fusion_impl = "te"
+@@ -87,13 +88,49 @@ class DeepSeekV3Bridge(MegatronModelBridge):
+         )
+         provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
+ 
+-        # TODO: mtp
+-        provider.mtp_num_layers = None
++        provider.mtp_num_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or None
+ 
+         return provider
+ 
++    @classmethod
++    def megatron_to_hf_config(cls, provider: MLAModelProvider) -> dict:
++        hf_cfg = super(DeepSeekV3Bridge, cls).megatron_to_hf_config(provider)
++
++        # Megatron uses None="not set/disabled", but HF expects integers
++        hf_cfg["num_nextn_predict_layers"] = hf_cfg.get("num_nextn_predict_layers") or 0
++        hf_cfg["n_group"] = hf_cfg.get("n_group") or 1
++        hf_cfg["topk_group"] = hf_cfg.get("topk_group") or 1
++
++        # Reconstruct first_k_dense_replace from moe_layer_freq (count leading dense layers)
++        moe_layer_freq = getattr(provider, "moe_layer_freq", None)
++        if moe_layer_freq is not None and isinstance(moe_layer_freq, list):
++            first_k_dense_replace = 0
++            for val in moe_layer_freq:
++                if val == 0:
++                    first_k_dense_replace += 1
++                else:
++                    break
++            hf_cfg["first_k_dense_replace"] = first_k_dense_replace
++
++        # Reconstruct n_shared_experts from moe_shared_expert_intermediate_size / moe_ffn_hidden_size
++        shared_size = getattr(provider, "moe_shared_expert_intermediate_size", None)
++        moe_ffn = getattr(provider, "moe_ffn_hidden_size", None)
++        if shared_size is not None and moe_ffn is not None and moe_ffn > 0:
++            hf_cfg["n_shared_experts"] = shared_size // moe_ffn
++
++        return hf_cfg
++
++    def build_conversion_tasks(self, hf_pretrained, megatron_model):
++        """Override to store config before mapping_registry is called."""
++        # Store config on instance for use in mapping_registry
++        from transformers import PretrainedConfig
++
++        self._hf_config = hf_pretrained if isinstance(hf_pretrained, PretrainedConfig) else hf_pretrained.config
++        return super().build_conversion_tasks(hf_pretrained, megatron_model)
++
+     def mapping_registry(self) -> MegatronMappingRegistry:
+-        mapping_list = get_common_mapping_list()
++        hf_config = getattr(self, "_hf_config", None)
++        mapping_list = get_common_mapping_list(hf_config=hf_config)
+         mapping_list.append(
+             AutoMapping(
+                 megatron_param="decoder.layers.*.mlp.router.expert_bias",
+diff --git a/src/megatron/bridge/models/gpt_full_te_layer_autocast_spec.py b/src/megatron/bridge/models/gpt_full_te_layer_autocast_spec.py
+index 9bd4de89..83724f25 100644
+--- a/src/megatron/bridge/models/gpt_full_te_layer_autocast_spec.py
++++ b/src/megatron/bridge/models/gpt_full_te_layer_autocast_spec.py
+@@ -335,11 +335,9 @@ def get_gpt_full_te_layer_autocast_spec(transformer_config) -> ModuleSpec:
+ 
+ def torch_dtype_from_precision(precision: Union[int, str]) -> torch.dtype:
+     """Mapping from precision types to corresponding PyTorch parameter datatype."""
+-    if precision in ("bf16", "bf16-mixed"):
+-        return torch.bfloat16
+-    elif precision in (16, "16", "16-mixed"):
+-        return torch.float16
+-    elif precision in (32, "32", "32-true"):
+-        return torch.float32
+-    else:
++    from megatron.bridge.utils.activation_map import str_to_dtype
++
++    try:
++        return str_to_dtype(str(precision))
++    except ValueError:
+         raise ValueError(f"Could not parse the precision of `{precision}` to a valid torch.dtype")
+diff --git a/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py b/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py
+index cb75000f..9770ab38 100644
+--- a/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py
++++ b/src/megatron/bridge/models/gpt_oss/gpt_oss_bridge.py
+@@ -12,22 +12,22 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-import logging
+ import math
+ from typing import Dict, Mapping, Optional, Tuple, Union
+ 
+ import torch
+ import torch.nn as nn
+-from megatron.core import parallel_state
+ from megatron.core.models.gpt.gpt_model import GPTModel
+ from transformers import GptOssForCausalLM
+ 
+ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+ from megatron.bridge.models.conversion.param_mapping import (
+     AutoMapping,
+     QKVMapping,
++    _align_expert_weight_to_shape,
+ )
++from megatron.bridge.models.conversion.utils import get_module_and_param_from_name
+ from megatron.bridge.models.gpt_provider import GPTModelProvider
+ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+ from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+@@ -53,13 +53,6 @@ class GPTOSSBridge(MegatronModelBridge):
+         >>> provider = bridge.to_megatron_provider()
+     """
+ 
+-    def __init__(self):
+-        super().__init__()
+-        # gpt-oss HF weights has one weight for all the experts, but megatron has one for each expert
+-        # We need to cache the weights during import to load and dequantize the expert weights only once.
+-        # and we need to merge the weights of multiple experts during export.
+-        self.hf_weights_cache = {}
+-
+     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> GPTModelProvider:
+         """Convert HuggingFace config to GPTModelProvider."""
+         provider = super().provider_bridge(hf_pretrained)
+@@ -126,74 +119,31 @@ class GPTOSSBridge(MegatronModelBridge):
+     def maybe_modify_loaded_hf_weight(
+         self, hf_param: str | dict[str, str], hf_state_dict: Mapping[str, torch.Tensor]
+     ) -> torch.Tensor:
+-        """Load weights from HuggingFace state dict and dequantize if necessary."""
++        """Load weights from HuggingFace state dict with MXFP4 dequantization support.
++
++        down_proj transpose on export is handled in GPTOSSMLPDownProjMapping.megatron_to_hf,
++        which transposes the per-expert weight from Megatron's [in, out] storage to
++        HF's expected [out, in] layout.
++
++        gate_up_proj is handled directly in GPTOSSMLPGateUpProjMapping.hf_to_megatron via
++        _align_expert_weight_to_shape, which auto-detects the orientation difference between
++        BF16 checkpoints ([num_experts, hidden, 2*intermediate]) and MXFP4-dequantized checkpoints
++        ([num_experts, 2*intermediate, hidden]).
++        """
+         if isinstance(hf_param, str):
+-            if hf_param in self.hf_weights_cache:
+-                return self.hf_weights_cache[hf_param]
+             if hf_param in hf_state_dict:
+                 hf_weights = hf_state_dict[hf_param]
+-                if ".mlp.experts." in hf_param and len(hf_weights.shape) == 3:
+-                    hf_weights = hf_weights.transpose(-1, -2)
+-                self.hf_weights_cache[hf_param] = hf_weights
+-            else:
+-                blocks_key = hf_param + "_blocks"
+-                scales_key = hf_param + "_scales"
+-                if blocks_key in hf_state_dict and scales_key in hf_state_dict:
+-                    hf_weights = _dequantize_mxfp4(hf_state_dict[blocks_key], hf_state_dict[scales_key])
+-                    self.hf_weights_cache[hf_param] = hf_weights
+-                else:
+-                    raise KeyError(
+-                        f"Cannot locate weights for '{hf_param}'. Missing both de-quantized tensor and "
+-                        f"quantized representation (blocks='{blocks_key}', scales='{scales_key}')."
+-                    )
+-        else:
+-            hf_weights = {k: hf_state_dict[v] for k, v in hf_param.items()}
+-        return hf_weights
+-
+-    def maybe_modify_converted_hf_weight(
+-        self,
+-        task: WeightConversionTask,
+-        converted_weights_dict: Dict[str, torch.Tensor],
+-        hf_state_dict: Mapping[str, torch.Tensor],
+-    ) -> Dict[str, torch.Tensor]:
+-        num_experts = self.hf_config.num_local_experts
+-        ep_size = parallel_state.get_expert_model_parallel_world_size()
+-        experts_per_rank = num_experts // ep_size
+-
+-        try:
+-            local_expert_number = extract_expert_number_from_param(task.param_name) % experts_per_rank
+-        except ValueError:
+-            # not an expert weight
+-            return converted_weights_dict
+-
+-        assert len(converted_weights_dict) == 1, (
+-            f"There should be only one key in the converted_weights_dict, got keys: {converted_weights_dict.keys()}"
+-        )
+-        for key, value in converted_weights_dict.items():
+-            if key not in self.hf_weights_cache:
+-                self.hf_weights_cache[key] = {}
+-
+-            # we end up with ep_size many weights to add to the cache
+-            # unpack the weights and re-index
+-            if ep_size == 1:
+-                self.hf_weights_cache[key][local_expert_number] = value
+-            else:
+-                assert value.shape[0] == ep_size
+-                for i, exp_val in enumerate(value):
+-                    global_expert_number = local_expert_number + (i * experts_per_rank)
+-                    self.hf_weights_cache[key][global_expert_number] = exp_val
+-            if len(self.hf_weights_cache[key]) == num_experts:
+-                logging.debug(f"All experts are loaded for {key}")
+-                # all experts are loaded
+-                merged_hf_weights = torch.cat(
+-                    [self.hf_weights_cache[key][i].unsqueeze(0) for i in range(num_experts)], dim=0
+-                )
+-                del self.hf_weights_cache[key]
+-                return {key: merged_hf_weights}
+-            else:
+-                # not all experts are loaded yet, return empty dict
+-                logging.debug(f"{len(self.hf_weights_cache[key])}/{num_experts} experts are loaded for {key}")
+-                return {}
++                return hf_weights
++            blocks_key = hf_param + "_blocks"
++            scales_key = hf_param + "_scales"
++            if blocks_key in hf_state_dict and scales_key in hf_state_dict:
++                hf_weights = _dequantize_mxfp4(hf_state_dict[blocks_key], hf_state_dict[scales_key])
++                return hf_weights
++            raise KeyError(
++                f"Cannot locate weights for '{hf_param}'. Missing both de-quantized tensor and "
++                f"quantized representation (blocks='{blocks_key}', scales='{scales_key}')."
++            )
++        return {k: hf_state_dict[v] for k, v in hf_param.items()}
+ 
+     def mapping_registry(self) -> MegatronMappingRegistry:
+         """
+@@ -277,42 +227,50 @@ class GPTOSSBridge(MegatronModelBridge):
+ 
+ 
+ class GPTOSSMLPDownProjMapping(AutoMapping):
+-    """
+-    MLPDownProj for expert weights GPT-OSS models.
++    """MLPDownProj for expert weights in GPT-OSS models.
++
++    megatron_to_hf transposes the per-expert weight from Megatron's [in, out]
++    storage to HF's expected [out, in] layout.
+     """
+ 
++    is_grouped_export = True
++
+     def __init__(self, megatron_param: str, hf_param: str, permute_dims: Optional[Tuple[int, ...]] = None):
+         super().__init__(megatron_param, hf_param, permute_dims)
+         self.allow_hf_name_mismatch = True
+ 
++    @property
++    def group_key(self) -> str:
++        return self.hf_param
++
+     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
+         global_expert_number = extract_expert_number_from_param(self.megatron_param)
+         return super().hf_to_megatron(hf_weights[global_expert_number], megatron_module)
+ 
+     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
+-        # only bf16 export is supported currently
+         if megatron_weights is None:
+             return super().megatron_to_hf(megatron_weights, megatron_module)
+-
+-        # GPT-OSS stores fc2 weight transposed vs Megatron when using BF16.
+         if len(megatron_weights.shape) == 2:
+             megatron_weights = megatron_weights.transpose(0, 1)
+         return super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
+ 
+-    def _validate_patterns(self, *args, **kwargs):
+-        # allow number of wildcards to mismatch in this mapping
+-        pass
+-
+ 
+ class GPTOSSMLPGateUpProjMapping(AutoMapping):
+-    """
+-    MLPGateUpProj for expert weights GPT-OSS models.
++    """MLPGateUpProj for expert weights in GPT-OSS models.
++
++    GPT-OSS uses alternating row interleaving for gate/up projections.
+     """
+ 
++    is_grouped_export = True
++
+     def __init__(self, megatron_param: str, hf_param: str, permute_dims: Optional[Tuple[int, ...]] = None):
+         super().__init__(megatron_param, hf_param, permute_dims)
+         self.allow_hf_name_mismatch = True
+ 
++    @property
++    def group_key(self) -> str:
++        return self.hf_param
++
+     @staticmethod
+     def _interleave(gate_up_proj):
+         return torch.cat((gate_up_proj[::2, ...], gate_up_proj[1::2, ...]), dim=0)
+@@ -326,22 +284,20 @@ class GPTOSSMLPGateUpProjMapping(AutoMapping):
+ 
+     def hf_to_megatron(self, hf_weights: Union[torch.Tensor, Dict], megatron_module: nn.Module) -> torch.Tensor:
+         global_expert_number = extract_expert_number_from_param(self.megatron_param)
+-        return super().hf_to_megatron(self._interleave(hf_weights[global_expert_number]), megatron_module)
++        expert_weight = hf_weights[global_expert_number] if hf_weights.ndim >= 2 else hf_weights
++        normalized_param = self._normalize_expert_param_name(self.megatron_param)
++        _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
++        expert_weight = _align_expert_weight_to_shape(expert_weight, target_param.shape, "gate_up_proj")
++        return super().hf_to_megatron(self._interleave(expert_weight), megatron_module)
+ 
+     def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
+-        # only bf16 export is supported currently
+         if megatron_weights is None:
+             return super().megatron_to_hf(megatron_weights, megatron_module)
+-
+         megatron_weights = self._uninterleave(megatron_weights)
+         if len(megatron_weights.shape) == 2:
+             megatron_weights = megatron_weights.transpose(0, 1)
+         return super().megatron_to_hf(megatron_weights.contiguous(), megatron_module)
+ 
+-    def _validate_patterns(self, *args, **kwargs):
+-        # allow number of wildcards to mismatch in this mapping
+-        pass
+-
+ 
+ def _dequantize_mxfp4(
+     blocks: torch.Tensor,
 diff --git a/src/megatron/bridge/models/hf_pretrained/vlm.py b/src/megatron/bridge/models/hf_pretrained/vlm.py
 index 06c96e57..0a45a2df 100644
 --- a/src/megatron/bridge/models/hf_pretrained/vlm.py
@@ -1148,6 +2138,18 @@ index 06c96e57..0a45a2df 100644
      @property
      def model(self) -> VLMType:
          """Lazy load and return the underlying model."""
+diff --git a/src/megatron/bridge/models/kimi/kimi_bridge.py b/src/megatron/bridge/models/kimi/kimi_bridge.py
+index c979566d..058a026f 100755
+--- a/src/megatron/bridge/models/kimi/kimi_bridge.py
++++ b/src/megatron/bridge/models/kimi/kimi_bridge.py
+@@ -64,6 +64,7 @@ class KimiK2Bridge(MegatronModelBridge):
+         provider.moe_permute_fusion = True
+ 
+         provider.apply_rope_fusion = False
++        provider.gradient_accumulation_fusion = True
+         provider.bias_activation_fusion = True
+         provider.bias_dropout_fusion = True
+         provider.cross_entropy_fusion_impl = "te"
 diff --git a/src/megatron/bridge/models/kimi_vl/__init__.py b/src/megatron/bridge/models/kimi_vl/__init__.py
 new file mode 100644
 index 00000000..f3a852e4
@@ -1180,10 +2182,10 @@ index 00000000..f3a852e4
 +]
 diff --git a/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
 new file mode 100644
-index 00000000..15a788cd
+index 00000000..d80917e9
 --- /dev/null
 +++ b/src/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,597 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -1201,14 +2203,14 @@ index 00000000..15a788cd
 +import itertools
 +import re
 +from functools import partial
-+from typing import Dict, Iterable, List, Mapping, Union
++from typing import Dict, List, Mapping
 +
 +import torch
 +from megatron.core import parallel_state
 +from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 +
 +from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-+from megatron.bridge.models.conversion.model_bridge import MegatronModel, MegatronModelBridge, WeightConversionTask
++from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
 +from megatron.bridge.models.conversion.param_mapping import (
 +    AutoMapping,
 +    GatedMLPMapping,
@@ -1580,9 +2582,6 @@ index 00000000..15a788cd
 +        mla_rope_params = provider_kwargs.pop("_mla_rope_params", None)
 +        valid_fields = KimiK25VLModelProvider.__dataclass_fields__
 +        provider = KimiK25VLModelProvider(**{k: v for k, v in provider_kwargs.items() if k in valid_fields})
-+        if mla_rope_params:
-+            for key, value in mla_rope_params.items():
-+                setattr(provider, key, value)
 +
 +        # --- Language model architecture defaults (MoE + MLA) ---
 +        provider.transformer_layer_spec = partial(get_gpt_decoder_block_spec, use_transformer_engine=HAVE_TE)
@@ -1593,6 +2592,11 @@ index 00000000..15a788cd
 +        provider.qk_layernorm = True
 +        provider.multi_latent_attention = True
 +        provider.position_embedding_type = "rope"
++
++        # Apply MLA rope params, otherwise rope scaling factor will be wrong.
++        if mla_rope_params:
++            for key, value in mla_rope_params.items():
++                setattr(provider, key, value)
 +
 +        # MoE settings
 +        provider.moe_grouped_gemm = True
@@ -1698,11 +2702,14 @@ index 00000000..15a788cd
 +        for fqn, tensor in converted_weights_dict.items():
 +            if self._is_quantized_expert_key(fqn):
 +                base = fqn[:-7] if fqn.endswith(".weight") else fqn
++                # Preserve the original scale dtype from the HF checkpoint
 +                orig_scale_key = f"{base}.weight_scale"
 +                scale_dtype = (
 +                    hf_state_dict[orig_scale_key].dtype if orig_scale_key in hf_state_dict else torch.bfloat16
 +                )
++
 +                packed, scale, shape = quantize_to_int4(tensor, scale_dtype=scale_dtype)
++
 +                result[f"{base}.weight_packed"] = packed
 +                result[f"{base}.weight_scale"] = scale
 +                result[f"{base}.weight_shape"] = shape
@@ -2453,62 +3460,271 @@ index 00000000..0c980963
 +    weight_scale = scale.to(scale_dtype)
 +
 +    return weight_packed, weight_scale, weight_shape
-diff --git a/src/megatron/bridge/models/qwen_omni/qwen25_omni_provider.py b/src/megatron/bridge/models/qwen_omni/qwen25_omni_provider.py
-index 41b8f716..f859d6e5 100644
---- a/src/megatron/bridge/models/qwen_omni/qwen25_omni_provider.py
-+++ b/src/megatron/bridge/models/qwen_omni/qwen25_omni_provider.py
-@@ -21,7 +21,9 @@ Reference: https://huggingface.co/Qwen/Qwen2.5-Omni-7B
- """
+diff --git a/src/megatron/bridge/models/model_provider.py b/src/megatron/bridge/models/model_provider.py
+index 1a196daf..10e60ad0 100644
+--- a/src/megatron/bridge/models/model_provider.py
++++ b/src/megatron/bridge/models/model_provider.py
+@@ -12,12 +12,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
  
- from dataclasses import dataclass, field
-+from typing import Callable
+-from __future__ import annotations
+-
+ import abc
+ import os
++import warnings
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Any, Callable, Generic, TypedDict, TypeVar, Union
++from typing import Any, Callable, Generic, TypedDict, TypeVar, Union
  
-+import torch.nn.functional as F
- from megatron.core.models.gpt import GPTModel as MCoreGPTModel
- from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
- from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-@@ -30,15 +32,14 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-     Qwen2_5OmniToken2WavConfig,
- )
+ from megatron.bridge.models.common.unimodal import _ddp_wrap, _print_num_params
  
--from megatron.bridge.models import Qwen2ModelProvider
-+from megatron.bridge.models.gpt_provider import GPTModelProvider
- from megatron.bridge.models.qwen_omni.modeling_qwen25_omni.model import Qwen25OmniModel
+@@ -57,10 +56,6 @@ from megatron.bridge.utils.common_utils import get_local_rank_preinit
+ from megatron.bridge.utils.instantiate_utils import InstantiationMode
  
+ 
+-if TYPE_CHECKING:
+-    from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
+-
+-
+ try:
+     from megatron.core.fp8_utils import correct_amax_history_if_needed
+ except ImportError:
+@@ -129,7 +124,6 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
+         | None = None,
+         post_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
+         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+-        mixed_precision_config: MixedPrecisionConfig | None = None,
+         pg_collection: ProcessGroupCollection | None = None,
+     ) -> list[ModelT]:
+         """Instantiate and wrap the model for distributed training.
+@@ -158,8 +152,6 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
+                 this will override all hooks registered via `register_post_wrap_hook`.
+             mixed_precision_wrapper: A module wrapper (e.g., `Float16Module`) applied when fp16/bf16
+                 is enabled. If None, no mixed precision wrapper is applied.
+-            mixed_precision_config: Optional MixedPrecisionConfig. Used to configure mixed-precision
+-                features on models during initialization.
+             pg_collection: Optional pre-initialized ProcessGroupCollection. If provided, skips
+                 model parallel initialization and uses the provided collection directly.
+                 This is used when `use_decentralized_pg=True` in the distributed config.
+@@ -167,6 +159,12 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
+         Returns:
+             A list containing the wrapped model instance.
+         """
++        warnings.warn(
++            "ModelProviderMixin-based model configuration is deprecated. Migrate to ModelConfig + ModelBuilder.",
++            DeprecationWarning,
++            stacklevel=2,
++        )
++
+         if wrap_with_ddp and not ddp_config:
+             raise ValueError("ddp_config is required when wrap_with_ddp is True")
+ 
+@@ -216,7 +214,6 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
+             init_model_with_meta_device=init_model_with_meta_device,
+             pre_wrap_hook=final_pre_wrap_hook,
+             mixed_precision_wrapper=mixed_precision_wrapper,
+-            mixed_precision_config=mixed_precision_config,
+             pg_collection=pg_collection,
+         )
+ 
+@@ -501,7 +498,6 @@ def get_model(
+     ]
+     | None = None,
+     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+-    mixed_precision_config: MixedPrecisionConfig | None = None,
+     *,
+     pg_collection: ProcessGroupCollection,
+ ) -> list[MegatronModule]:
+@@ -536,8 +532,6 @@ def get_model(
+             hooks will be executed in order.
+         mixed_precision_wrapper: Wrapper class/function applied when fp16/bf16 is enabled. Defaults
+             to Megatron-Core's `Float16Module`. If None, the wrapper is not applied.
+-        mixed_precision_config: MixedPrecisionConfig that controls mixed-precision features
+-            for the created model.
+ 
+     Returns:
+         list[MegatronModule]: List of model modules. Contains multiple modules
+@@ -620,7 +614,6 @@ def get_model(
+             overlap_param_gather_with_optimizer_step,
+             use_megatron_fsdp=use_megatron_fsdp,
+             use_torch_fsdp2=use_torch_fsdp2,
+-            mixed_precision_config=mixed_precision_config,
+             pg_collection=pg_collection,
+         )
+ 
+diff --git a/src/megatron/bridge/models/transformer_config.py b/src/megatron/bridge/models/transformer_config.py
+index 618700ed..6bc5b8d3 100644
+--- a/src/megatron/bridge/models/transformer_config.py
++++ b/src/megatron/bridge/models/transformer_config.py
+@@ -48,6 +48,29 @@ def _safe_asdict(obj, skip_keys: set[str]) -> dict:
+     return obj
+ 
+ 
++def _resolve_string_fields(config: MCoreTransformerConfig) -> None:
++    """Resolve string-valued fields to their runtime types.
++
++    Handles ``activation_func`` (e.g. ``model.activation_func=silu``) and dtype
++    fields ``params_dtype`` / ``pipeline_dtype`` (e.g. ``model.params_dtype=bf16``)
++    when they arrive as strings via CLI overrides.
++    """
++    if isinstance(config.activation_func, str):
++        from megatron.bridge.utils.activation_map import str_to_callable
++
++        config.activation_func = str_to_callable(config.activation_func)
++
++    if isinstance(config.params_dtype, str):
++        from megatron.bridge.utils.activation_map import str_to_dtype
++
++        config.params_dtype = str_to_dtype(config.params_dtype)
++
++    if isinstance(config.pipeline_dtype, str):
++        from megatron.bridge.utils.activation_map import str_to_dtype
++
++        config.pipeline_dtype = str_to_dtype(config.pipeline_dtype)
++
++
+ @dataclass
+ class TransformerConfig(MCoreTransformerConfig):
+     """Megatron Core TransformerConfig with deferred post-init.
+@@ -87,10 +110,20 @@ class TransformerConfig(MCoreTransformerConfig):
+         to compute derived fields based on the current field values. It can be
+         called multiple times safely.
+         """
++        _resolve_string_fields(self)
+         if self.pipeline_model_parallel_size > 1 and self.pipeline_dtype is None:
+             self.pipeline_dtype = self.params_dtype
++        if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
++            self.sequence_parallel = False
+         MCoreTransformerConfig.__post_init__(self)
+ 
++        # In-batch packing produces variable-length packed sequences across microbatches,
++        # so PP stages must communicate tensor shapes dynamically instead of using static
++        # buffers.  Set *after* __post_init__ to avoid the false-positive MoE allgather
++        # dispatcher check (irrelevant for non-MoE models).
++        if getattr(self, "_pack_sequences_in_batch", False) and self.pipeline_model_parallel_size > 1:
++            self.variable_seq_lengths = True
++
+     def __deepcopy__(self, memo):
+         """Custom deepcopy to preserve process group handles when cloning configs.
+ 
+@@ -152,10 +185,16 @@ class MLATransformerConfig(TransformerConfig, MCoreMLATransformerConfig):
+         to compute derived fields based on the current field values. It can be
+         called multiple times safely.
+         """
++        _resolve_string_fields(self)
+         if self.pipeline_model_parallel_size > 1 and self.pipeline_dtype is None:
+             self.pipeline_dtype = self.params_dtype
++        if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
++            self.sequence_parallel = False
+         MCoreMLATransformerConfig.__post_init__(self)
+ 
++        if getattr(self, "_pack_sequences_in_batch", False) and self.pipeline_model_parallel_size > 1:
++            self.variable_seq_lengths = True
++
  
  @dataclass
--class Qwen25OmniModelProvider(Qwen2ModelProvider):
-+class Qwen25OmniModelProvider(GPTModelProvider):
-     """
-     Base model provider for Qwen2.5 Omni Models.
--    Inherits language model configuration from Qwen2ModelProvider (dense, Qwen2 architecture).
+ class HeterogeneousTransformerConfig(TransformerConfig, MCoreHeterogeneousTransformerConfig):
+@@ -201,6 +240,9 @@ class HeterogeneousTransformerConfig(TransformerConfig, MCoreHeterogeneousTransf
+         to compute derived fields and parse the heterogeneous block configurations.
+         It can be called multiple times safely.
+         """
++        _resolve_string_fields(self)
++        if self.sequence_parallel and self.tensor_model_parallel_size <= 1:
++            self.sequence_parallel = False
+         MCoreHeterogeneousTransformerConfig.__post_init__(self)
  
-     Key differences from Qwen3OmniMoeModelProvider:
-     - Dense LLM (Qwen2), not MoE
-@@ -67,6 +68,13 @@ class Qwen25OmniModelProvider(Qwen2ModelProvider):
-     bos_token_id: int = 151643
-     eos_token_id: int = 151645
+     def get_config_for_layer(self, layer_number: int) -> MCoreTransformerConfig:
+diff --git a/src/megatron/bridge/peft/adapter_wrapper.py b/src/megatron/bridge/peft/adapter_wrapper.py
+index c84c9f69..fcc828e2 100644
+--- a/src/megatron/bridge/peft/adapter_wrapper.py
++++ b/src/megatron/bridge/peft/adapter_wrapper.py
+@@ -204,7 +204,7 @@ class AdapterWrapper(nn.Module):
+             The combined sharded state dictionary.
+         """
+         adapter_sharded_state_dict_kwargs = {}
+-        if isinstance(self.adapter, ParallelLinearAdapter) and "in_proj" in self.adapter.base_linear_name:
++        if isinstance(self.adapter, ParallelLinearAdapter) and "mixer.in_proj" in self.adapter.base_linear_name:
+             adapter_sharded_state_dict_kwargs["mamba_dim_info"] = _compute_mamba_dim_info(self.to_wrap)
  
-+    # Qwen2.5 architecture: SwiGLU activation (SiLU + gated MLP)
-+    activation_func: Callable = F.silu
-+    gated_linear_unit: bool = True
-+    normalization: str = "RMSNorm"
-+    hidden_dropout: float = 0.0
-+    add_bias_linear: bool = False
+         sharded_state_dict = {}
+diff --git a/src/megatron/bridge/peft/canonical_lora.py b/src/megatron/bridge/peft/canonical_lora.py
+index b832ab16..65260e36 100644
+--- a/src/megatron/bridge/peft/canonical_lora.py
++++ b/src/megatron/bridge/peft/canonical_lora.py
+@@ -31,6 +31,12 @@ from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attrib
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _should_treat_linear_fc1_as_unfused(full_name: str) -> bool:
++    """Return True when CanonicalLoRA should keep linear_fc1 as a single adapter."""
 +
-     head_dim: int = 128
-     add_qkv_bias: bool = True
-     qk_layernorm: bool = False
-@@ -100,6 +108,7 @@ class Qwen25OmniModelProvider(Qwen2ModelProvider):
-     async_tensor_model_parallel_allreduce: bool = True
-     distribute_saved_activations: bool = False
-     cp_comm_type: str = "p2p"
-+    gradient_accumulation_fusion: bool = False
++    return full_name.startswith("vision_model.") or full_name.endswith(".mlp.experts.linear_fc1")
++
++
+ class ModuleDict(nn.ModuleDict):
+     """
+     nn.ModuleDict with a sharded_state_dict implementation for checkpointing
+@@ -192,6 +198,9 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
+             Can be 'pre' (before the low-rank projection) or 'post' (after). Defaults to 'pre'.
+         lora_A_init_method (str): Initialization method for LoRA A matrix. Defaults to "xavier".
+         lora_B_init_method (str): Initialization method for LoRA B matrix. Defaults to "zero".
++        normalize_moe_lora (bool): When True, expert linear layers use dim // moe_router_topk as the LoRA rank
++            while non-expert layers keep the full dim. This normalizes the total adapter capacity for MoE models
++            so it is comparable to a dense model. Defaults to False.
+     """
  
-     def provide(self, pre_process=None, post_process=None, vp_stage=None):
-         """Provide a Qwen2.5 Omni model instance with vision, audio, and language components."""
+     target_modules: List[str] = field(
+@@ -211,6 +220,23 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
+     dropout_position: Literal["pre", "post"] = "pre"
+     lora_A_init_method: str = "xavier"
+     lora_B_init_method: str = "zero"
++    normalize_moe_lora: bool = False
++
++    def _get_effective_dim(self, m: nn.Module, is_expert: bool) -> int:
++        """Return the LoRA rank to use, reduced for expert layers when normalize_moe_lora is enabled."""
++        if not self.normalize_moe_lora or not is_expert:
++            return self.dim
++        topk = getattr(getattr(m, "config", None), "moe_router_topk", None)
++        if topk is None or topk <= 0:
++            raise ValueError(
++                f"normalize_moe_lora is enabled but moe_router_topk is {topk!r}; "
++                f"it must be set to a positive integer on the model config"
++            )
++        if self.dim % topk != 0:
++            raise ValueError(
++                f"LoRA dim={self.dim} must be divisible by moe_router_topk={topk} when normalize_moe_lora is enabled"
++            )
++        return self.dim // topk
+ 
+     def __post_init__(self) -> None:
+         """
+@@ -283,8 +309,10 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
+             is_expert = is_expert_linear(full_name)
+             attrs = get_adapter_attributes_from_linear(m, is_expert=is_expert)
+ 
++            dim = self._get_effective_dim(m, is_expert)
++
+             adapter_kwargs = dict(
+-                dim=self.dim,
++                dim=dim,
+                 base_linear_name=full_name,
+                 activation="identity",
+                 norm_type=None,
+@@ -302,6 +330,11 @@ class CanonicalLoRA(PEFT, ModuleMatcher):
+                 base_linear_is_parallel=attrs.base_linear_is_parallel,
+             )
+ 
++            if name == "linear_fc1" and _should_treat_linear_fc1_as_unfused(full_name):
++                logger.info(f"Adding lora to: {full_name} (treating unsupported canonical linear_fc1 as unfused)")
++                adapter = ParallelLinearAdapter(attrs.in_features, attrs.out_features, **adapter_kwargs)
++                return LoRALinear(m, adapter)
++
+             canonical_submodules = self.canonical_mapping[match]
+             logger.info(f"Adding lora to: {full_name} ({canonical_submodules})")
+             if name == "linear_qkv":
 diff --git a/src/megatron/bridge/peft/lora.py b/src/megatron/bridge/peft/lora.py
-index 48d4057e..c54931b6 100644
+index 48d4057e..74bb650e 100644
 --- a/src/megatron/bridge/peft/lora.py
 +++ b/src/megatron/bridge/peft/lora.py
 @@ -27,6 +27,7 @@ from megatron.core.utils import unwrap_model
@@ -2537,10 +3753,13 @@ index 48d4057e..c54931b6 100644
  
  
  logger = logging.getLogger(__name__)
-@@ -78,6 +88,12 @@ class LoRA(PEFT, ModuleMatcher):
+@@ -78,6 +88,15 @@ class LoRA(PEFT, ModuleMatcher):
          lora_A_init_method (str): Initialization method for the low-rank matrix A. Defaults to "xavier".
          lora_B_init_method (str): Initialization method for the low-rank matrix B. Defaults to "zero".
          lora_dtype (torch.dtype): Parameter data type for LoRA weights. Default None (will use model's dtype).
++        normalize_moe_lora (bool): When True, expert linear layers use dim // moe_router_topk as the LoRA rank
++            while non-expert layers keep the full dim. This normalizes the total adapter capacity for MoE models
++            so it is comparable to a dense model. Defaults to False.
 +        experts_shared_outer_loras (bool): When True, grouped-expert LoRA
 +            (``TE*ParallelGroupedLinear`` base modules) uses
 +            :class:`SharedOuterGroupedExpertAdapter` — ``gate_up`` lora_A and
@@ -2550,15 +3769,41 @@ index 48d4057e..c54931b6 100644
      """
  
      target_modules: List[str] = field(
-@@ -91,6 +107,7 @@ class LoRA(PEFT, ModuleMatcher):
+@@ -91,6 +110,24 @@ class LoRA(PEFT, ModuleMatcher):
      lora_B_init_method: str = "zero"
      a2a_experimental: bool = False
      lora_dtype: torch.dtype = None
++    normalize_moe_lora: bool = False
 +    experts_shared_outer_loras: bool = False
++
++    def _get_effective_dim(self, module: nn.Module, is_expert: bool) -> int:
++        """Return the LoRA rank to use, reduced for expert layers when normalize_moe_lora is enabled."""
++        if not self.normalize_moe_lora or not is_expert:
++            return self.dim
++        topk = getattr(getattr(module, "config", None), "moe_router_topk", None)
++        if topk is None or topk <= 0:
++            raise ValueError(
++                f"normalize_moe_lora is enabled but moe_router_topk is {topk!r}; "
++                f"it must be set to a positive integer on the model config"
++            )
++        if self.dim % topk != 0:
++            raise ValueError(
++                f"LoRA dim={self.dim} must be divisible by moe_router_topk={topk} when normalize_moe_lora is enabled"
++            )
++        return self.dim // topk
  
      def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
          """
-@@ -148,6 +165,44 @@ class LoRA(PEFT, ModuleMatcher):
+@@ -140,6 +177,8 @@ class LoRA(PEFT, ModuleMatcher):
+             is_expert = is_expert_linear(full_name)
+             attrs = get_adapter_attributes_from_linear(module, is_expert=is_expert)
+ 
++            dim = self._get_effective_dim(module, is_expert)
++
+             enable_op_fuser = (
+                 hasattr(module, "config")
+                 and getattr(module.config, "use_transformer_engine_op_fuser", False)
+@@ -148,10 +187,48 @@ class LoRA(PEFT, ModuleMatcher):
              )
  
              logging.info(f"Adding lora to: {full_name}")
@@ -2580,7 +3825,7 @@ index 48d4057e..c54931b6 100644
 +                adapter = SharedOuterGroupedExpertAdapter(
 +                    attrs.in_features,
 +                    attrs.out_features,
-+                    self.dim,
++                    dim,
 +                    num_local_experts=module.num_gemms,
 +                    base_linear_name=full_name,
 +                    activation="identity",
@@ -2603,6 +3848,11 @@ index 48d4057e..c54931b6 100644
              adapter = ParallelLinearAdapter(
                  attrs.in_features,
                  attrs.out_features,
+-                self.dim,
++                dim,
+                 base_linear_name=full_name,
+                 activation="identity",
+                 norm_type=None,
 diff --git a/src/megatron/bridge/peft/lora_layers.py b/src/megatron/bridge/peft/lora_layers.py
 index d5404c64..dd948b7b 100644
 --- a/src/megatron/bridge/peft/lora_layers.py
@@ -2634,18 +3884,10 @@ index d5404c64..dd948b7b 100644
      """Adapter wrapper that applies LoRA to router gating logits."""
  
 diff --git a/src/megatron/bridge/peft/utils.py b/src/megatron/bridge/peft/utils.py
-index 1ca5b18b..886d3ee0 100644
+index 1ca5b18b..51804c85 100644
 --- a/src/megatron/bridge/peft/utils.py
 +++ b/src/megatron/bridge/peft/utils.py
-@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional, Tuple
- 
- import packaging
- import torch
-+import torch.distributed as dist
- import torch.nn as nn
- from megatron.core import ModelParallelConfig, parallel_state
- from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
-@@ -732,3 +733,391 @@ class ParallelLinearAdapter(nn.Module):
+@@ -732,3 +732,391 @@ class ParallelLinearAdapter(nn.Module):
          sharded_state_dict.update(linear_in_sd)
          sharded_state_dict.update(linear_out_sd)
          return sharded_state_dict
@@ -3176,3 +4418,76 @@ index 00000000..db32ed32
 +        return DTYPE_MAP[name]
 +    known = sorted(n for n in DTYPE_MAP if "." not in n)
 +    raise ValueError(f"Unknown dtype: '{name}'. Known names: {known}")
+diff --git a/src/megatron/bridge/utils/common_utils.py b/src/megatron/bridge/utils/common_utils.py
+index 1946230b..35a3d507 100644
+--- a/src/megatron/bridge/utils/common_utils.py
++++ b/src/megatron/bridge/utils/common_utils.py
+@@ -267,6 +267,24 @@ def extract_expert_number_from_param(param_name: str) -> int:
+     return int(match.group(1))
+ 
+ 
++def disable_mtp_for_inference(m: torch.nn.Module) -> None:
++    """Disable Multi-Token Prediction (MTP) on a Megatron model for inference.
++
++    MTP is only used during training. Setting ``mtp_num_layers = None`` and
++    clearing ``mtp_process`` on the language model prevents hangs on NCCL
++    collectives during inference.
++
++    Args:
++        m: A Megatron model (or DDP-wrapped model) to disable MTP on.
++    """
++    m.config.mtp_num_layers = None
++    m.config.grad_scale_func = None
++    inner = m.module if hasattr(m, "module") else m
++    lang = getattr(inner, "language_model", inner)
++    if hasattr(lang, "mtp_process"):
++        lang.mtp_process = False
++
++
+ def resolve_path(path: str) -> Path:
+     """Resolve a path to an absolute path."""
+ 
+diff --git a/src/megatron/bridge/utils/fusions.py b/src/megatron/bridge/utils/fusions.py
+index 4856a1b8..a876aab0 100644
+--- a/src/megatron/bridge/utils/fusions.py
++++ b/src/megatron/bridge/utils/fusions.py
+@@ -34,9 +34,26 @@ LOG_FUSION_DISABLE = os.environ.get("MEGATRON_SUPPRESS_FUSION_WARNINGS", "0") !=
+ def can_enable_gradient_accumulation_fusion() -> bool:
+     """Check if gradient accumulation fusion can be enabled.
+ 
++    There are two independent backends that support wgrad fusion:
++    - TransformerEngine (TE): handles fuse_wgrad_accumulation internally,
++      no extra CUDA extension needed.
++    - APEX fused_weight_gradient_mlp_cuda: required for the non-TE
++      (ColumnParallelLinear) path.
++
++    In TE-based training containers (the common case for high-perf models),
++    fused_weight_gradient_mlp_cuda is not installed, so the APEX check alone
++    incorrectly returns False even though TE can perform the fusion.
++
+     Returns:
+-        bool: True if gradient accumulation fusion is available.
++        bool: True if gradient accumulation fusion is available via either backend.
+     """
++    try:
++        import transformer_engine.pytorch  # noqa: F401
++
++        return True
++    except ImportError:
++        pass
++
+     try:
+         import fused_weight_gradient_mlp_cuda  # noqa: F401
+ 
+@@ -44,8 +61,9 @@ def can_enable_gradient_accumulation_fusion() -> bool:
+     except ImportError:
+         if LOG_FUSION_DISABLE:
+             logger.warning(
+-                "gradient_accumulation_fusion requires FusedLayerNorm from megatron.core.fusions "
+-                "but it is not available. Fusion disabled."
++                "gradient_accumulation_fusion requires either TransformerEngine or the "
++                "fused_weight_gradient_mlp_cuda APEX extension, but neither is available. "
++                "Fusion disabled."
+             )
+         return False
+ 

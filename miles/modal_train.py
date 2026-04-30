@@ -23,7 +23,7 @@ miles_cfg = exp_mod.miles if exp_mod else None
 MILES_ROOT = "/root/miles"
 
 image = (
-    modal.Image.from_registry("radixark/miles:dev-202604221234")
+    modal.Image.from_registry("radixark/miles:dev-202604281249")
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
     .add_local_python_source("modal_helpers", copy=True)
@@ -51,6 +51,7 @@ with image.imports():
         build_train_cmd,
         get_modal_cluster_context,
         prepare_miles_config,
+        resolve_checkpoint_ref,
         start_ray_head,
     )
 
@@ -74,6 +75,16 @@ RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
 
+def run_config_hook(experiment: str, hook_name: str, mounted_volumes) -> None:
+    """Reload mounted volumes, run a MilesConfig hook, then commit them."""
+    miles_cfg = get_module(experiment).miles
+    for volume in mounted_volumes:
+        volume.reload()
+    getattr(miles_cfg, hook_name)()
+    for volume in mounted_volumes:
+        volume.commit()
+
+
 @app.local_entrypoint()
 def list_configs():
     """Print all available experiments."""
@@ -91,69 +102,55 @@ def list_configs():
 @app.function(
     image=image,
     volumes={str(HF_CACHE_PATH): hf_cache_volume},
-    timeout=2 * 60 * 60,
+    timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def prepare_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Run the experiment's prepare_model() against the HF cache volume."""
-    miles_cfg = get_module(experiment).miles
-    hf_cache_volume.reload()
-    miles_cfg.prepare_model()
-    hf_cache_volume.commit()
+def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run the experiment's download_model() against the HF cache volume."""
+    run_config_hook(experiment, "download_model", (hf_cache_volume,))
+
+
+@app.function(
+    image=image,
+    gpu=f"{modal_cfg.gpu}" if modal_cfg else None,
+    volumes=modal_volumes,
+    timeout=4 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def post_process_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run optional GPU model post-processing for the experiment."""
+    run_config_hook(
+        experiment,
+        "post_process_model",
+        (hf_cache_volume, data_volume, checkpoints_volume),
+    )
 
 
 @app.function(
     image=image,
     volumes={str(DATA_PATH): data_volume},
-    timeout=2 * 60 * 60,
+    timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def prepare_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Run the prepare_data() to populate the data volume."""
-    miles_cfg = get_module(experiment).miles
-    data_volume.reload()
-    miles_cfg.prepare_data()
-    data_volume.commit()
+def download_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run the experiment's download_data() against the data volume."""
+    run_config_hook(experiment, "download_data", (data_volume,))
 
 
 @app.function(
     image=image,
-    gpu="H200:1",
+    gpu=f"{modal_cfg.gpu}" if modal_cfg else None,
     volumes=modal_volumes,
     timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def convert_kimi_int4_to_bf16(
-    model: str = "moonshotai/Kimi-K2.5",
-    output_dir: str = str(CHECKPOINTS_PATH / "Kimi-K2.5-bf16"),
-):
-    """Convert Kimi native INT4 weights to BF16 for INT4 QAT training.
-
-    The BF16 checkpoint is used as --hf-checkpoint with INT4 QAT env vars
-    (OPEN_TRAINING_INT4_FAKE_QAT_FLAG=1, OPEN_TRAINING_INT4_GROUP_SIZE=32).
-
-    Run: modal run modal_train.py::convert_kimi_int4_to_bf16
-    """
-    from huggingface_hub import snapshot_download
-
-    hf_cache_volume.reload()
-    checkpoints_volume.reload()
-
-    if model.startswith("/"):
-        model_dir = model
-    else:
-        model_dir = snapshot_download(model, local_files_only=True)
-    print(f"Source: {model_dir}")
-
-    print(f"\n=== INT4 → BF16: {output_dir} ===")
-    subprocess.run(
-        ["python", f"{MILES_ROOT}/tools/convert_kimi_int4_to_bf16.py",
-         "--model-dir", model_dir, "--output-dir", output_dir],
-        check=True,
+def post_process_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run optional GPU data post-processing for the experiment."""
+    run_config_hook(
+        experiment,
+        "post_process_data",
+        (hf_cache_volume, data_volume, checkpoints_volume),
     )
-
-    checkpoints_volume.commit()
-    print(f"\n=== Done: {output_dir} ===")
 
 
 @app.function(
@@ -170,10 +167,10 @@ def convert_kimi_int4_to_bf16(
     if miles_cfg
     else lambda fn: fn
 )
-def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw."""
-    from huggingface_hub import snapshot_download
-
+def convert_hf_to_megatron_checkpoint(
+    experiment: str = os.environ.get("EXPERIMENT_CONFIG", ""),
+):
+    """Convert HF checkpoint to Megatron torch_dist format in raw mode."""
     miles_cfg = get_module(experiment).miles
 
     if getattr(miles_cfg, "megatron_to_hf_mode", None) == "bridge":
@@ -183,7 +180,11 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
     hf_cache_volume.reload()
     checkpoints_volume.reload()
 
-    hf_path = snapshot_download(miles_cfg.hf_checkpoint, local_files_only=True)
+    conversion_hf_checkpoint = (
+        getattr(miles_cfg, "megatron_conversion_hf_checkpoint", None)
+        or miles_cfg.hf_checkpoint
+    )
+    hf_path = resolve_checkpoint_ref(conversion_hf_checkpoint)
     save_path = str(miles_cfg.ref_load)
     num_nodes, nproc_per_node, extra_args = get_checkpoint_conversion_policy(miles_cfg)
     node_rank, master_addr, _, nnodes = get_modal_cluster_context(num_nodes)
@@ -201,6 +202,7 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
     # prevent volume corruption (see modal_helpers/convert_hf_to_torch_dist.py).
     # Single-node uses the upstream script directly.
     import importlib.util
+
     convert_script = (
         importlib.util.find_spec("modal_helpers.convert_hf_to_torch_dist").origin
         if num_nodes > 1
@@ -222,12 +224,16 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
         f"Conversion layout for {experiment!r}: nodes={num_nodes}, "
         f"nproc_per_node={nproc_per_node}, node_rank={node_rank}"
     )
+    print(
+        f"Converting HF checkpoint {conversion_hf_checkpoint!r} "
+        f"to Megatron torch_dist at {save_path!r}"
+    )
     print(f"Running: bash -c {cmd!r}")
     subprocess.run(["bash", "-c", cmd], check=True, env=env)
     checkpoints_volume.commit()
 
     if node_rank == 0:
-        print(f"Saved torch_dist checkpoint to {save_path}")
+        print(f"Saved Megatron torch_dist checkpoint to {save_path}")
 
 
 @app.function(

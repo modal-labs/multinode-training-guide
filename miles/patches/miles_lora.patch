@@ -1,28 +1,15 @@
-diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
-index 1b9c64eb9..0f7b3d67a 100644
---- a/miles/backends/megatron_utils/actor.py
-+++ b/miles/backends/megatron_utils/actor.py
-@@ -170,7 +170,10 @@ class MegatronTrainRayActor(TrainRayActor):
-             self.model,
-             weights_getter=lambda: self.weights_backuper.get("actor"),
-             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
--            quantization_config=getattr(self.hf_config, "quantization_config", None),
-+            quantization_config=(
-+                getattr(self.hf_config, "quantization_config", None)
-+                or getattr(getattr(self.hf_config, "text_config", None), "quantization_config", None)
-+            ),
-             is_lora=is_lora_enabled(args),
-         )
- 
 diff --git a/miles/backends/megatron_utils/bridge_lora_helpers.py b/miles/backends/megatron_utils/bridge_lora_helpers.py
-index 1aa4293e1..a77acf1bd 100644
+index 1aa4293e1..45d7103a3 100644
 --- a/miles/backends/megatron_utils/bridge_lora_helpers.py
 +++ b/miles/backends/megatron_utils/bridge_lora_helpers.py
-@@ -96,6 +96,11 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
+@@ -93,9 +93,14 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
+     provider.sequence_parallel = args.sequence_parallel
+     provider.virtual_pipeline_model_parallel_size = args.virtual_pipeline_model_parallel_size
+     provider.context_parallel_size = args.context_parallel_size
++    provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
      provider.variable_seq_lengths = True
      provider.moe_token_dispatcher_type = "alltoall"
      provider.moe_router_load_balancing_type = "none"
-+    provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
 +    if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
 +        provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
 +    if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
@@ -175,7 +162,7 @@ index 2c48c08fd..823f3f8ad 100644
          else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
      )
 diff --git a/miles/backends/megatron_utils/megatron_to_hf/__init__.py b/miles/backends/megatron_utils/megatron_to_hf/__init__.py
-index 888ade1f9..1654cd658 100644
+index 888ade1f9..ac780826b 100644
 --- a/miles/backends/megatron_utils/megatron_to_hf/__init__.py
 +++ b/miles/backends/megatron_utils/megatron_to_hf/__init__.py
 @@ -1,6 +1,7 @@
@@ -186,47 +173,7 @@ index 888ade1f9..1654cd658 100644
  from .llama import convert_llama_to_hf
  from .mimo import convert_mimo_to_hf
  from .processors import quantize_params, remove_padding
-@@ -30,6 +31,39 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None):
- _cached_tensors = {}
- 
- 
-+def postprocess_q_lora_converted_tensors(args, converted_named_tensors, cached_tensors):
-+    # Keep q_a_proj and kv_a_proj_with_mqa paired before quantization so
-+    # the bridge update path matches the direct convert_to_hf behavior.
-+    if args.q_lora_rank is None:
-+        return converted_named_tensors
-+
-+    processed_named_tensors = []
-+    for converted_name, converted_param in converted_named_tensors:
-+        if "q_a_proj" in converted_name:
-+            pair_name = converted_name.replace("q_a_proj", "kv_a_proj_with_mqa")
-+            if pair_name in cached_tensors:
-+                processed_named_tensors += [
-+                    (converted_name, converted_param),
-+                    (pair_name, cached_tensors[pair_name]),
-+                ]
-+                del cached_tensors[pair_name]
-+            else:
-+                cached_tensors[converted_name] = converted_param
-+        elif "kv_a_proj_with_mqa" in converted_name:
-+            pair_name = converted_name.replace("kv_a_proj_with_mqa", "q_a_proj")
-+            if pair_name in cached_tensors:
-+                processed_named_tensors += [
-+                    (converted_name, converted_param),
-+                    (pair_name, cached_tensors[pair_name]),
-+                ]
-+                del cached_tensors[pair_name]
-+            else:
-+                cached_tensors[converted_name] = converted_param
-+        else:
-+            processed_named_tensors.append((converted_name, converted_param))
-+
-+    return processed_named_tensors
-+
- # TODO optimize code details
- def _convert_to_hf_core(args, model_name, name, param):
-     if "glm4moelite" in model_name or "deepseekv3" in model_name:
-@@ -50,37 +84,14 @@ def _convert_to_hf_core(args, model_name, name, param):
+@@ -50,6 +51,10 @@ def _convert_to_hf_core(args, model_name, name, param):
          converted_named_tensors = convert_llama_to_hf(args, name, param)
      elif "mimo" in model_name:
          converted_named_tensors = convert_mimo_to_hf(args, name, param)
@@ -237,38 +184,6 @@ index 888ade1f9..1654cd658 100644
      else:
          raise ValueError(f"Unsupported model: {model_name}")
  
--    # to compatible with sglang implementation
--    if args.q_lora_rank is not None:
--        old_converted_named_tensors = converted_named_tensors
--        converted_named_tensors = []
--        for converted_name, converted_param in old_converted_named_tensors:
--            if "q_a_proj" in converted_name:
--                pair_name = converted_name.replace("q_a_proj", "kv_a_proj_with_mqa")
--                if pair_name in _cached_tensors:
--                    converted_named_tensors += [
--                        (converted_name, converted_param),
--                        (pair_name, _cached_tensors[pair_name]),
--                    ]
--                    del _cached_tensors[pair_name]
--                else:
--                    _cached_tensors[converted_name] = converted_param
--            elif "kv_a_proj_with_mqa" in converted_name:
--                pair_name = converted_name.replace("kv_a_proj_with_mqa", "q_a_proj")
--                if pair_name in _cached_tensors:
--                    converted_named_tensors += [
--                        (converted_name, converted_param),
--                        (pair_name, _cached_tensors[pair_name]),
--                    ]
--                    del _cached_tensors[pair_name]
--                else:
--                    _cached_tensors[converted_name] = converted_param
--            else:
--                converted_named_tensors.append((converted_name, converted_param))
--    return converted_named_tensors
-+    return postprocess_q_lora_converted_tensors(args, converted_named_tensors, _cached_tensors)
- 
- 
- def convert_lora_to_hf(args, model_name, name, param):
 diff --git a/miles/backends/megatron_utils/megatron_to_hf/kimi_vl.py b/miles/backends/megatron_utils/megatron_to_hf/kimi_vl.py
 new file mode 100644
 index 000000000..eafb33bcf
@@ -415,60 +330,24 @@ index 000000000..eafb33bcf
 +
 +    raise ValueError(f"Unknown parameter name: {name}")
 \ No newline at end of file
-diff --git a/miles/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py b/miles/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py
-index ca69df8e6..e3db62d33 100644
---- a/miles/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py
-+++ b/miles/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py
-@@ -267,7 +267,16 @@ def quantize_params_compressed_tensors(converted_named_params, quantization_conf
-     w_cfg = quantization_config["config_groups"]["group_0"]["weights"]
-     group_size = w_cfg["group_size"]
-     is_symmetric = w_cfg["symmetric"]
--    ignore_rules = quantization_config.get("ignore", [])
-+
-+    # tmp fix for kimi 2.5
-+    ignore_rules = list(quantization_config.get("ignore", []))
-+    ignore_rules.extend(
-+        [
-+            r"re:.*lm_head.*",
-+            r"re:.*mm_projector.*",
-+            r"re:.*vision_tower.*",
-+        ]
-+    )
- 
-     results = []
- 
-@@ -280,6 +289,17 @@ def quantize_params_compressed_tensors(converted_named_params, quantization_conf
-             results.append((name, param))
-             continue
- 
-+        # pack_layer views use weight.shape[1] // group_size; need exact divisibility so kernel output numel matches.
-+        if (param.shape[1] % group_size) != 0:
-+            logger.warning(
-+                "quantize_params_compressed_tensors: skip INT4 pack for %s shape=%s (in_features %% group_size != 0, group_size=%s)",
-+                name,
-+                tuple(param.shape),
-+                group_size,
-+            )
-+            results.append((name, param))
-+            continue
-+
-         qw, s, zp = pack_layer(param, group_size, is_symmetric)
-         qweight_name = name.replace(".weight", ".weight_packed")
-         scale_name = name.replace(".weight", ".weight_scale")
 diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
-index a9be3696d..2c77580f5 100644
+index a9be3696d..95499da60 100644
 --- a/miles/backends/megatron_utils/model.py
 +++ b/miles/backends/megatron_utils/model.py
-@@ -38,7 +38,7 @@ from .ci_utils import (
+@@ -38,7 +38,11 @@ from .ci_utils import (
  )
  from .initialize import is_megatron_main_rank
  from .lora_utils import is_lora_enabled, is_lora_model
 -from .model_provider import get_model_provider_func
-+from .model_provider import freeze_model_params, get_model_provider_func, wrap_model_provider_with_freeze
++from .model_provider import (
++    freeze_model_params,
++    get_model_provider_func,
++    wrap_model_provider_with_freeze,
++)
  from .parallel import get_packed_seq_params
  
  logger = logging.getLogger(__name__)
-@@ -122,8 +122,12 @@ def setup_model_and_optimizer(
+@@ -122,8 +126,12 @@ def setup_model_and_optimizer(
  
      if is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
          model = _setup_lora_model_via_bridge(args)
@@ -483,7 +362,7 @@ index a9be3696d..2c77580f5 100644
      # Optimizer
      kwargs = {}
 diff --git a/miles/backends/megatron_utils/model_provider.py b/miles/backends/megatron_utils/model_provider.py
-index 45adc8679..4eebe7687 100644
+index 45adc8679..6aee93fc0 100644
 --- a/miles/backends/megatron_utils/model_provider.py
 +++ b/miles/backends/megatron_utils/model_provider.py
 @@ -2,6 +2,7 @@
@@ -521,7 +400,7 @@ index 45adc8679..4eebe7687 100644
 +
 +
 +def freeze_model_params(model, args: argparse.Namespace) -> None:
-+    """Set requires_grad from --only-train-params-name-list / --freeze-params-name-list (regex, re.search on name)."""
++    """Set requires_grad from --only-train-params-name-list / --freeze-params-name-list."""
 +    if not getattr(args, "only_train_params_name_list", None) and not getattr(args, "freeze_params_name_list", None):
 +        return
 +
@@ -594,19 +473,10 @@ index c61f26487..ffa91e6de 100644
              if not match:
                  yield name, buffer
 diff --git a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
-index 10c3c8fb6..142f7c0ac 100644
+index 10c3c8fb6..bbdefd0a6 100644
 --- a/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
 +++ b/miles/backends/megatron_utils/update_weight/hf_weight_iterator_bridge.py
-@@ -32,10 +32,16 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
-             elif weight_type == "base":
-                 conversion_tasks = self._bridge.get_conversion_tasks(self.model)
-                 conversion_tasks = _process_conversion_tasks(conversion_tasks, renamed_megatron_local_weights)
-+                # merge_adapter_weights=False yields pure base (no adapter
-+                # baked in) so SGLang's runtime LoRA add isn't double-counted.
-+                # Bridge then inserts ``.base_layer`` into base names; strip it
-+                # below so SGLang's ``params_dict[name]`` lookup matches its
-+                # outer-path alias for ``BaseLayerWithLoRA``.
-                 named_weights = self._bridge.export_hf_weights(
+@@ -36,6 +36,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                      self.model,
                      cpu=False,
                      conversion_tasks=conversion_tasks,
@@ -614,14 +484,11 @@ index 10c3c8fb6..142f7c0ac 100644
                  )
  
              # TODO: verify if postprocess_hf_param is needed for LoRA weights
-@@ -53,7 +59,14 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+@@ -53,7 +54,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
              )
  
              if weight_type == "base":
 -                named_weights = ((n, t) for n, t in named_weights if not is_lora_weight_name(n))
-+                # Strip the ``.base_layer`` infix the bridge inserts when
-+                # merge_adapter_weights=False, since SGLang's params_dict
-+                # uses the outer-path alias.
 +                named_weights = (
 +                    (n.replace(".base_layer.", "."), t)
 +                    for n, t in named_weights
@@ -630,17 +497,8 @@ index 10c3c8fb6..142f7c0ac 100644
              elif weight_type == "lora":
                  named_weights = ((n, t) for n, t in named_weights if is_lora_weight_name(n))
  
-@@ -62,6 +75,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
- 
- def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
-     def _handle_one(task):
-+        if task is None:
-+            return None
-         if task.param_weight is None:
-             return task
- 
 diff --git a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
-index e045b5f27..4019b1014 100644
+index e045b5f27..0e8d7c5be 100644
 --- a/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
 +++ b/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py
 @@ -1,3 +1,4 @@
@@ -736,21 +594,13 @@ index e045b5f27..4019b1014 100644
      @torch.no_grad()
      def update_weights(self) -> None:
          """
-@@ -197,19 +263,59 @@ class UpdateWeightFromTensor:
+@@ -197,16 +263,38 @@ class UpdateWeightFromTensor:
              ):
                  refs, long_lived_tensors = self._send_base_params(hf_named_tensors)
                  results = ray.get(refs)
 +                self._ipc_chunk_barrier()
                  _check_weight_sync_results(results, is_lora=False)
--                del long_lived_tensors
-+                # Drop both refs and the Ray ObjectRef list before collecting,
-+                # so PyTorch's storage refcount and Ray's per-task tracking can
-+                # both decrement before we ipc_collect.
-+                del long_lived_tensors, refs, results
-+                gc.collect()
-+                torch.cuda.synchronize()
-+                torch.cuda.ipc_collect()
-+                torch.cuda.empty_cache()
+                 del long_lived_tensors
  
          if self.is_lora:
 -            lora_sync_chunk_count = 0
@@ -775,11 +625,7 @@ index e045b5f27..4019b1014 100644
 +                    results = ray.get(refs)
 +                    self._ipc_chunk_barrier()
 +                    _check_weight_sync_results(results, is_lora=True)
-+                    del long_lived_tensors, refs, results
-+                    gc.collect()
-+                    torch.cuda.synchronize()
-+                    torch.cuda.ipc_collect()
-+                    torch.cuda.empty_cache()
++                    del long_lived_tensors
 +                    lora_sync_chunk_count += 1
 +                pending = next_chunk
 +            if pending is not None:
@@ -789,20 +635,9 @@ index e045b5f27..4019b1014 100644
                  results = ray.get(refs)
 +                self._ipc_chunk_barrier()
                  _check_weight_sync_results(results, is_lora=True)
--                del long_lived_tensors
-+                del long_lived_tensors, refs, results
-+                gc.collect()
-+                torch.cuda.synchronize()
-+                torch.cuda.ipc_collect()
-+                torch.cuda.empty_cache()
+                 del long_lived_tensors
                  lora_sync_chunk_count += 1
-+            del pending, next_chunk, chunk_stream
-+            gc.collect()
-+            torch.cuda.empty_cache()
- 
-             if lora_sync_chunk_count == 0:
-                 raise RuntimeError(
-@@ -255,7 +361,13 @@ class UpdateWeightFromTensor:
+@@ -255,7 +343,13 @@ class UpdateWeightFromTensor:
                  refs = (refs or []) + refs_distributed
          return refs or [], long_lived_tensors
  
@@ -817,7 +652,7 @@ index e045b5f27..4019b1014 100644
          if not any(is_lora_weight_name(n) for n, _ in hf_named_tensors):
              raise RuntimeError(
                  "LoRA weight sync failed: chunk contains no LoRA weights "
-@@ -263,18 +375,28 @@ class UpdateWeightFromTensor:
+@@ -263,18 +357,28 @@ class UpdateWeightFromTensor:
              )
          if self.use_distribute and self._is_distributed_src_rank:
              raise NotImplementedError("LoRA weight sync is not yet supported for distributed (non-colocated) engines")
@@ -857,7 +692,7 @@ index e045b5f27..4019b1014 100644
  
  
  def _send_to_colocated_engine(
-@@ -286,7 +408,9 @@ def _send_to_colocated_engine(
+@@ -286,7 +390,9 @@ def _send_to_colocated_engine(
      weight_version=None,
      lora_config: dict | None = None,
      lora_name: str | None = None,
@@ -868,7 +703,7 @@ index e045b5f27..4019b1014 100644
  ) -> tuple[list[ObjectRef], Any]:
      # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
      # gather_object is only collective among group members, so we skip entirely.
-@@ -308,13 +432,17 @@ def _send_to_colocated_engine(
+@@ -308,13 +414,17 @@ def _send_to_colocated_engine(
  
      serialized_tensors = []
      for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
@@ -890,7 +725,7 @@ index e045b5f27..4019b1014 100644
  
      serialized_named_tensors = (
          [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
-@@ -329,22 +457,34 @@ def _send_to_colocated_engine(
+@@ -329,22 +439,34 @@ def _send_to_colocated_engine(
      refs = []
      if dist.get_rank() == ipc_gather_src:
          if is_lora:
@@ -1212,7 +1047,7 @@ index 3bda887b2..cc7b735fc 100644
      dp_size = parallel_state.intra_dp.size
      dp_group = parallel_state.intra_dp.group
 diff --git a/miles/rollout/sglang_rollout.py b/miles/rollout/sglang_rollout.py
-index 551021f53..23035a9d8 100644
+index 551021f53..0cea504fc 100644
 --- a/miles/rollout/sglang_rollout.py
 +++ b/miles/rollout/sglang_rollout.py
 @@ -24,7 +24,7 @@ from miles.utils.eval_config import EvalDatasetConfig
@@ -1224,7 +1059,7 @@ index 551021f53..23035a9d8 100644
      encode_image_for_rollout_engine,
      load_processor,
      load_tokenizer,
-@@ -141,9 +141,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
+@@ -141,9 +141,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
      ), f"Sample status is {sample.status}"
  
      if state.processor and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
@@ -1232,15 +1067,16 @@ index 551021f53..23035a9d8 100644
 -        processor_output = state.processor(text=sample.prompt, **processor_kwargs)
 +        processor_output = call_processor(state.processor, sample.prompt, sample.multimodal_inputs)
          prompt_ids = processor_output["input_ids"][0]
-+        if hasattr(prompt_ids, "tolist"):
-+            prompt_ids = prompt_ids.tolist()
-+        else:
-+            prompt_ids = list(prompt_ids)
++        prompt_ids = (
++            prompt_ids.tolist()
++            if hasattr(prompt_ids, "tolist")
++            else list(prompt_ids)
++        )
          sample.multimodal_train_inputs = {
              k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
          } or None
 diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
-index ab9ef5b23..689401a67 100644
+index ab9ef5b23..75d949a80 100644
 --- a/miles/utils/arguments.py
 +++ b/miles/utils/arguments.py
 @@ -211,6 +211,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
@@ -1253,7 +1089,7 @@ index ab9ef5b23..689401a67 100644
 +                nargs="*",
 +                default=None,
 +                help=(
-+                    "Regex patterns (re.search on full param names) to train; all others frozen. "
++                    "Regex patterns (re.search on full param names) to train; all others are frozen. "
 +                    "Mutually exclusive with --freeze-params-name-list."
 +                ),
 +            )

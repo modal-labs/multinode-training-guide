@@ -7,8 +7,9 @@ Two separate concerns:
 
 Each experiment defines one instance of each. All non-private, non-callable
 attributes on a MilesConfig subclass become Miles CLI args automatically via
-cli_args(). The 'environment' field is the only exception — it is injected
-into the Ray job runtime env, not passed to Miles directly.
+cli_args(), except launcher instruction fields such as environment,
+async_mode, miles_model_script, source_hf_checkpoint, and
+megatron_conversion_hf_checkpoint.
 """
 
 import json
@@ -26,8 +27,14 @@ CHECKPOINTS_PATH = Path("/checkpoints")
 
 GPUType = Literal["H100", "H200", "B200", "B300", "A100"]
 
-# Fields on MilesConfig that are NOT Miles CLI args.
-_MILES_SKIP = {"environment", "async_mode", "miles_model_script"}
+# Fields on MilesConfig that are launcher instructions, not Miles CLI args.
+_MILES_SKIP = {
+    "environment",
+    "async_mode",
+    "miles_model_script",
+    "source_hf_checkpoint",
+    "megatron_conversion_hf_checkpoint",
+}
 
 # MilesConfig fields that Miles reads as YAML files at runtime.
 # Users may set these as inline dicts in Python configs; the launcher
@@ -67,7 +74,8 @@ class MilesConfig:
     """Base Miles training configuration.
 
     Subclass and set class attributes to configure an experiment.
-    All attributes (except 'environment') are forwarded to Miles as CLI args.
+    All attributes except launcher instruction fields are forwarded to Miles
+    as CLI args.
     Each experiment must be fully self-contained — no inherited defaults.
 
     Fields in _MILES_SKIP are launcher instructions, not Miles CLI args:
@@ -76,6 +84,12 @@ class MilesConfig:
       miles_model_script — path relative to /root/miles to a shell script that
                            defines MODEL_ARGS for model architecture; sourced
                            before running the train command
+      source_hf_checkpoint — optional upstream HF repo/local path used by
+                             download_model() when hf_checkpoint points at a
+                             converted training checkpoint
+      megatron_conversion_hf_checkpoint — optional HF-format repo/local path to
+                                          convert in convert_hf_to_megatron_checkpoint();
+                                          defaults to hf_checkpoint
 
     Example:
 
@@ -83,6 +97,8 @@ class MilesConfig:
             async_mode = False
             miles_model_script = ""
             hf_checkpoint = "Qwen/Qwen3-4B"
+            # source_hf_checkpoint = "Qwen/Qwen3-4B"  # optional if different
+            # megatron_conversion_hf_checkpoint = "Qwen/Qwen3-4B"
             actor_num_nodes = 1
             actor_num_gpus_per_node = 8
             megatron_to_hf_mode = "bridge"
@@ -99,6 +115,8 @@ class MilesConfig:
     }
     async_mode: bool = False  # True → use train_async.py
     miles_model_script: str = ""  # shell script path relative to /root/miles
+    source_hf_checkpoint: str | None = None
+    megatron_conversion_hf_checkpoint: str | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         # Fresh environment dict per instance — never mutate the class-level default.
@@ -152,14 +170,23 @@ class MilesConfig:
                 out += [flag, str(val)]
         return out
 
-    def prepare_model(self) -> None:
-        """Populate the HF cache and apply any model-specific local fixes."""
-        from huggingface_hub import snapshot_download
+    def download_model(self) -> None:
+        """Required CPU hook for populating the HF cache."""
+        from modal_helpers.utils import resolve_checkpoint_ref
 
-        snapshot_download(self.hf_checkpoint)
+        resolve_checkpoint_ref(
+            self.source_hf_checkpoint or self.hf_checkpoint,
+            local_files_only=False,
+        )
 
-    def prepare_data(self) -> None:
-        raise NotImplementedError(f"{type(self).__name__} has no prepare_data()")
+    def post_process_model(self) -> None:
+        """Optional GPU hook; no-op unless explicitly run."""
+
+    def download_data(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} has no download_data()")
+
+    def post_process_data(self) -> None:
+        """Optional GPU hook; no-op unless explicitly run."""
 
     def total_nodes(self) -> int:
         """Total Modal cluster nodes required by this config.

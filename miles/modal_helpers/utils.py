@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import time
+from os import PathLike
 
 # (attr_name_on_miles_cfg, cli_flag) — optional per-rank conversion args
 _CONVERSION_EXTRA_ARGS = [
@@ -12,6 +13,30 @@ _CONVERSION_EXTRA_ARGS = [
     ("mtp_num_layers", "mtp-num-layers"),
     ("make_vocab_size_divisible_by", "make-vocab-size-divisible-by"),
 ]
+
+
+def is_local_checkpoint_ref(ref: str | PathLike) -> bool:
+    """Return True when a checkpoint ref is already a mounted local path."""
+    return str(ref).startswith("/")
+
+
+def resolve_checkpoint_ref(
+    ref: str | PathLike,
+    *,
+    local_files_only: bool = True,
+) -> str:
+    """Resolve a checkpoint ref to a local path.
+
+    Absolute paths are returned unchanged. Other values are treated as
+    Hugging Face repo IDs and resolved through the local HF cache by default.
+    """
+    ref_str = str(ref)
+    if is_local_checkpoint_ref(ref_str):
+        return ref_str
+
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(ref_str, local_files_only=local_files_only)
 
 
 def get_checkpoint_conversion_policy(miles_cfg) -> tuple[int, int, list[str]]:
@@ -109,14 +134,13 @@ def start_ray_head(my_ip: str, n_nodes: int) -> None:
 
 def prepare_miles_config(miles_cfg, tmpdir: str) -> None:
     """Resolve HF repo IDs to local paths and materialize inline YAML configs."""
-    from huggingface_hub import snapshot_download
     import yaml
 
     from configs.base import YAML_CONFIG_FIELDS
 
     for attr in ("hf_checkpoint", "load", "ref_load", "critic_load"):
-        if (val := getattr(miles_cfg, attr, None)) and not str(val).startswith("/"):
-            setattr(miles_cfg, attr, snapshot_download(val, local_files_only=True))
+        if val := getattr(miles_cfg, attr, None):
+            setattr(miles_cfg, attr, resolve_checkpoint_ref(val))
 
     for field in YAML_CONFIG_FIELDS:
         if isinstance(val := getattr(miles_cfg, field, None), dict):

@@ -86,12 +86,14 @@ class _Miles(MilesConfig):
     # ── Environment (per-config, not base defaults) ───────────────────────────
     def __init__(self):
         super().__init__()
-        self.environment.update({
-            "NCCL_ALGO": "Ring",
-            "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-        })
+        self.environment.update(
+            {
+                "NCCL_ALGO": "Ring",
+                "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+            }
+        )
 
-    def prepare_data(self) -> None:
+    def download_data(self) -> None:
         """Download dapo-math-17k and aime-2024 datasets."""
         import os
         from huggingface_hub import snapshot_download

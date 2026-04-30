@@ -1,157 +1,178 @@
 # miles — Modal launcher for Miles training
 
-Thin Modal launcher that runs [Miles](https://github.com/radixark/miles) RL training on GPU clusters.
+Thin Modal launcher for running [Miles](https://github.com/radixark/miles) RL
+training jobs on Modal GPU clusters.
 
 ## Prerequisites
 
 - Modal CLI installed and authenticated
-- Set your Modal environment: `export MODAL_ENVIRONMENT=<your-env>`
+- Modal environment selected: `export MODAL_ENVIRONMENT=<your-env>`
 - Modal secrets:
-  - `huggingface-secret` — required for `prepare_model` and `prepare_data`
-  - `wandb-secret` — required only for experiments with `use_wandb = True`
+  - `huggingface-secret` for model/data download and post-processing
+  - `wandb-secret` for configs with `use_wandb = True`
 
-## Running an experiment
+Run all commands from the repo root.
 
-All commands take the experiment name via `EXPERIMENT_CONFIG`. Run from the repo root.
+## Common Workflow
 
-### 1. List available experiments
+Set the config name once:
+
+```bash
+export EXPERIMENT_CONFIG=qwen3_4b_lora_smoke
+```
+
+List available configs:
 
 ```bash
 modal run miles/modal_train.py::list_configs
 ```
 
-### 2. Prepare model (one-time)
-
-Downloads the experiment's HF checkpoint to the `huggingface-cache` volume and applies any experiment-specific model fixes.
+Download required model artifacts:
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_model
+modal run miles/modal_train.py::download_model
 ```
 
-### 3. Prepare data (one-time)
-
-Downloads and preprocesses the training dataset to the `miles-data` volume.
-Only required if the experiment defines a `prepare_data()` function (see [Adding an experiment](#adding-an-experiment)).
+Download required data artifacts:
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::prepare_data
+modal run miles/modal_train.py::download_data
 ```
 
-### 4. Convert checkpoint (one-time, raw mode only)
-
-Converts the HF checkpoint to `torch_dist` format. Only required when `megatron_to_hf_mode = "raw"`.
-Skip this step if using bridge mode.
+Run optional post-processing only when the config needs it:
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run miles/modal_train.py::convert_checkpoint
+modal run miles/modal_train.py::post_process_model
+modal run miles/modal_train.py::post_process_data
 ```
 
-### 5. Run training
+Convert to Megatron `torch_dist` only for raw-mode configs:
 
 ```bash
-EXPERIMENT_CONFIG=qwen3_4b_lora_smoke modal run -d miles/modal_train.py::train
+modal run miles/modal_train.py::convert_hf_to_megatron_checkpoint
 ```
 
-Use `-d` (detached) to keep training running after you close your terminal.
+Bridge-mode configs do not need this conversion step.
 
-## Docker Image
+Launch training:
 
-Uses `radixark/miles:dev-202604101227` as the base image.
+```bash
+modal run -d miles/modal_train.py::train
+```
 
-## Architecture
+Use `-d` to keep the Modal job running after the terminal disconnects.
 
-Each experiment defines two module-level objects in `configs/<name>.py`:
+## Run Kimi-K2.5
 
-- `modal` — `ModalConfig` instance (GPU type, dev overlays, image patches)
-- `miles` — `MilesConfig` subclass instance (all Miles CLI arguments)
+`kimi_k25` uses bridge mode, so do not run
+`convert_hf_to_megatron_checkpoint`.
 
-`MilesConfig` attributes are automatically converted to CLI flags:
-- `lora_rank = 64` → `--lora-rank 64`
-- `colocate = True` → `--colocate`
-- `colocate = False` → omitted
+```bash
+export EXPERIMENT_CONFIG=kimi_k25
 
-### Special Fields
+modal run miles/modal_train.py::download_model
+modal run miles/modal_train.py::post_process_model
+modal run miles/modal_train.py::download_data
+modal run -d miles/modal_train.py::train
+```
 
-These `MilesConfig` fields are **not** passed as CLI args:
+For this config:
+
+- `download_model` downloads `source_hf_checkpoint` and applies the Kimi source patch.
+- `post_process_model` creates `/checkpoints/Kimi-K2.5-int4` for training and `/checkpoints/Kimi-K2.5-bf16` for the reference load.
+- `download_data` downloads the training dataset to `/data`.
+- `train` launches the bridge-mode training job directly.
+
+## Launcher Model
+
+Each experiment lives in `miles/configs/<name>.py` and exposes:
+
+- `modal`: `ModalConfig` for image, GPU type, patches, and Modal resources
+- `miles`: `MilesConfig` for Miles CLI arguments and preparation hooks
+
+`MilesConfig` attributes become CLI flags automatically:
+
+- `lora_rank = 64` becomes `--lora-rank 64`
+- `colocate = True` becomes `--colocate`
+- `colocate = False` is omitted
+
+Launcher-only fields are not passed to Miles:
 
 | Field | Purpose |
-|-------|---------|
-| `environment` | Injected into the Ray job runtime env |
-| `async_mode` | Selects `train_async.py` vs `train.py` |
-| `miles_model_script` | Shell script sourced for `MODEL_ARGS` (e.g., `scripts/models/qwen3-4B.sh`) |
+| --- | --- |
+| `environment` | Ray job environment variables |
+| `async_mode` | Selects `train_async.py` instead of `train.py` |
+| `miles_model_script` | Shell script sourced for `MODEL_ARGS` |
+| `source_hf_checkpoint` | Upstream repo/path used for download or config-specific conversion |
+| `megatron_conversion_hf_checkpoint` | Optional raw Megatron conversion input; defaults to `hf_checkpoint` |
 
-### Volumes
+## Hooks
 
-| Volume | Mount Path | Purpose |
-|--------|-----------|---------|
-| `huggingface-cache` | `/root/.cache/huggingface` | Model checkpoints |
-| `miles-data` | `/data` | Training datasets |
-| `miles-checkpoints` | `/checkpoints` | Converted checkpoints |
+Every config should make `download_model` and `download_data` usable.
+`download_model` has a default implementation; `download_data` must be
+implemented by the config.
 
-## Adding an experiment
+| Hook | Resource | Expected use |
+| --- | --- | --- |
+| `download_model()` | CPU | Download source model files into the HF cache |
+| `download_data()` | CPU | Download or prepare training data under `/data` |
+| `post_process_model()` | GPU | Optional model conversion or derived model artifacts |
+| `post_process_data()` | GPU | Optional data processing that needs GPU |
 
-### 1. Create the config file
+The default `post_process_model()` and `post_process_data()` are no-ops. Run
+their Modal entrypoints only when the config documents a reason.
 
-Create `configs/<your_experiment>.py`. Each config file must expose two module-level instances:
-- `modal` — a `ModalConfig` instance (GPU type, image patches)
-- `miles` — a `MilesConfig` subclass instance (all Miles training arguments)
+## Checkpoint Fields
+
+Use `hf_checkpoint` for the checkpoint Miles should train or serve from.
+
+Use `source_hf_checkpoint` when the upstream model is different from
+`hf_checkpoint`. For example, Kimi downloads `moonshotai/Kimi-K2.5`, then
+post-processing writes the training checkpoint to
+`/checkpoints/Kimi-K2.5-int4`.
+
+Use `megatron_conversion_hf_checkpoint` only when raw Megatron conversion should
+read a different HF-format checkpoint than `hf_checkpoint`.
+
+All three fields may be Hugging Face repo IDs or absolute mounted paths.
+
+## Volumes
+
+| Volume | Mount path | Purpose |
+| --- | --- | --- |
+| `huggingface-cache` | `/root/.cache/huggingface` | HF snapshots |
+| `miles-data` | `/data` | Training and eval data |
+| `miles-checkpoints` | `/checkpoints` | Derived checkpoints |
+
+## Add A Config
+
+Create `miles/configs/<name>.py`:
 
 ```python
-from configs.base import ModalConfig, MilesConfig, DATA_PATH
+from configs.base import DATA_PATH, ModalConfig, MilesConfig
 
 modal = ModalConfig(gpu="H200")
 
 
 class _Miles(MilesConfig):
-    # Launcher instructions (not passed to Miles CLI)
-    miles_model_script = "scripts/models/qwen3-4B.sh"  # sources MODEL_ARGS
+    miles_model_script = "scripts/models/qwen3-4B.sh"
     async_mode = False
 
-    # Model
     hf_checkpoint = "Qwen/Qwen3-4B"
-    megatron_to_hf_mode = "bridge"  # or "raw" (requires convert_checkpoint)
+    megatron_to_hf_mode = "bridge"
 
-    # Infrastructure
     actor_num_nodes = 1
     actor_num_gpus_per_node = 4
     colocate = True
 
-    # Data
     prompt_data = f"{DATA_PATH}/my_dataset/train.jsonl"
     input_key = "prompt"
     label_key = "label"
     rm_type = "deepscaler"
 
-    # ... all other Miles args as snake_case attributes
-
-
-miles = _Miles()
-```
-
-Every attribute on `_Miles` (except `environment`, `async_mode`, `miles_model_script`) is forwarded to
-Miles as a CLI argument: `field_name` → `--field-name`. See `configs/base.py` for full rules.
-
-### 2. Add `prepare_model()` / `prepare_data()` methods (if needed)
-
-Override `prepare_model()` if your experiment needs model-specific preparation beyond a plain HF download.
-The base implementation already calls `snapshot_download(self.hf_checkpoint)`.
-
-```python
-class _Miles(MilesConfig):
-    ...
-    def prepare_model(self) -> None:
-        super().prepare_model()
-        # apply model-specific local patches if needed
-```
-
-If your experiment needs to download or preprocess a dataset, override `prepare_data()` on `_Miles`.
-It runs inside the Modal container with the `miles-data` volume mounted at `DATA_PATH`.
-
-```python
-class _Miles(MilesConfig):
-    ...
-    def prepare_data(self) -> None:
+    def download_data(self) -> None:
         import os
+
         from huggingface_hub import snapshot_download
 
         os.makedirs(f"{DATA_PATH}/my_dataset", exist_ok=True)
@@ -160,48 +181,25 @@ class _Miles(MilesConfig):
             repo_type="dataset",
             local_dir=f"{DATA_PATH}/my_dataset",
         )
+
+
+miles = _Miles()
 ```
 
-If `prepare_data()` is not overridden, `prepare_data` will raise `NotImplementedError` — simply skip that step.
+No registration step is needed. The launcher discovers config files
+automatically.
 
-### 3. Run the workflow
+## Inline Config Values
 
-`EXPERIMENT_CONFIG` is the config filename without `.py`:
+`eval_config`, `custom_config_path`, and `sglang_config` may be Python dicts.
+The launcher writes them to temporary YAML files before training.
 
-```bash
-EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_model
-EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::prepare_data  # if prepare_data() defined
-EXPERIMENT_CONFIG=my_experiment modal run miles/modal_train.py::convert_checkpoint  # if megatron_to_hf_mode = "raw"
-EXPERIMENT_CONFIG=my_experiment modal run -d miles/modal_train.py::train
-```
+`train_env_vars`, `apply_chat_template_kwargs`, and `multimodal_keys` may be
+Python dicts. The launcher serializes them as JSON CLI values.
 
-No registration step needed — the launcher discovers configs automatically from the `configs/` directory.
+## Dev Overlay
 
-## YAML config fields
-
-`eval_config`, `custom_config_path`, and `sglang_config` normally take file paths in Miles.
-In Python configs you can write them as inline dicts — the launcher materializes them to temp YAML files automatically:
-
-```python
-class _Miles(MilesConfig):
-    eval_config = {
-        "eval": {
-            "defaults": {"max_response_len": 16384},
-            "datasets": [
-                {"name": "aime", "path": "/data/aime.jsonl", "rm_type": "deepscaler"},
-            ],
-        }
-    }
-```
-
-## JSON config fields
-
-`train_env_vars`, `apply_chat_template_kwargs`, and `multimodal_keys` are parsed by Miles with `json.loads()`.
-If set as dicts in Python configs, the launcher serializes them with `json.dumps()` automatically.
-
-## Dev overlay
-
-To test local Miles changes without rebuilding the image, set `local_miles` in your `ModalConfig`:
+To test local Miles changes without rebuilding the base image:
 
 ```python
 modal = ModalConfig(
@@ -210,9 +208,9 @@ modal = ModalConfig(
 )
 ```
 
-## Applying patches to the image
+## Image Patches
 
-To inject local patch files into the image (e.g. to patch SGLang), use `patch_files` and `image_run_commands`:
+To inject local patch files into the image:
 
 ```python
 modal = ModalConfig(
@@ -222,4 +220,4 @@ modal = ModalConfig(
 )
 ```
 
-Each file in `patch_files` is added to the image at `/tmp/<filename>`.
+Each patch file is copied to `/tmp/<filename>` inside the image.

@@ -1,5 +1,5 @@
 """Kimi-K2.5 — 8 H200 nodes (8 GPUs each), colocated. NOT real full-param:
-trains only the last 3 layers via ``only_train_params_name_list``.
+trains only the last 4 layers via ``only_train_params_name_list``.
 
 Run:
     EXPERIMENT_CONFIG=kimi_k25 modal run -d miles/modal_train.py::train
@@ -25,9 +25,9 @@ Knobs to tune (train/rollout throughput):
 
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH
 
-SGLANG_SYNC_SHA = "b51b26377b72f8fb839d6d3b56ad2ead840bda95"
+SGLANG_SYNC_SHA = "bb9223d7c51fa66092b3bcae566ef4ecff309dc6"
 MEGATRON_BRIDGE_SHA = "3fd3768045422d0aa5c97e90a4e6c659aea9acb9"
-MILES_SHA = "cc077c4e03cc806cfcafce61a0667a8aa6636777"
+MILES_SHA = "17eaf73caa41d83361f6e0676548896a497842fe"
 
 modal = ModalConfig(
     gpu="H200",
@@ -61,16 +61,22 @@ class _Miles(MilesConfig):
         "OPEN_TRAINING_INT4_FAKE_QAT_FLAG": "1",
         "OPEN_TRAINING_INT4_GROUP_SIZE": "32",
     }
-    hf_checkpoint = "moonshotai/Kimi-K2.5"
+    source_hf_checkpoint = "moonshotai/Kimi-K2.5"
+    hf_checkpoint = f"{CHECKPOINTS_PATH}/Kimi-K2.5-int4"
     ref_load = f"{CHECKPOINTS_PATH}/Kimi-K2.5-bf16"
     megatron_to_hf_mode = "bridge"
+    model_name = "kimi_k25"
 
-    only_train_params_name_list = ["layers\\.58\\.", "layers\\.59\\.", "layers\\.60\\."]
+    only_train_params_name_list = [
+        "layers\\.57\\.",
+        "layers\\.58\\.",
+        "layers\\.59\\.",
+        "layers\\.60\\.",
+    ]
 
     actor_num_nodes = 8
     actor_num_gpus_per_node = 8
     colocate = True
-    calculate_per_token_loss = True
     use_miles_router = True
     skip_eval_before_train = True
     update_weight_buffer_size = 4 * 512 * 1024 * 1024
@@ -101,7 +107,7 @@ class _Miles(MilesConfig):
     eps_clip = 0.2
     eps_clip_high = 0.28
     # use_kl_loss = True
-    # use_tis = True
+    use_tis = True
 
     optimizer = "adam"
     lr = 1e-6
@@ -141,22 +147,24 @@ class _Miles(MilesConfig):
     sglang_mem_fraction_static = 0.7
     sglang_ep_size = 8
     sglang_server_concurrency = 1024
-    use_tis = True
     # use_rollout_routing_replay = True
 
     use_wandb = True
     wandb_project = "miles-kimi-k25"
     wandb_group = "kimi-k25"
     disable_wandb_random_suffix = True
+    # check_weight_update_equal = True
 
-    def prepare_model(self) -> None:
+    def download_model(self) -> None:
         # Kimi-K2.5 currently needs this upstream source patch before use:
         # https://huggingface.co/moonshotai/Kimi-K2.5/discussions/91
         from pathlib import Path
 
-        from huggingface_hub import snapshot_download
+        from modal_helpers.utils import resolve_checkpoint_ref
 
-        model_dir = Path(snapshot_download(repo_id=self.hf_checkpoint))
+        model_dir = Path(
+            resolve_checkpoint_ref(self.source_hf_checkpoint, local_files_only=False)
+        )
         model_file = model_dir / "modeling_kimi_k25.py"
         src = model_file.read_text()
 
@@ -196,7 +204,51 @@ class _Miles(MilesConfig):
         src = src.replace(layer_old, layer_new, 1)
         model_file.write_text(src)
 
-    def prepare_data(self) -> None:
+    def post_process_model(self) -> None:
+        import shlex
+        import subprocess
+
+        from modal_helpers.utils import resolve_checkpoint_ref
+
+        if not self.source_hf_checkpoint:
+            raise ValueError("kimi_k25 requires source_hf_checkpoint")
+
+        source_hf_path = resolve_checkpoint_ref(self.source_hf_checkpoint)
+        int4_path = str(self.hf_checkpoint)
+        bf16_path = str(self.ref_load)
+        tools_dir = "/root/miles/tools"
+
+        int4_cmd = [
+            "python",
+            f"{tools_dir}/convert_hf_to_int4_direct.py",
+            "--model-dir",
+            source_hf_path,
+            "--save-dir",
+            int4_path,
+            "--group-size",
+            self.environment["OPEN_TRAINING_INT4_GROUP_SIZE"],
+        ]
+        print(
+            "\n=== Converting Kimi HF checkpoint to INT4: "
+            f"{' '.join(shlex.quote(arg) for arg in int4_cmd)} ==="
+        )
+        subprocess.run(int4_cmd, check=True)
+
+        bf16_cmd = [
+            "python",
+            f"{tools_dir}/convert_kimi_int4_to_bf16.py",
+            "--model-dir",
+            source_hf_path,
+            "--output-dir",
+            bf16_path,
+        ]
+        print(
+            "\n=== Converting Kimi native INT4 checkpoint to BF16: "
+            f"{' '.join(shlex.quote(arg) for arg in bf16_cmd)} ==="
+        )
+        subprocess.run(bf16_cmd, check=True)
+
+    def download_data(self) -> None:
         import os
         from huggingface_hub import snapshot_download
 
