@@ -70,9 +70,9 @@ Use `-d` to keep the Modal job running after the terminal disconnects.
 ```bash
 export EXPERIMENT_CONFIG=kimi_k25
 
-modal run miles/modal_train.py::download_model
-modal run miles/modal_train.py::post_process_model
-modal run miles/modal_train.py::download_data
+modal run -d miles/modal_train.py::download_model
+modal run -d miles/modal_train.py::post_process_model
+modal run -d miles/modal_train.py::download_data
 modal run -d miles/modal_train.py::train
 ```
 
