@@ -26,6 +26,7 @@ sandbox_image = modal.Image.debian_slim(python_version="3.11").apt_install(
     "kmod",
     "socat",
     "python3-websockify",
+    "genisoimage",
 )
 
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
@@ -243,6 +244,21 @@ class VMHandler(BaseHTTPRequestHandler):
                 self._json_response({"error": "timeout"}, 504)
             except Exception as e:
                 self._json_response({"error": str(e)}, 500)
+        elif self.path == "/guest-file":
+            # Read a file from the Windows guest via its HTTP file server
+            import urllib.request, urllib.error
+            guest_path = body.get("path", "")
+            timeout = body.get("timeout", 10)
+            url = f"http://127.0.0.1:9999/{guest_path}"
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    content = resp.read().decode("utf-8", errors="replace")
+                self._json_response({"content": content, "path": guest_path})
+            except urllib.error.HTTPError as e:
+                self._json_response({"error": f"HTTP {e.code}", "path": guest_path}, e.code)
+            except Exception as e:
+                self._json_response({"error": str(e), "path": guest_path}, 500)
         else:
             self._json_response({"error": "not found"}, 404)
 
@@ -257,6 +273,25 @@ def main():
 if __name__ == "__main__":
     main()
 ''').lstrip()
+
+
+# PowerShell HTTP file server that runs inside the Windows guest.
+# Written to a floppy image and copied during login.
+_FILESERVER_PS1 = r"""$h=[System.Net.HttpListener]::new()
+$h.Prefixes.Add("http://*:9999/")
+$h.Start()
+while($true){
+    $c=$h.GetContext()
+    $p=$c.Request.Url.LocalPath.TrimStart('/')
+    try{
+        $b=[IO.File]::ReadAllBytes($p)
+        $c.Response.OutputStream.Write($b,0,$b.Length)
+    }catch{
+        $c.Response.StatusCode=404
+    }
+    $c.Response.Close()
+}
+"""
 
 
 # Entrypoint that boots QEMU from a COW overlay disk
@@ -274,6 +309,13 @@ echo "Created COW overlay: $OVERLAY (backing: $BASE_DISK)"
 # Copy OVMF vars so each VM gets its own UEFI state
 cp "$OVMF_VARS_SRC" /tmp/ovmf_vars.fd
 
+# Create a small ISO image with utility scripts for the guest
+ISO="/tmp/scripts.iso"
+mkdir -p /tmp/isodir
+cp /sandbox/fileserver.ps1 /tmp/isodir/
+genisoimage -quiet -o $ISO -J -R /tmp/isodir
+echo "Created ISO with guest scripts"
+
 QEMU_ARGS=(
     -enable-kvm -m 4096 -cpu host -smp 4
     -drive "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd"
@@ -285,6 +327,8 @@ QEMU_ARGS=(
     -daemonize -pidfile /tmp/qemu.pid
     -usb -device usb-tablet
     -vga std
+    -nic "user,hostfwd=tcp:127.0.0.1:9999-:9999"
+    -drive "file=$ISO,media=cdrom,readonly=on"
 )
 
 echo "=== Starting QEMU ==="
@@ -331,8 +375,9 @@ def create_rollout_sandbox(timeout: int = 3600) -> tuple[modal.Sandbox, WindowsV
         volumes={"/vol": vol},
     )
 
-    # Upload the RPC server
+    # Upload the RPC server and guest file server script
     _write_b64(sb, "/sandbox/server.py", _SERVER_PY.encode())
+    _write_b64(sb, "/sandbox/fileserver.ps1", _FILESERVER_PS1.encode())
 
     # Write and run the entrypoint
     _write_b64(sb, "/sandbox/entrypoint.sh", _ENTRYPOINT.encode())
@@ -350,4 +395,5 @@ def boot_and_login(timeout: int = 3600) -> tuple[modal.Sandbox, WindowsVM]:
     sb, vm = create_rollout_sandbox(timeout=timeout)
     vm.wait_for_screen(timeout=300)
     vm.login(ADMIN_PASSWORD)
+    vm.setup_file_server()
     return sb, vm

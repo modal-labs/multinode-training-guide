@@ -182,14 +182,12 @@ class WindowsComputerUseEnv:
         if self.vm is None:
             return 0.0
         try:
-            result = self.vm.exec(
-                'powershell -Command "Get-Content C:\\output.txt -Raw"',
-                timeout=10,
-            )
-            content = result.get("stdout", "").strip()
+            content = self.vm.read_guest_file("C:/output.txt", timeout=10)
+            if content is None:
+                return 0.0
+            content = content.strip()
             if content == self.target_text:
                 return 1.0
-            # Partial credit for partial match
             if self.target_text.lower() in content.lower():
                 return 0.5
             if len(content) > 0:

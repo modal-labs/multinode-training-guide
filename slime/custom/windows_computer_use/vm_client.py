@@ -135,20 +135,58 @@ class WindowsVM:
 
     # ----- Lifecycle -----
 
+    def read_guest_file(self, guest_path: str, timeout: int = 10) -> str | None:
+        """Read a file from inside the Windows guest via its HTTP file server."""
+        resp = self._post_long(
+            "/guest-file", {"path": guest_path, "timeout": timeout}, timeout=timeout + 5
+        )
+        if "error" in resp:
+            return None
+        return resp.get("content")
+
+    def _open_powershell(self):
+        """Minimize all, then open a fresh PowerShell via Run dialog."""
+        self.sendkey("meta_l-d")
+        time.sleep(2)
+        self.sendkey("meta_l-r")
+        time.sleep(3)
+        self.type_line("powershell")
+        time.sleep(5)
+
     def login(self, password: str):
         self.sendkey("ctrl-alt-delete")
         time.sleep(8)
         self.type_text(password, delay=0.15)
         self.sendkey("ret")
-        time.sleep(25)
-        self.sendkey("meta_l-r")
-        time.sleep(3)
-        self.type_line("powershell")
-        time.sleep(5)
+        time.sleep(30)
+        # Disable screen timeout
+        self._open_powershell()
         self.type_line("powercfg /change monitor-timeout-ac 0")
         time.sleep(1)
         self.type_line("powercfg /change standby-timeout-ac 0")
         time.sleep(1)
+        self.sendkey("meta_l-d")
+        time.sleep(2)
+
+    def setup_file_server(self):
+        """Open a fresh PowerShell and start the guest HTTP file server."""
+        self._open_powershell()
+        # Firewall rule
+        self.type_line(
+            "netsh advfirewall firewall add rule name=FS"
+            " dir=in action=allow protocol=TCP localport=9999"
+        )
+        time.sleep(5)
+        # Copy script from CD-ROM (E:) and launch
+        self.type_line("copy E:\\fileserver.ps1 C:\\fileserver.ps1 -Force")
+        time.sleep(3)
+        self.type_line(
+            "Start-Job {powershell -ExecutionPolicy Bypass"
+            " -File C:\\fileserver.ps1}"
+        )
+        time.sleep(5)
+        self.sendkey("meta_l-d")
+        time.sleep(2)
 
     def shutdown(self) -> dict:
         return self._post("/shutdown")
