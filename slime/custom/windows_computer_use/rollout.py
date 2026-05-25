@@ -535,7 +535,11 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         print(f"[generate] EXCEPTION: {type(_exc).__name__}: {_exc}")
         import traceback
         traceback.print_exc()
-        raise
+        sample.metadata["env_reward"] = 0.0
+        sample.status = Sample.Status.COMPLETED
+        return _finalize_sample(
+            sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer
+        )
     finally:
         try:
             await _aio_gen.to_thread(env.close)

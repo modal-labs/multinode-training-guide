@@ -390,18 +390,32 @@ def create_rollout_sandbox(timeout: int = 3600) -> tuple[modal.Sandbox, WindowsV
     return sb, vm
 
 
-def boot_and_login(timeout: int = 3600) -> tuple[modal.Sandbox, WindowsVM]:
+def boot_and_login(timeout: int = 3600, retries: int = 2) -> tuple[modal.Sandbox, WindowsVM]:
     """Create a sandbox, boot Windows, login, and return ready-to-use VM."""
     import time as _time
 
-    t0 = _time.time()
-    print(f"[boot_and_login] Creating sandbox...")
-    sb, vm = create_rollout_sandbox(timeout=timeout)
-    print(f"[boot_and_login] Sandbox created in {_time.time()-t0:.0f}s, waiting for screen...")
-    vm.wait_for_screen(timeout=300)
-    print(f"[boot_and_login] Screen ready at {_time.time()-t0:.0f}s, logging in...")
-    vm.login(ADMIN_PASSWORD)
-    print(f"[boot_and_login] Login done at {_time.time()-t0:.0f}s, setting up file server...")
-    vm.setup_file_server()
-    print(f"[boot_and_login] File server ready. Total boot time: {_time.time()-t0:.0f}s")
-    return sb, vm
+    for attempt in range(retries + 1):
+        t0 = _time.time()
+        sb = None
+        try:
+            print(f"[boot_and_login] Creating sandbox (attempt {attempt+1}/{retries+1})...")
+            sb, vm = create_rollout_sandbox(timeout=timeout)
+            print(f"[boot_and_login] Sandbox created in {_time.time()-t0:.0f}s, waiting for screen...")
+            vm.wait_for_screen(timeout=300)
+            print(f"[boot_and_login] Screen ready at {_time.time()-t0:.0f}s, logging in...")
+            vm.login(ADMIN_PASSWORD)
+            print(f"[boot_and_login] Login done at {_time.time()-t0:.0f}s, setting up file server...")
+            vm.setup_file_server()
+            print(f"[boot_and_login] File server ready. Total boot time: {_time.time()-t0:.0f}s")
+            return sb, vm
+        except Exception as e:
+            print(f"[boot_and_login] Attempt {attempt+1} failed: {type(e).__name__}: {e}")
+            if sb is not None:
+                try:
+                    sb.terminate()
+                except Exception:
+                    pass
+            if attempt >= retries:
+                raise
+            _time.sleep(5)
+    raise RuntimeError("boot_and_login: all retries exhausted")
