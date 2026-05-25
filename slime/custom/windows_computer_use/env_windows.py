@@ -79,6 +79,69 @@ def _execute_action(vm, action: dict) -> str:
         return f"Unknown action: {verb}"
 
 
+# ── Reward checkers ───────────────────────────────────────────────────────────
+
+
+def _check_exact_match(content: str, target: str) -> float:
+    content = content.strip()
+    if content == target:
+        return 1.0
+    if target.lower() in content.lower():
+        return 0.5
+    if len(content) > 0:
+        return 0.2
+    return 0.0
+
+
+def _check_date_format(content: str, _target: str) -> float:
+    content = content.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", content):
+        return 1.0
+    if re.search(r"\d{4}-\d{2}-\d{2}", content):
+        return 0.5
+    if len(content) > 0:
+        return 0.1
+    return 0.0
+
+
+def _check_has_windows_dirs(content: str, _target: str) -> float:
+    content_lower = content.lower()
+    known = ["windows", "users", "program files"]
+    found = sum(1 for d in known if d in content_lower)
+    if found >= 2:
+        return 1.0
+    if found >= 1:
+        return 0.5
+    if len(content.strip()) > 0:
+        return 0.1
+    return 0.0
+
+
+def _check_non_empty(content: str, _target: str) -> float:
+    return 1.0 if len(content.strip()) > 0 else 0.0
+
+
+def _check_has_step1_step2(content: str, _target: str) -> float:
+    has1 = "step1" in content
+    has2 = "step2" in content
+    if has1 and has2:
+        return 1.0
+    if has1 or has2:
+        return 0.5
+    if len(content.strip()) > 0:
+        return 0.1
+    return 0.0
+
+
+CHECKERS = {
+    "exact_match": _check_exact_match,
+    "date_format": _check_date_format,
+    "has_windows_dirs": _check_has_windows_dirs,
+    "non_empty": _check_non_empty,
+    "has_step1_step2": _check_has_step1_step2,
+}
+
+
 class WindowsComputerUseEnv:
     """RL environment: control a Windows VM via screenshots + actions.
 
@@ -89,8 +152,18 @@ class WindowsComputerUseEnv:
       - close()
     """
 
-    def __init__(self, *, target_text: str, vm=None, sandbox=None):
+    def __init__(
+        self,
+        *,
+        target_text: str,
+        output_path: str = "C:/output.txt",
+        checker: str = "exact_match",
+        vm=None,
+        sandbox=None,
+    ):
         self.target_text = target_text
+        self.output_path = output_path
+        self.checker_name = checker
         self.vm = vm
         self.sandbox = sandbox
         self.turn = 0
@@ -182,17 +255,11 @@ class WindowsComputerUseEnv:
         if self.vm is None:
             return 0.0
         try:
-            content = self.vm.read_guest_file("C:/output.txt", timeout=10)
+            content = self.vm.read_guest_file(self.output_path, timeout=10)
             if content is None:
                 return 0.0
-            content = content.strip()
-            if content == self.target_text:
-                return 1.0
-            if self.target_text.lower() in content.lower():
-                return 0.5
-            if len(content) > 0:
-                return 0.2
-            return 0.0
+            checker_fn = CHECKERS.get(self.checker_name, _check_exact_match)
+            return checker_fn(content, self.target_text)
         except Exception:
             return 0.0
 
@@ -200,6 +267,26 @@ class WindowsComputerUseEnv:
 # --------------------------------------------------------------------------
 # Slime env factory — called by the rollout to instantiate the env
 # --------------------------------------------------------------------------
+
+
+def _parse_target(raw_target: str) -> tuple[str, str, str]:
+    """Parse the target field which may be JSON-encoded task metadata.
+
+    Returns (target_text, output_path, checker).
+    """
+    import json as _json
+
+    if raw_target.startswith("{"):
+        try:
+            payload = _json.loads(raw_target)
+            return (
+                payload.get("text", ""),
+                payload.get("output_path", "C:/output.txt"),
+                payload.get("checker", "exact_match"),
+            )
+        except _json.JSONDecodeError:
+            pass
+    return raw_target, "C:/output.txt", "exact_match"
 
 
 def build_env(sample=None, args=None, **_) -> WindowsComputerUseEnv:
@@ -211,16 +298,26 @@ def build_env(sample=None, args=None, **_) -> WindowsComputerUseEnv:
     from custom.windows_computer_use.sandbox_manager import boot_and_login
 
     target_text = ""
+    output_path = "C:/output.txt"
+    checker = "exact_match"
+
     if sample is not None:
-        metadata = getattr(sample, "metadata", None) or {}
-        target_text = metadata.get("target", "")
-        if not target_text and hasattr(sample, "label"):
-            target_text = sample.label or ""
+        # First try sample.label (set by label_key in config)
+        raw_target = ""
+        if hasattr(sample, "label") and sample.label:
+            raw_target = sample.label
+        else:
+            metadata = getattr(sample, "metadata", None) or {}
+            raw_target = metadata.get("target", "")
+
+        target_text, output_path, checker = _parse_target(raw_target)
 
     sb, vm = boot_and_login(timeout=1800)
 
     return WindowsComputerUseEnv(
         target_text=target_text,
+        output_path=output_path,
+        checker=checker,
         vm=vm,
         sandbox=sb,
     )

@@ -2,7 +2,8 @@
 
 Train a vision-language model (Qwen3-VL-2B) to control a Windows desktop via
 RL (GRPO). The model sees screenshots and emits keyboard actions to accomplish
-tasks like opening Notepad, typing text, and saving files.
+tasks ranging from simple Notepad saves to PowerShell commands and multi-step
+file operations.
 
 ## Architecture
 
@@ -17,7 +18,7 @@ Slime (GRPO on Modal H200s)
   │     4. Execute action on VM via RPC
   │     5. Repeat until <done/> or max_turns
   │
-  │  Reward: check if C:\output.txt matches the target text
+  │  Reward: check output file with task-specific checker
   ▼
 Windows VM (Modal Sandbox with QEMU/KVM)
   └── Windows Server 2022 + RPC server
@@ -46,19 +47,31 @@ EXPERIMENT_CONFIG=qwen3vl_windows_computer_use modal run slime/modal_train.py::p
 
 # 3. Train (detached)
 EXPERIMENT_CONFIG=qwen3vl_windows_computer_use modal run -d slime/modal_train.py::train
+
+# Smoke test (boots VM, runs tasks, checks varying rewards)
+modal run slime/test_windows_env.py
 ```
 
-## Task: Notepad File Saving
+## Task Levels
 
-The initial task is deliberately simple — open Notepad, type a specific sentence,
-and save it as `C:\output.txt`:
+The dataset contains 47 tasks across 4 difficulty levels:
 
-1. Model receives: a screenshot + instruction ("type 'Hello World' and save as C:\output.txt")
-2. Expected actions: `sendkey meta_l-r` → `type notepad` → `sendkey ret` → wait →
-   `type Hello World` → `sendkey ctrl-s` → navigate save dialog → `<done/>`
-3. Reward: binary check — does `C:\output.txt` contain the exact target text?
+| Level | Type | Count | Description |
+|-------|------|-------|-------------|
+| 1 | `notepad_simple` | 30 | Type text, save as `C:\output.txt` |
+| 2 | `notepad_filename` | 8 | Type text, save to a specified filename |
+| 3 | `powershell` | 6 | Run PowerShell commands to create files |
+| 4 | `multistep` | 3 | Create directories + files in sequence |
 
-The dataset contains 50 different sentences at varying lengths.
+### Reward Checkers
+
+Each task specifies a checker function for computing reward:
+
+- **`exact_match`** — 1.0 for exact match, 0.5 for case-insensitive substring, 0.2 for any content, 0.0 for empty
+- **`date_format`** — 1.0 for YYYY-MM-DD on its own, 0.5 if present in longer text
+- **`has_windows_dirs`** — checks for Windows/Users/Program Files in directory listing
+- **`non_empty`** — 1.0 for any non-empty content
+- **`has_step1_step2`** — checks for multi-step file append results
 
 ## Action Space
 
@@ -78,7 +91,7 @@ The dataset contains 50 different sentences at varying lengths.
 | `custom/windows_computer_use/env_windows.py` | RL environment wrapping the Windows VM |
 | `custom/windows_computer_use/rollout.py` | VLM multi-turn rollout (generate function) |
 | `custom/windows_computer_use/reward.py` | Custom reward model |
-| `custom/windows_computer_use/dataset.py` | Dataset generation |
+| `custom/windows_computer_use/dataset.py` | Multi-task dataset generation |
 | `custom/windows_computer_use/sandbox_manager.py` | VM lifecycle (boot, COW disk, login) |
 | `custom/windows_computer_use/vm_client.py` | HTTP client for the in-VM RPC server |
 
@@ -100,9 +113,15 @@ The rollout follows Slime's VLM multi-turn pattern (same as `geo3k_vlm_multi_tur
 - Only model-generated tokens are trained (`loss_mask=0` for observations)
 - The environment computes reward at episode end
 
+### Task metadata encoding
+
+Task metadata (output path, checker type, difficulty) is JSON-encoded in the
+`target` column of the parquet dataset. The `build_env` function parses this
+to configure each rollout with the correct output path and reward checker.
+
 ### Scaling up
 
 To try harder tasks or larger models:
 - Change `hf_checkpoint` and `slime_model_script` in the config
-- Add new environment classes for different Windows tasks
+- Add new task types in `dataset.py` and corresponding checkers in `env_windows.py`
 - Increase `actor_num_gpus_per_node` / `tensor_model_parallel_size` for larger models

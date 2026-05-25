@@ -1,8 +1,8 @@
 """Qwen3-VL-2B-Instruct GRPO for Windows computer use.
 
 Trains a VLM to control a Windows VM by looking at screenshots and
-emitting keyboard/mouse actions. The task: open Notepad, type a
-sentence, save it as C:\\output.txt.
+emitting keyboard/mouse actions. Tasks range from simple Notepad save
+to PowerShell commands and multi-step file operations.
 
 Uses Slime's VLM multi-turn rollout with a custom environment that
 wraps Windows sandboxes (QEMU VMs on Modal).
@@ -67,7 +67,7 @@ class _Slime(SlimeConfig):
     custom_generate_function_path = "custom.windows_computer_use.rollout.generate"
     custom_rm_path = "custom.windows_computer_use.reward.compute_reward"
     custom_config_path = {
-        "max_turns": 10,
+        "max_turns": 15,
         "rollout_interaction_env_path": ("custom.windows_computer_use.env_windows"),
     }
 
@@ -110,7 +110,7 @@ class _Slime(SlimeConfig):
     # ── WandB ─────────────────────────────────────────────────────────────────
     use_wandb = True
     wandb_project = "slime-windows-computer-use"
-    wandb_group = "qwen3-vl-2b-notepad"
+    wandb_group = "qwen3-vl-2b-windows-multitask"
     disable_wandb_random_suffix = True
 
     def prepare_data(self) -> None:

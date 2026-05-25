@@ -181,8 +181,7 @@ class WindowsVM:
         self.type_line("copy E:\\fileserver.ps1 C:\\fileserver.ps1 -Force")
         time.sleep(3)
         self.type_line(
-            "Start-Job {powershell -ExecutionPolicy Bypass"
-            " -File C:\\fileserver.ps1}"
+            "Start-Job {powershell -ExecutionPolicy Bypass -File C:\\fileserver.ps1}"
         )
         time.sleep(5)
         self.sendkey("meta_l-d")
