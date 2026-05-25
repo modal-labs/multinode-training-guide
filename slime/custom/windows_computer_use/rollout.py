@@ -57,6 +57,13 @@ def _build_env(env_module, sample: Sample, args: Any):
         return build_fn(sample, args)
 
 
+async def _build_env_async(env_module, sample: Sample, args: Any):
+    """Build env in a thread to avoid blocking the async event loop."""
+    import asyncio as _aio
+
+    return await _aio.to_thread(_build_env, env_module, sample, args)
+
+
 def _encode_observation_for_generation(
     tokenizer,
     processor,
@@ -136,7 +143,7 @@ def _merge_multimodal_train_inputs(chunks: list[dict | None]) -> dict | None:
     return merged
 
 
-def _initialize_resources(args: Any, sample: Sample):
+async def _initialize_resources(args: Any, sample: Sample):
     env_module = _load_env_module(getattr(args, "rollout_interaction_env_path", None))
     max_turns = getattr(args, "max_turns", None)
     if max_turns is None:
@@ -145,7 +152,7 @@ def _initialize_resources(args: Any, sample: Sample):
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     sample.metadata = sample.metadata or {}
-    env = _build_env(env_module, sample, args)
+    env = await _build_env_async(env_module, sample, args)
     config = {"max_turns": max_turns}
     return env, env_module, config, state, url
 
@@ -250,8 +257,10 @@ async def _run_inference_step(url, tokens, sampling_params, image_data, tokenize
     return response_text, new_tokens, new_log_probs, finish_type
 
 
-def _process_env_step(env, response_text, tokenizer, processor, args, sample_metadata):
-    observation, done, step_info = env.step(response_text)
+async def _process_env_step(env, response_text, tokenizer, processor, args, sample_metadata):
+    import asyncio as _aio
+
+    observation, done, step_info = await _aio.to_thread(env.step, response_text)
     if done:
         return None, None, None, None, True, step_info
 
@@ -376,7 +385,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         "Partial rollout is not supported for interaction rollouts."
     )
 
-    env, env_module, config, state, url = _initialize_resources(args, sample)
+    env, env_module, config, state, url = await _initialize_resources(args, sample)
     print(f"[generate] Env built in {_time.time()-_t0:.0f}s")
     sampling_params = sampling_params.copy()
 
@@ -385,8 +394,10 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
     )
 
     try:
+        import asyncio as _aio_gen
+
         print(f"[generate] Resetting env...")
-        obs, _ = env.reset()
+        obs, _ = await _aio_gen.to_thread(env.reset)
         print(f"[generate] Env reset done at {_time.time()-_t0:.0f}s")
 
         # Encode the initial observation (screenshot) and prepend to context
@@ -463,7 +474,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 break
 
             obs_ids, obs_imgs, obs_mm, obs_mm_train, done, step_info = (
-                _process_env_step(
+                await _process_env_step(
                     env,
                     response_text,
                     state.tokenizer,
@@ -502,7 +513,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
             if turn_idx + 1 >= config["max_turns"]:
                 # Max turns reached without <done/>, compute reward anyway
-                reward = env._compute_reward()
+                reward = await _aio_gen.to_thread(env._compute_reward)
                 sample.metadata["env_reward"] = reward
                 sample.status = Sample.Status.COMPLETED
                 break
@@ -518,6 +529,6 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         raise
     finally:
         try:
-            env.close()
+            await _aio_gen.to_thread(env.close)
         except Exception:
             pass
