@@ -53,9 +53,9 @@ class _Slime(SlimeConfig):
     rm_type = "custom"
 
     # ── Rollout — VLM multi-turn with Windows env ─────────────────────────────
-    num_rollout = 8
+    num_rollout = 4
     rollout_batch_size = 8
-    n_samples_per_prompt = 4
+    n_samples_per_prompt = 8
     rollout_max_response_len = 4096
     rollout_temperature = 1.0
     rollout_num_gpus_per_engine = 1
@@ -101,7 +101,7 @@ class _Slime(SlimeConfig):
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = "adam"
-    lr = 5e-6
+    lr = 1e-5
     lr_decay_style = "constant"
     weight_decay = 0.1
     adam_beta1 = 0.9
