@@ -53,21 +53,21 @@ class _Slime(SlimeConfig):
     rm_type = "custom"
 
     # ── Rollout — VLM multi-turn with Windows env ─────────────────────────────
-    num_rollout = 200
-    rollout_batch_size = 4
-    n_samples_per_prompt = 2
+    num_rollout = 8
+    rollout_batch_size = 2
+    n_samples_per_prompt = 1
     rollout_max_response_len = 4096
     rollout_temperature = 0.8
     rollout_num_gpus_per_engine = 1
     sglang_mem_fraction_static = 0.7
     sglang_cuda_graph_bs = [1, 2, 4, 8, 16, 24, 32]
-    global_batch_size = 32
+    global_batch_size = 8
 
     # Custom multi-turn VLM rollout + environment + reward
     custom_generate_function_path = "custom.windows_computer_use.rollout.generate"
     custom_rm_path = "custom.windows_computer_use.reward.compute_reward"
     custom_config_path = {
-        "max_turns": 15,
+        "max_turns": 10,
         "rollout_interaction_env_path": ("custom.windows_computer_use.env_windows"),
     }
 

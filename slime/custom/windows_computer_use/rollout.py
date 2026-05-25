@@ -345,11 +345,17 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
     This is the `--custom-generate-function-path` entry point.
     """
+    import time as _time
+
+    _t0 = _time.time()
+    print(f"[generate] Starting rollout for sample...")
+
     assert not getattr(args, "partial_rollout", False), (
         "Partial rollout is not supported for interaction rollouts."
     )
 
     env, env_module, config, state, url = _initialize_resources(args, sample)
+    print(f"[generate] Env built in {_time.time()-_t0:.0f}s")
     sampling_params = sampling_params.copy()
 
     current_image_data, response_tokens, budget, multimodal_train_inputs_buffer = (
@@ -357,7 +363,9 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
     )
 
     try:
+        print(f"[generate] Resetting env...")
         obs, _ = env.reset()
+        print(f"[generate] Env reset done at {_time.time()-_t0:.0f}s")
 
         # Encode the initial observation (screenshot) and prepend to context
         if obs.get("multi_modal_data"):
@@ -393,7 +401,9 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             return sample
 
+        print(f"[generate] Starting turns (max={config['max_turns']})")
         for turn_idx in range(config["max_turns"]):
+            print(f"[generate] Turn {turn_idx+1}/{config['max_turns']} at {_time.time()-_t0:.0f}s")
             cur_sampling_params = sampling_params.copy()
             if budget is not None:
                 cur_sampling_params["max_new_tokens"] = budget
@@ -439,6 +449,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 reward = (step_info or {}).get("reward", 0.0)
                 sample.metadata["env_reward"] = reward
                 sample.status = Sample.Status.COMPLETED
+                print(f"[generate] Done at turn {turn_idx+1}, reward={reward:.2f}, total={_time.time()-_t0:.0f}s")
                 break
 
             obs_logprobs = [0.0] * len(obs_ids)
