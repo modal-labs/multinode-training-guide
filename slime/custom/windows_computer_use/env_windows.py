@@ -285,19 +285,21 @@ class WindowsComputerUseEnv:
                 pass
 
         if task_reward >= 0.5:
-            return task_reward
+            return task_reward * 5.0
 
         shaping = 0.0
         if self.partial_format_count > 0:
-            shaping += min(self.partial_format_count * 0.03, 0.06)
+            shaping += min(self.partial_format_count * 0.2, 0.4)
         if self.valid_action_count > 0:
-            shaping += min(self.valid_action_count * 0.05, 0.15)
+            shaping += min(self.valid_action_count * 0.3, 1.0)
         relevant = {"sendkey", "type", "typeline", "wait"}
         if self.action_verbs_used & relevant:
-            shaping += 0.1
+            shaping += 0.5
+        if len(self.action_verbs_used & relevant) >= 2:
+            shaping += 0.5
         if self.done_signaled:
-            shaping += 0.1
-        return min(shaping, 0.4)
+            shaping += 0.5
+        return min(shaping, 3.0)
 
 
 # --------------------------------------------------------------------------
