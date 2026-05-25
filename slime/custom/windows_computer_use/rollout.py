@@ -486,6 +486,11 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer
         )
 
+    except Exception as _exc:
+        print(f"[generate] EXCEPTION: {type(_exc).__name__}: {_exc}")
+        import traceback
+        traceback.print_exc()
+        raise
     finally:
         try:
             env.close()
