@@ -438,6 +438,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             return sample
 
+        all_response_texts: list[str] = []
         print(f"[generate] Starting turns (max={config['max_turns']})")
         for turn_idx in range(config["max_turns"]):
             print(f"[generate] Turn {turn_idx+1}/{config['max_turns']} at {_time.time()-_t0:.0f}s")
@@ -459,6 +460,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             print(f"[generate] Turn {turn_idx+1} inference done: {len(new_tokens)} tokens, finish={finish_type}, text={response_text[:200]!r}")
+            all_response_texts.append(response_text)
             _append_to_sample(
                 sample, response_tokens, new_tokens, new_logprobs, loss_mask_val=1
             )
@@ -527,6 +529,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 sample.status = Sample.Status.COMPLETED
                 break
 
+        sample.metadata["all_response_texts"] = all_response_texts
         return _finalize_sample(
             sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer
         )
@@ -536,6 +539,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         import traceback
         traceback.print_exc()
         sample.metadata["env_reward"] = 0.0
+        sample.metadata["all_response_texts"] = all_response_texts
         sample.status = Sample.Status.COMPLETED
         return _finalize_sample(
             sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer
