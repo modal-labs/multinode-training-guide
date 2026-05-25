@@ -204,7 +204,23 @@ def _prepare_start_state(sample, state, args, sampling_params):
     return current_image_data, response_tokens, budget, multimodal_train_inputs_buffer
 
 
+_checked_router = False
+
+
 async def _run_inference_step(url, tokens, sampling_params, image_data, tokenizer):
+    global _checked_router
+    if not _checked_router:
+        _checked_router = True
+        try:
+            import aiohttp
+            router_base = url.rsplit("/generate", 1)[0]
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(f"{router_base}/workers", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    workers = await resp.json()
+                    print(f"[inference] Router workers: {workers}")
+        except Exception as e:
+            print(f"[inference] Failed to query router workers: {e}")
+
     payload = {
         "input_ids": tokens,
         "sampling_params": sampling_params,
