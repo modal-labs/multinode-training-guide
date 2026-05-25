@@ -216,12 +216,16 @@ class WindowsComputerUseEnv:
 
     def format_observation(self, observation: dict) -> dict:
         """Convert observation to a chat message with image content."""
+        from PIL import Image as _PILImage
+
         observation = observation or {}
         content: list[dict] = []
 
         multimodal = observation.get("multi_modal_data") or {}
         for _, images in multimodal.items():
             for image in images:
+                if isinstance(image, bytes):
+                    image = _PILImage.open(io.BytesIO(image))
                 content.append({"type": "image", "image": image})
 
         obs_text = observation.get("obs_str", "")
