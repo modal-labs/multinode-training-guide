@@ -168,10 +168,16 @@ class WindowsComputerUseEnv:
         self.sandbox = sandbox
         self.turn = 0
         self.last_reward: float = 0.0
+        self.valid_action_count = 0
+        self.done_signaled = False
+        self.action_verbs_used: set[str] = set()
 
     def reset(self) -> tuple[dict, dict]:
         self.turn = 0
         self.last_reward = 0.0
+        self.valid_action_count = 0
+        self.done_signaled = False
+        self.action_verbs_used = set()
 
         screenshot = self._take_screenshot()
         obs = {
@@ -198,10 +204,13 @@ class WindowsComputerUseEnv:
             return obs, False, {}
 
         if action["verb"] == "done":
+            self.done_signaled = True
             reward = self._compute_reward()
             self.last_reward = reward
             return {}, True, {"reward": reward}
 
+        self.valid_action_count += 1
+        self.action_verbs_used.add(action["verb"])
         status = _execute_action(self.vm, action)
         logger.info("Turn %d: %s → %s", self.turn, action, status)
 
@@ -255,17 +264,34 @@ class WindowsComputerUseEnv:
             return None
 
     def _compute_reward(self) -> float:
-        """Check if the target file was created with the correct content."""
-        if self.vm is None:
-            return 0.0
-        try:
-            content = self.vm.read_guest_file(self.output_path, timeout=10)
-            if content is None:
-                return 0.0
-            checker_fn = CHECKERS.get(self.checker_name, _check_exact_match)
-            return checker_fn(content, self.target_text)
-        except Exception:
-            return 0.0
+        """Compute reward with shaping for action quality.
+
+        Task-completion reward (0.5-1.0) dominates when the file is correct.
+        Shaping reward (0.0-0.3) provides gradient signal when the model
+        hasn't completed the task but is producing valid actions.
+        """
+        task_reward = 0.0
+        if self.vm is not None:
+            try:
+                content = self.vm.read_guest_file(self.output_path, timeout=10)
+                if content is not None:
+                    checker_fn = CHECKERS.get(self.checker_name, _check_exact_match)
+                    task_reward = checker_fn(content, self.target_text)
+            except Exception:
+                pass
+
+        if task_reward >= 0.5:
+            return task_reward
+
+        shaping = 0.0
+        if self.valid_action_count > 0:
+            shaping += min(self.valid_action_count * 0.02, 0.1)
+        relevant = {"sendkey", "type", "typeline", "wait"}
+        if self.action_verbs_used & relevant:
+            shaping += 0.05
+        if self.done_signaled:
+            shaping += 0.05
+        return min(shaping, 0.3)
 
 
 # --------------------------------------------------------------------------

@@ -466,11 +466,17 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
             if _should_stop_on_finish(sample, finish_type):
                 print(f"[generate] Stopped: finish_type={finish_type}, budget={budget}")
+                reward = await _aio_gen.to_thread(env._compute_reward)
+                sample.metadata["env_reward"] = reward
+                print(f"[generate] End-of-generation reward={reward:.2f}")
                 break
 
             if budget is not None and budget <= 0:
                 print(f"[generate] BUDGET EXHAUSTED after turn {turn_idx+1}")
+                reward = await _aio_gen.to_thread(env._compute_reward)
+                sample.metadata["env_reward"] = reward
                 sample.status = Sample.Status.TRUNCATED
+                print(f"[generate] Truncated reward={reward:.2f}")
                 break
 
             obs_ids, obs_imgs, obs_mm, obs_mm_train, done, step_info = (
@@ -508,7 +514,10 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             if budget is not None and budget <= 0:
+                reward = await _aio_gen.to_thread(env._compute_reward)
+                sample.metadata["env_reward"] = reward
                 sample.status = Sample.Status.TRUNCATED
+                print(f"[generate] Truncated (post-obs) reward={reward:.2f}")
                 break
 
             if turn_idx + 1 >= config["max_turns"]:
