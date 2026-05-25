@@ -425,15 +425,18 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 state.tokenizer,
             )
 
+            print(f"[generate] Turn {turn_idx+1} inference done: {len(new_tokens)} tokens, finish={finish_type}, text={response_text[:200]!r}")
             _append_to_sample(
                 sample, response_tokens, new_tokens, new_logprobs, loss_mask_val=1
             )
             budget = _update_budget(budget, len(new_tokens))
 
             if _should_stop_on_finish(sample, finish_type):
+                print(f"[generate] Stopped: finish_type={finish_type}, budget={budget}")
                 break
 
             if budget is not None and budget <= 0:
+                print(f"[generate] BUDGET EXHAUSTED after turn {turn_idx+1}")
                 sample.status = Sample.Status.TRUNCATED
                 break
 
