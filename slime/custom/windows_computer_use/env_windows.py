@@ -171,6 +171,7 @@ class WindowsComputerUseEnv:
         self.valid_action_count = 0
         self.done_signaled = False
         self.action_verbs_used: set[str] = set()
+        self.partial_format_count = 0
 
     def reset(self) -> tuple[dict, dict]:
         self.turn = 0
@@ -178,6 +179,7 @@ class WindowsComputerUseEnv:
         self.valid_action_count = 0
         self.done_signaled = False
         self.action_verbs_used = set()
+        self.partial_format_count = 0
 
         screenshot = self._take_screenshot()
         obs = {
@@ -196,6 +198,8 @@ class WindowsComputerUseEnv:
         action = _parse_action(response_text)
 
         if action is None:
+            if "<action" in response_text or "<done" in response_text:
+                self.partial_format_count += 1
             screenshot = self._take_screenshot()
             obs = {
                 "obs_str": "No valid action found. Use <action>VERB ARGS</action>.",
@@ -284,6 +288,8 @@ class WindowsComputerUseEnv:
             return task_reward
 
         shaping = 0.0
+        if self.partial_format_count > 0:
+            shaping += min(self.partial_format_count * 0.03, 0.06)
         if self.valid_action_count > 0:
             shaping += min(self.valid_action_count * 0.05, 0.15)
         relevant = {"sendkey", "type", "typeline", "wait"}

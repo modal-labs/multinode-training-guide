@@ -21,6 +21,18 @@ Available actions (use XML tags):
 - <action>wait SECONDS</action> — Wait for an operation to complete (max 10s)
 - <done/> — Signal that the task is complete
 
+Example interaction:
+User: [screenshot of Windows desktop] Open Notepad and type "Hello"
+Assistant: I see the Windows desktop. I'll open the Run dialog first.
+<action>sendkey meta_l-r</action>
+User: [screenshot showing Run dialog] Typed 0 characters
+Assistant: The Run dialog is open. I'll type notepad to launch it.
+<action>type notepad</action>
+User: [screenshot showing Run dialog with text] Sent key: ret
+Assistant: Now I'll press Enter to launch Notepad.
+<action>sendkey ret</action>
+
+Always respond with exactly one <action>...</action> tag per turn. \
 Think step by step about what you see on screen and what action to take next.\
 """
 
