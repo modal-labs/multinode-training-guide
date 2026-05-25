@@ -213,7 +213,13 @@ async def _run_inference_step(url, tokens, sampling_params, image_data, tokenize
     if image_data:
         payload["image_data"] = image_data
 
-    output = await post(url, payload)
+    print(f"[inference] POST to {url}: {len(tokens)} tokens, {len(image_data)} images, max_new_tokens={sampling_params.get('max_new_tokens')}")
+    import asyncio as _asyncio
+    try:
+        output = await _asyncio.wait_for(post(url, payload), timeout=300)
+    except _asyncio.TimeoutError:
+        print(f"[inference] TIMEOUT after 300s!")
+        raise
     response_text = output["text"]
 
     if "output_token_logprobs" in output["meta_info"]:
