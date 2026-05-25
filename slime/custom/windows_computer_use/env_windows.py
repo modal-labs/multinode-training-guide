@@ -285,13 +285,13 @@ class WindowsComputerUseEnv:
 
         shaping = 0.0
         if self.valid_action_count > 0:
-            shaping += min(self.valid_action_count * 0.02, 0.1)
+            shaping += min(self.valid_action_count * 0.05, 0.15)
         relevant = {"sendkey", "type", "typeline", "wait"}
         if self.action_verbs_used & relevant:
-            shaping += 0.05
+            shaping += 0.1
         if self.done_signaled:
-            shaping += 0.05
-        return min(shaping, 0.3)
+            shaping += 0.1
+        return min(shaping, 0.4)
 
 
 # --------------------------------------------------------------------------
