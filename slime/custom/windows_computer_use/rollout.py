@@ -369,6 +369,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
         # Encode the initial observation (screenshot) and prepend to context
         if obs.get("multi_modal_data"):
+            print(f"[generate] Encoding initial observation...")
             initial_msg = env.format_observation(obs)
             obs_ids, obs_imgs, obs_mm, obs_mm_train = (
                 _encode_observation_for_generation(
@@ -384,6 +385,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             if bos_id is not None and obs_ids and obs_ids[0] == bos_id:
                 obs_ids = obs_ids[1:]
 
+            print(f"[generate] Initial obs encoded: {len(obs_ids)} tokens, budget before={budget}")
             _append_to_sample(
                 sample, response_tokens, obs_ids, [0.0] * len(obs_ids), loss_mask_val=0
             )
@@ -396,8 +398,10 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 multimodal_train_inputs_buffer,
             )
             budget = _update_budget(budget, len(obs_ids))
+            print(f"[generate] Budget after initial obs: {budget}")
 
         if budget is not None and budget <= 0:
+            print(f"[generate] BUDGET EXHAUSTED after initial obs, returning TRUNCATED")
             sample.status = Sample.Status.TRUNCATED
             return sample
 
