@@ -97,7 +97,7 @@ class _Slime(SlimeConfig):
     kl_loss_coef = 0.0
     kl_loss_type = "low_var_kl"
     kl_coef = 0.0
-    entropy_coef = 0.001
+    entropy_coef = 0.0
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = "adam"

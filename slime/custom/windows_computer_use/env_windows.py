@@ -48,6 +48,31 @@ def _parse_action(text: str) -> dict | None:
     return {"verb": verb, "args": args}
 
 
+_TASK_RELEVANT_KEYS = {
+    "meta_l-r": 1.0,  # Win+R
+    "ret": 0.5,  # Enter
+    "ctrl-s": 0.8,  # Save
+    "tab": 0.3,
+    "ctrl-a": 0.3,
+}
+
+
+def _score_action(action: dict) -> float:
+    """Score an action for task-relevance (0.0-1.0)."""
+    verb = action["verb"]
+    args = action["args"]
+    if verb == "sendkey":
+        key = args.replace(" ", "-").lower()
+        return _TASK_RELEVANT_KEYS.get(key, 0.1)
+    elif verb == "type":
+        return 0.5 if len(args) > 0 else 0.1
+    elif verb == "typeline":
+        return 0.6 if len(args) > 0 else 0.1
+    elif verb == "wait":
+        return 0.2
+    return 0.0
+
+
 def _execute_action(vm, action: dict) -> str:
     """Execute a parsed action on the Windows VM.
 
@@ -172,6 +197,7 @@ class WindowsComputerUseEnv:
         self.done_signaled = False
         self.action_verbs_used: set[str] = set()
         self.partial_format_count = 0
+        self.action_quality_sum = 0.0
 
     def reset(self) -> tuple[dict, dict]:
         self.turn = 0
@@ -180,6 +206,7 @@ class WindowsComputerUseEnv:
         self.done_signaled = False
         self.action_verbs_used = set()
         self.partial_format_count = 0
+        self.action_quality_sum = 0.0
 
         screenshot = self._take_screenshot()
         obs = {
@@ -215,6 +242,7 @@ class WindowsComputerUseEnv:
 
         self.valid_action_count += 1
         self.action_verbs_used.add(action["verb"])
+        self.action_quality_sum += _score_action(action)
         status = _execute_action(self.vm, action)
         logger.info("Turn %d: %s → %s", self.turn, action, status)
 
@@ -289,17 +317,16 @@ class WindowsComputerUseEnv:
 
         shaping = 0.0
         if self.partial_format_count > 0:
-            shaping += min(self.partial_format_count * 0.2, 0.4)
+            shaping += min(self.partial_format_count * 0.1, 0.3)
         if self.valid_action_count > 0:
-            shaping += min(self.valid_action_count * 0.3, 1.0)
+            shaping += min(self.valid_action_count * 0.2, 0.6)
+        shaping += min(self.action_quality_sum, 2.0)
         relevant = {"sendkey", "type", "typeline", "wait"}
-        if self.action_verbs_used & relevant:
-            shaping += 0.5
         if len(self.action_verbs_used & relevant) >= 2:
             shaping += 0.5
         if self.done_signaled:
-            shaping += 0.5
-        return min(shaping, 3.0)
+            shaping += 0.3
+        return min(shaping, 4.0)
 
 
 # --------------------------------------------------------------------------
