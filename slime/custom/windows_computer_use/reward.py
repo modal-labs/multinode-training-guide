@@ -99,27 +99,20 @@ def _action_quality_reward(texts: list[str]) -> float:
 
 
 async def compute_reward(args: Any, sample: Sample) -> float:
-    """Compute final reward from env + action quality + brevity bonus.
+    """Compute final reward from env + action quality bonus.
 
     Env reward provides task-completion signal.
     Action quality provides gradient signal for action specificity.
-    Brevity bonus rewards shorter responses (creates within-group variance
-    for GRPO since different completions have different lengths).
     """
     metadata = sample.metadata or {}
     env_reward = float(metadata.get("env_reward", 0.0))
     texts = metadata.get("all_response_texts", [])
     quality = _action_quality_reward(texts) if texts else 0.0
 
-    # Brevity bonus: shorter responses get up to 0.3 extra
-    total_len = sum(len(t) for t in texts) if texts else _MAX_RESPONSE_LEN
-    brevity = max(0.0, 1.0 - total_len / _MAX_RESPONSE_LEN) * 0.3
-
-    # Blend: env reward + quality + brevity
-    raw = env_reward + quality * 0.5 + brevity
+    # Blend: env reward (task progress) + quality bonus (action specificity)
+    raw = env_reward + quality * 0.5
     final = raw * REWARD_SCALE
 
-    if final > 0:
-        first_text = repr(texts[0][:80]) if texts else "N/A"
-        print(f"[RM] env={env_reward:.2f} qual={quality:.2f} brev={brevity:.3f} final={final:.2f} n_texts={len(texts)} first={first_text}")
+    first_text = repr(texts[0][:80]) if texts else "N/A"
+    print(f"[RM] env={env_reward:.2f} qual={quality:.2f} final={final:.2f} n_texts={len(texts)} first={first_text}")
     return final
