@@ -12,11 +12,8 @@ from typing import Any
 
 from slime.utils.types import Sample
 
-_ACTION_RE = re.compile(r"<action>\s*\w+.*?</action>", re.DOTALL)
+_ACTION_CONTENT_RE = re.compile(r"<action>\s*(.*?)\s*</action>", re.DOTALL)
 _DONE_RE = re.compile(r"<done\s*/?>")
-_VERB_RE = re.compile(
-    r"<action>\s*(sendkey|type|typeline|wait)\b.*?</action>", re.DOTALL
-)
 
 # Valid sendkey arguments that the QEMU HMP understands.
 _VALID_KEYS = {
@@ -53,13 +50,14 @@ def _action_quality_reward(texts: list[str]) -> float:
         if not text:
             continue
 
-        actions = _ACTION_RE.findall(text)
-        if len(actions) > 1:
+        # Extract content between <action>...</action> tags
+        action_contents = _ACTION_CONTENT_RE.findall(text)
+        if len(action_contents) > 1:
             multiple_per_turn += 1
 
-        for raw_action in actions:
+        for content in action_contents:
             n_actions += 1
-            parts = raw_action.strip().split(None, 1)
+            parts = content.strip().split(None, 1)
             verb = parts[0].lower() if parts else ""
             args = parts[1].strip() if len(parts) > 1 else ""
 
@@ -75,6 +73,8 @@ def _action_quality_reward(texts: list[str]) -> float:
                 quality_sum += 0.3
             elif verb in ("typeline", "wait"):
                 quality_sum += 0.2
+            elif verb in ("sendkey", "type") and not args:
+                quality_sum += 0.05
             else:
                 quality_sum += 0.05
 
