@@ -29,12 +29,33 @@ _VALID_KEYS = {
 }
 
 
+_VALID_VERBS = {"sendkey", "type", "typeline", "wait"}
+
+
 def _turn_is_good(text: str) -> bool:
-    """Binary per-turn check: does this turn contain a valid action?"""
+    """Binary per-turn check: does this turn contain a valid action?
+
+    Relaxed: any <action> with a recognized verb counts. We want the
+    model to first learn the format, THEN learn correct arguments.
+    """
     contents = _ACTION_CONTENT_RE.findall(text)
     if not contents:
         return False
-    # At least one action must have a recognized verb with arguments
+    for content in contents:
+        parts = content.strip().split(None, 1)
+        if not parts:
+            continue
+        verb = parts[0].lower()
+        if verb in _VALID_VERBS:
+            return True
+    return False
+
+
+def _turn_is_great(text: str) -> bool:
+    """Stricter check: action has valid verb AND meaningful arguments."""
+    contents = _ACTION_CONTENT_RE.findall(text)
+    if not contents:
+        return False
     for content in contents:
         parts = content.strip().split(None, 1)
         if not parts:
@@ -53,37 +74,39 @@ def _turn_is_good(text: str) -> bool:
 
 
 async def compute_reward(args: Any, sample: Sample) -> float:
-    """Binary turn-fraction reward for GRPO variance.
+    """Tiered reward: format → quality → task completion.
 
-    Scores each turn as good (1) or bad (0), then returns the
-    fraction of good turns. Different samples naturally produce
-    different numbers of good turns for the same prompt, creating
-    the within-group variance GRPO needs.
+    Three tiers create natural variance within GRPO groups:
+    - Tier 0 (0.0): no valid action tags at all (gibberish)
+    - Tier 1 (0.5): has valid action verbs but wrong/missing args
+    - Tier 2 (1.0): has valid actions with correct arguments
+    - + env_reward for actual task completion
+    - + done bonus for signaling completion
 
-    Adds env_reward for task completion signal.
+    Reward = (env_reward + quality) * 3.0
     """
     metadata = sample.metadata or {}
     env_reward = float(metadata.get("env_reward", 0.0))
     texts = metadata.get("all_response_texts", [])
 
     if not texts:
-        print(f"[RM] env={env_reward:.2f} good=0/0 final=0.00")
+        print(f"[RM] env={env_reward:.2f} g=0/0 G=0/0 final=0.00")
         return 0.0
 
     n_good = sum(1 for t in texts if _turn_is_good(t))
+    n_great = sum(1 for t in texts if _turn_is_great(t))
     n_total = len(texts)
-    turn_fraction = n_good / n_total if n_total > 0 else 0.0
 
-    # Binary boost: any good turn → 0.5 base, all good → 1.0
-    # No good turns → 0.0
+    # Tiered quality: good (format) + great (content) bonus
     if n_good == 0:
         quality = 0.0
-    elif n_good == n_total:
-        quality = 1.0
     else:
-        quality = 0.3 + 0.7 * turn_fraction
+        # Base: fraction of turns with valid format
+        quality = 0.5 * (n_good / n_total)
+        # Bonus: fraction of turns with correct arguments
+        quality += 0.5 * (n_great / n_total)
 
-    # Check for done signal
+    # Done signal bonus
     has_done = any(_DONE_RE.search(t) for t in texts)
     if has_done:
         quality = min(quality + 0.2, 1.0)
@@ -91,5 +114,5 @@ async def compute_reward(args: Any, sample: Sample) -> float:
     final = (env_reward + quality) * 3.0
 
     first_text = repr(texts[0][:80]) if texts else "N/A"
-    print(f"[RM] env={env_reward:.2f} good={n_good}/{n_total} qual={quality:.2f} final={final:.2f} first={first_text}")
+    print(f"[RM] env={env_reward:.2f} g={n_good}/{n_total} G={n_great}/{n_total} qual={quality:.2f} final={final:.2f} first={first_text}")
     return final
