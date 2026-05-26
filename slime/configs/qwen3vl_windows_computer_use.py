@@ -33,7 +33,6 @@ class _Slime(SlimeConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     hf_checkpoint = "Qwen/Qwen3-VL-2B-Instruct"
     load = "Qwen/Qwen3-VL-2B-Instruct"
-    ref_load = hf_checkpoint
     megatron_to_hf_mode = "bridge"
 
     # ── Infrastructure ────────────────────────────────────────────────────────
@@ -56,7 +55,7 @@ class _Slime(SlimeConfig):
     # ── Rollout — VLM multi-turn with Windows env ─────────────────────────────
     num_rollout = 40
     rollout_batch_size = 8
-    n_samples_per_prompt = 4
+    n_samples_per_prompt = 8
     rollout_max_response_len = 4096
     rollout_temperature = 1.0
     rollout_num_gpus_per_engine = 1
@@ -95,7 +94,7 @@ class _Slime(SlimeConfig):
     advantage_estimator = "grpo"
     eps_clip = 0.2
     eps_clip_high = 0.28
-    kl_loss_coef = 0.02
+    kl_loss_coef = 0.0
     kl_loss_type = "low_var_kl"
     kl_coef = 0.0
     entropy_coef = 0.001
