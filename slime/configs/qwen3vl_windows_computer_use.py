@@ -97,7 +97,7 @@ class _Slime(SlimeConfig):
     eps_clip_high = 0.28
     kl_loss_coef = 0.02
     kl_loss_type = "low_var_kl"
-    kl_coef = 0.001
+    kl_coef = 0.0
     entropy_coef = 0.01
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
