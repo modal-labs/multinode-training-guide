@@ -1,8 +1,8 @@
 """Custom reward model for Windows computer use.
 
-Combines environment reward (task completion) with format reward
-(producing valid action tags). The format reward provides strong
-GRPO signal even when the model hasn't learned the task yet.
+Scales the environment reward to create clear GRPO signal.
+The env provides shaping rewards (0.0-0.3 for action quality,
+0.5-1.0 for task completion), which we amplify with a multiplier.
 """
 
 from __future__ import annotations
@@ -18,47 +18,101 @@ _VERB_RE = re.compile(
     r"<action>\s*(sendkey|type|typeline|wait)\b.*?</action>", re.DOTALL
 )
 
+# Valid sendkey arguments that the QEMU HMP understands.
+_VALID_KEYS = {
+    "ret", "spc", "tab", "esc", "backspace", "delete",
+    "up", "down", "left", "right", "home", "end",
+    "pgup", "pgdn", "f1", "f2", "f3", "f4", "f5",
+    "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "ctrl-a", "ctrl-c", "ctrl-s", "ctrl-v", "ctrl-x", "ctrl-z",
+    "meta_l-r", "meta_l-e", "meta_l-d", "alt-f4", "alt-tab",
+}
 
-def _format_reward(texts: list[str]) -> float:
-    """Compute format reward from model response texts across all turns.
+REWARD_SCALE = 3.0
 
-    Returns 0.0 or 0.5-1.0 based on whether ANY turn has valid action
-    format. Binary-like signal maximizes GRPO variance.
+
+def _action_quality_reward(texts: list[str]) -> float:
+    """Score the quality of actions across all turns.
+
+    Returns 0.0-1.0 based on how well-formed and specific
+    the model's actions are. Creates variance between samples
+    that all produce action tags but differ in quality.
     """
     if not texts:
         return 0.0
 
-    full = "\n".join(texts)
-    if not full.strip():
+    n_actions = 0
+    quality_sum = 0.0
+    has_type_with_content = False
+    has_valid_sendkey = False
+    has_done = False
+    multiple_per_turn = 0
+
+    for text in texts:
+        text = text.strip()
+        if not text:
+            continue
+
+        actions = _ACTION_RE.findall(text)
+        if len(actions) > 1:
+            multiple_per_turn += 1
+
+        for raw_action in actions:
+            n_actions += 1
+            parts = raw_action.strip().split(None, 1)
+            verb = parts[0].lower() if parts else ""
+            args = parts[1].strip() if len(parts) > 1 else ""
+
+            if verb == "sendkey" and args:
+                key = args.replace(" ", "-").lower()
+                if key in _VALID_KEYS or len(key) == 1:
+                    has_valid_sendkey = True
+                    quality_sum += 0.3
+                else:
+                    quality_sum += 0.1
+            elif verb == "type" and args:
+                has_type_with_content = True
+                quality_sum += 0.3
+            elif verb in ("typeline", "wait"):
+                quality_sum += 0.2
+            else:
+                quality_sum += 0.05
+
+        if _DONE_RE.search(text):
+            has_done = True
+
+    if n_actions == 0:
         return 0.0
 
-    score = 0.0
-    if _ACTION_RE.search(full):
-        score = 0.5
-        if _VERB_RE.search(full):
-            score = 0.8
-    if _DONE_RE.search(full):
-        score = max(score, 0.3)
-        score = min(score + 0.2, 1.0)
-    return score
+    score = min(quality_sum / max(n_actions, 1), 0.5)
+    if has_type_with_content:
+        score += 0.15
+    if has_valid_sendkey:
+        score += 0.15
+    if has_done:
+        score += 0.1
+    if multiple_per_turn == 0 and n_actions > 0:
+        score += 0.1
+
+    return min(score, 1.0)
 
 
 async def compute_reward(args: Any, sample: Sample) -> float:
-    """Combine environment reward with format reward.
+    """Compute final reward from env + action quality bonus.
 
-    Environment reward dominates when the model completes the task.
-    Format reward provides gradient signal during early training.
+    Env reward provides task-completion signal.
+    Action quality provides gradient signal for action specificity.
     """
     metadata = sample.metadata or {}
     env_reward = float(metadata.get("env_reward", 0.0))
-
-    if env_reward >= 0.5:
-        return env_reward
-
     texts = metadata.get("all_response_texts", [])
-    format_reward = _format_reward(texts) if texts else 0.0
-    final = max(env_reward, format_reward)
+    quality = _action_quality_reward(texts) if texts else 0.0
+
+    # Blend: env reward (task progress) + quality bonus (action specificity)
+    raw = env_reward + quality * 0.5
+    final = raw * REWARD_SCALE
+
     if final > 0:
         first_text = repr(texts[0][:80]) if texts else "N/A"
-        print(f"[RM] env_r={env_reward:.2f} fmt_r={format_reward:.2f} final={final:.2f} n_texts={len(texts)} first={first_text}")
+        print(f"[RM] env={env_reward:.2f} qual={quality:.2f} final={final:.2f} n_texts={len(texts)} first={first_text}")
     return final
