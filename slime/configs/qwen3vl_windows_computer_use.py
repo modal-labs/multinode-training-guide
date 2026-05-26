@@ -53,7 +53,7 @@ class _Slime(SlimeConfig):
     rm_type = "custom"
 
     # ── Rollout — VLM multi-turn with Windows env ─────────────────────────────
-    num_rollout = 100
+    num_rollout = 40
     rollout_batch_size = 8
     n_samples_per_prompt = 8
     rollout_max_response_len = 4096
@@ -94,10 +94,10 @@ class _Slime(SlimeConfig):
     advantage_estimator = "grpo"
     eps_clip = 0.2
     eps_clip_high = 0.28
-    kl_loss_coef = 0.0
+    kl_loss_coef = 0.02
     kl_loss_type = "low_var_kl"
-    kl_coef = 0.0
-    entropy_coef = 0.001
+    kl_coef = 0.001
+    entropy_coef = 0.01
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = "adam"
