@@ -33,6 +33,7 @@ class _Slime(SlimeConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     hf_checkpoint = "Qwen/Qwen3-VL-2B-Instruct"
     load = "Qwen/Qwen3-VL-2B-Instruct"
+    ref_load = hf_checkpoint
     megatron_to_hf_mode = "bridge"
 
     # ── Infrastructure ────────────────────────────────────────────────────────
