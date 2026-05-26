@@ -53,7 +53,7 @@ class _Slime(SlimeConfig):
     rm_type = "custom"
 
     # ── Rollout — VLM multi-turn with Windows env ─────────────────────────────
-    num_rollout = 4
+    num_rollout = 100
     rollout_batch_size = 8
     n_samples_per_prompt = 8
     rollout_max_response_len = 4096
