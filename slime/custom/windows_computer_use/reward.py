@@ -1,8 +1,11 @@
 """Custom reward model for Windows computer use.
 
-Scales the environment reward to create clear GRPO signal.
-The env provides shaping rewards (0.0-0.3 for action quality,
-0.5-1.0 for task completion), which we amplify with a multiplier.
+Uses a per-turn binary scoring approach to create within-group
+variance for GRPO. Each turn is scored 1 (valid action with args)
+or 0 (gibberish/empty/malformed), and the fraction of good turns
+becomes the reward. Since different samples for the same prompt
+produce different numbers of valid turns, this creates natural
+binary-like variance within GRPO groups.
 """
 
 from __future__ import annotations
@@ -25,94 +28,68 @@ _VALID_KEYS = {
     "meta_l-r", "meta_l-e", "meta_l-d", "alt-f4", "alt-tab",
 }
 
-REWARD_SCALE = 3.0
-_MAX_RESPONSE_LEN = 4096  # from config
 
-
-def _action_quality_reward(texts: list[str]) -> float:
-    """Score the quality of actions across all turns.
-
-    Returns 0.0-1.0 based on how well-formed and specific
-    the model's actions are. Creates variance between samples
-    that all produce action tags but differ in quality.
-    """
-    if not texts:
-        return 0.0
-
-    n_actions = 0
-    quality_sum = 0.0
-    has_type_with_content = False
-    has_valid_sendkey = False
-    has_done = False
-    multiple_per_turn = 0
-
-    for text in texts:
-        text = text.strip()
-        if not text:
+def _turn_is_good(text: str) -> bool:
+    """Binary per-turn check: does this turn contain a valid action?"""
+    contents = _ACTION_CONTENT_RE.findall(text)
+    if not contents:
+        return False
+    # At least one action must have a recognized verb with arguments
+    for content in contents:
+        parts = content.strip().split(None, 1)
+        if not parts:
             continue
-
-        # Extract content between <action>...</action> tags
-        action_contents = _ACTION_CONTENT_RE.findall(text)
-        if len(action_contents) > 1:
-            multiple_per_turn += 1
-
-        for content in action_contents:
-            n_actions += 1
-            parts = content.strip().split(None, 1)
-            verb = parts[0].lower() if parts else ""
-            args = parts[1].strip() if len(parts) > 1 else ""
-
-            if verb == "sendkey" and args:
-                key = args.replace(" ", "-").lower()
-                if key in _VALID_KEYS or len(key) == 1:
-                    has_valid_sendkey = True
-                    quality_sum += 0.3
-                else:
-                    quality_sum += 0.1
-            elif verb == "type" and args:
-                has_type_with_content = True
-                quality_sum += 0.3
-            elif verb in ("typeline", "wait"):
-                quality_sum += 0.2
-            elif verb in ("sendkey", "type") and not args:
-                quality_sum += 0.05
-            else:
-                quality_sum += 0.05
-
-        if _DONE_RE.search(text):
-            has_done = True
-
-    if n_actions == 0:
-        return 0.0
-
-    score = min(quality_sum / max(n_actions, 1), 0.5)
-    if has_type_with_content:
-        score += 0.15
-    if has_valid_sendkey:
-        score += 0.15
-    if has_done:
-        score += 0.1
-    if multiple_per_turn == 0 and n_actions > 0:
-        score += 0.1
-
-    return min(score, 1.0)
+        verb = parts[0].lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
+        if verb == "sendkey" and args:
+            key = args.replace(" ", "-").lower()
+            if key in _VALID_KEYS or len(key) == 1:
+                return True
+        elif verb == "type" and args:
+            return True
+        elif verb in ("typeline", "wait"):
+            return True
+    return False
 
 
 async def compute_reward(args: Any, sample: Sample) -> float:
-    """Compute final reward from env + action quality bonus.
+    """Binary turn-fraction reward for GRPO variance.
 
-    Env reward provides task-completion signal.
-    Action quality provides gradient signal for action specificity.
+    Scores each turn as good (1) or bad (0), then returns the
+    fraction of good turns. Different samples naturally produce
+    different numbers of good turns for the same prompt, creating
+    the within-group variance GRPO needs.
+
+    Adds env_reward for task completion signal.
     """
     metadata = sample.metadata or {}
     env_reward = float(metadata.get("env_reward", 0.0))
     texts = metadata.get("all_response_texts", [])
-    quality = _action_quality_reward(texts) if texts else 0.0
 
-    # Blend: env reward (task progress) + quality bonus (action specificity)
-    raw = env_reward + quality * 0.5
-    final = raw * REWARD_SCALE
+    if not texts:
+        print(f"[RM] env={env_reward:.2f} good=0/0 final=0.00")
+        return 0.0
+
+    n_good = sum(1 for t in texts if _turn_is_good(t))
+    n_total = len(texts)
+    turn_fraction = n_good / n_total if n_total > 0 else 0.0
+
+    # Binary boost: any good turn → 0.5 base, all good → 1.0
+    # No good turns → 0.0
+    if n_good == 0:
+        quality = 0.0
+    elif n_good == n_total:
+        quality = 1.0
+    else:
+        quality = 0.3 + 0.7 * turn_fraction
+
+    # Check for done signal
+    has_done = any(_DONE_RE.search(t) for t in texts)
+    if has_done:
+        quality = min(quality + 0.2, 1.0)
+
+    final = (env_reward + quality) * 3.0
 
     first_text = repr(texts[0][:80]) if texts else "N/A"
-    print(f"[RM] env={env_reward:.2f} qual={quality:.2f} final={final:.2f} n_texts={len(texts)} first={first_text}")
+    print(f"[RM] env={env_reward:.2f} good={n_good}/{n_total} qual={quality:.2f} final={final:.2f} first={first_text}")
     return final
