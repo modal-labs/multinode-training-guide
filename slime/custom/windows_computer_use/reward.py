@@ -22,38 +22,25 @@ _VERB_RE = re.compile(
 def _format_reward(texts: list[str]) -> float:
     """Compute format reward from model response texts across all turns.
 
-    Returns 0.0-1.0 based on how well the responses follow the
-    expected action format. Scores each turn individually for
-    granular signal.
+    Returns 0.0 or 0.5-1.0 based on whether ANY turn has valid action
+    format. Binary-like signal maximizes GRPO variance.
     """
     if not texts:
         return 0.0
 
-    n_turns = len(texts)
-    turn_scores: list[float] = []
-    has_done = False
-
-    for text in texts:
-        text = text.strip()
-        if not text:
-            turn_scores.append(0.0)
-            continue
-        ts = 0.0
-        if _ACTION_RE.search(text):
-            ts += 0.6
-            if _VERB_RE.search(text):
-                ts += 0.3
-        elif _DONE_RE.search(text):
-            ts += 0.5
-            has_done = True
-        turn_scores.append(min(ts, 1.0))
-
-    if not turn_scores:
+    full = "\n".join(texts)
+    if not full.strip():
         return 0.0
 
-    avg = sum(turn_scores) / len(turn_scores)
-    bonus = 0.1 if has_done else 0.0
-    return min(avg + bonus, 1.0)
+    score = 0.0
+    if _ACTION_RE.search(full):
+        score = 0.5
+        if _VERB_RE.search(full):
+            score = 0.8
+    if _DONE_RE.search(full):
+        score = max(score, 0.3)
+        score = min(score + 0.2, 1.0)
+    return score
 
 
 async def compute_reward(args: Any, sample: Sample) -> float:
@@ -70,4 +57,7 @@ async def compute_reward(args: Any, sample: Sample) -> float:
 
     texts = metadata.get("all_response_texts", [])
     format_reward = _format_reward(texts) if texts else 0.0
-    return max(env_reward, format_reward)
+    final = max(env_reward, format_reward)
+    if final > 0:
+        print(f"[RM] env_r={env_reward:.2f} fmt_r={format_reward:.2f} final={final:.2f} n_texts={len(texts)} first={texts[0][:80]!r if texts else 'N/A'}")
+    return final
