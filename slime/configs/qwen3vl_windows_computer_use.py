@@ -62,6 +62,8 @@ class _Slime(SlimeConfig):
     sglang_mem_fraction_static = 0.7
     sglang_cuda_graph_bs = [1, 2, 4, 8, 16, 24, 32]
     global_batch_size = 32
+    use_fault_tolerance = True
+    save_interval = 5
 
     # Custom multi-turn VLM rollout + environment + reward
     custom_generate_function_path = "custom.windows_computer_use.rollout.generate"
