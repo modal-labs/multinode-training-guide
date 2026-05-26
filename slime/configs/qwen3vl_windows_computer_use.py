@@ -8,7 +8,7 @@ Uses Slime's VLM multi-turn rollout with a custom environment that
 wraps Windows sandboxes (QEMU VMs on Modal).
 """
 
-from configs.base import ModalConfig, SlimeConfig, DATA_PATH
+from configs.base import CHECKPOINTS_PATH, ModalConfig, SlimeConfig, DATA_PATH
 
 modal = ModalConfig(
     gpu="H200",
@@ -64,6 +64,7 @@ class _Slime(SlimeConfig):
     global_batch_size = 32
     use_fault_tolerance = True
     save_interval = 5
+    save = f"{CHECKPOINTS_PATH}/windows_computer_use"
 
     # Custom multi-turn VLM rollout + environment + reward
     custom_generate_function_path = "custom.windows_computer_use.rollout.generate"
