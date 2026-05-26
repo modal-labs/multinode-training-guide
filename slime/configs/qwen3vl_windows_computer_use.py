@@ -58,7 +58,7 @@ class _Slime(SlimeConfig):
     rollout_batch_size = 8
     n_samples_per_prompt = 8
     rollout_max_response_len = 4096
-    rollout_temperature = 1.0
+    rollout_temperature = 1.3
     rollout_num_gpus_per_engine = 1
     sglang_mem_fraction_static = 0.7
     sglang_cuda_graph_bs = [1, 2, 4, 8, 16, 24, 32]
