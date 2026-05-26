@@ -10,6 +10,7 @@ binary-like variance within GRPO groups.
 
 from __future__ import annotations
 
+import random
 import re
 from typing import Any
 
@@ -111,8 +112,16 @@ async def compute_reward(args: Any, sample: Sample) -> float:
     if has_done:
         quality = min(quality + 0.2, 1.0)
 
-    final = (env_reward + quality) * 3.0
+    raw = (env_reward + quality) * 3.0
+
+    # Add small noise to break ties within GRPO groups. Without this,
+    # all 8 samples for the same prompt get identical rewards and GRPO
+    # normalization produces zero advantages. The noise std (0.3) is
+    # small relative to the reward range (0-6) but large enough to
+    # create meaningful within-group variance for gradient signal.
+    noise = random.gauss(0, 0.3)
+    final = max(raw + noise, 0.0)
 
     first_text = repr(texts[0][:80]) if texts else "N/A"
-    print(f"[RM] env={env_reward:.2f} g={n_good}/{n_total} G={n_great}/{n_total} qual={quality:.2f} final={final:.2f} first={first_text}")
+    print(f"[RM] env={env_reward:.2f} g={n_good}/{n_total} G={n_great}/{n_total} qual={quality:.2f} raw={raw:.2f} final={final:.2f} first={first_text}")
     return final
