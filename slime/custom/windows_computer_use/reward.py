@@ -59,5 +59,6 @@ async def compute_reward(args: Any, sample: Sample) -> float:
     format_reward = _format_reward(texts) if texts else 0.0
     final = max(env_reward, format_reward)
     if final > 0:
-        print(f"[RM] env_r={env_reward:.2f} fmt_r={format_reward:.2f} final={final:.2f} n_texts={len(texts)} first={texts[0][:80]!r if texts else 'N/A'}")
+        first_text = repr(texts[0][:80]) if texts else "N/A"
+        print(f"[RM] env_r={env_reward:.2f} fmt_r={format_reward:.2f} final={final:.2f} n_texts={len(texts)} first={first_text}")
     return final
