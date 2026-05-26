@@ -97,11 +97,11 @@ class _Slime(SlimeConfig):
     kl_loss_coef = 0.0
     kl_loss_type = "low_var_kl"
     kl_coef = 0.0
-    entropy_coef = 0.0
+    entropy_coef = 0.001
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = "adam"
-    lr = 1e-5
+    lr = 3e-6
     lr_decay_style = "constant"
     weight_decay = 0.1
     adam_beta1 = 0.9

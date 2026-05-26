@@ -23,22 +23,37 @@ def _format_reward(texts: list[str]) -> float:
     """Compute format reward from model response texts across all turns.
 
     Returns 0.0-1.0 based on how well the responses follow the
-    expected action format. This creates clear binary GRPO signal.
+    expected action format. Scores each turn individually for
+    granular signal.
     """
-    full = "\n".join(texts)
-    if not full.strip():
+    if not texts:
         return 0.0
 
-    score = 0.0
-    action_matches = _ACTION_RE.findall(full)
-    if action_matches:
-        score += 0.5
-    verb_matches = _VERB_RE.findall(full)
-    if verb_matches:
-        score += 0.3
-    if _DONE_RE.search(full):
-        score += 0.2
-    return min(score, 1.0)
+    n_turns = len(texts)
+    turn_scores: list[float] = []
+    has_done = False
+
+    for text in texts:
+        text = text.strip()
+        if not text:
+            turn_scores.append(0.0)
+            continue
+        ts = 0.0
+        if _ACTION_RE.search(text):
+            ts += 0.6
+            if _VERB_RE.search(text):
+                ts += 0.3
+        elif _DONE_RE.search(text):
+            ts += 0.5
+            has_done = True
+        turn_scores.append(min(ts, 1.0))
+
+    if not turn_scores:
+        return 0.0
+
+    avg = sum(turn_scores) / len(turn_scores)
+    bonus = 0.1 if has_done else 0.0
+    return min(avg + bonus, 1.0)
 
 
 async def compute_reward(args: Any, sample: Sample) -> float:
