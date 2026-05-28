@@ -385,17 +385,18 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         "Partial rollout is not supported for interaction rollouts."
     )
 
+    import asyncio as _aio_gen
+
     env, env_module, config, state, url = await _initialize_resources(args, sample)
     print(f"[generate] Env built in {_time.time()-_t0:.0f}s")
-    sampling_params = sampling_params.copy()
-
-    current_image_data, response_tokens, budget, multimodal_train_inputs_buffer = (
-        _prepare_start_state(sample, state, args, sampling_params)
-    )
 
     all_response_texts: list[str] = []
     try:
-        import asyncio as _aio_gen
+        sampling_params = sampling_params.copy()
+
+        current_image_data, response_tokens, budget, multimodal_train_inputs_buffer = (
+            _prepare_start_state(sample, state, args, sampling_params)
+        )
 
         print(f"[generate] Resetting env...")
         obs, _ = await _aio_gen.to_thread(env.reset)
