@@ -438,7 +438,10 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         if budget is not None and budget <= 0:
             print(f"[generate] BUDGET EXHAUSTED after initial obs, returning TRUNCATED")
             sample.status = Sample.Status.TRUNCATED
-            return sample
+            sample.metadata["all_response_texts"] = all_response_texts
+            return _finalize_sample(
+                sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer
+            )
 
         print(f"[generate] Starting turns (max={config['max_turns']})")
         for turn_idx in range(config["max_turns"]):
