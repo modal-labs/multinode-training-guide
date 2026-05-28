@@ -7,6 +7,7 @@ that the base Windows image is never modified.
 from __future__ import annotations
 
 import base64
+import os
 import textwrap
 
 import modal
@@ -16,7 +17,7 @@ from custom.windows_computer_use.vm_client import WindowsVM
 VOLUME_NAME = "windows-qemu-disk"
 NOVNC_PORT = 6080
 RPC_PORT = 8765
-ADMIN_PASSWORD = "P@ssw0rd123"
+ADMIN_PASSWORD = os.environ.get("WINDOWS_ADMIN_PASSWORD", "P@ssw0rd123")
 
 # Sandbox image: QEMU + deps (matches windows-sandboxes)
 sandbox_image = modal.Image.debian_slim(python_version="3.11").apt_install(

@@ -393,6 +393,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         _prepare_start_state(sample, state, args, sampling_params)
     )
 
+    all_response_texts: list[str] = []
     try:
         import asyncio as _aio_gen
 
@@ -438,7 +439,6 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             return sample
 
-        all_response_texts: list[str] = []
         print(f"[generate] Starting turns (max={config['max_turns']})")
         for turn_idx in range(config["max_turns"]):
             print(f"[generate] Turn {turn_idx+1}/{config['max_turns']} at {_time.time()-_t0:.0f}s")
