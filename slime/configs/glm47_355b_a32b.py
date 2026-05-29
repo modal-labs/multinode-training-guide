@@ -14,7 +14,7 @@ from configs.base import (
 
 modal = ModalConfig(
     gpu="H100",
-    local_slime="/home/ec2-user/nan_wonderland/slime",
+    # local_slime="/path/to/your/local/slime",  # uncomment for dev overlay
     patch_files=[
         "patches/sglang_delta_sync.patch",
     ],
