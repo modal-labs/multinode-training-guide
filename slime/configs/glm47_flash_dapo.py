@@ -113,7 +113,7 @@ class _Slime(SlimeConfig):
     wandb_group = "glm4.7-flash-dapo-math-1n"
     disable_wandb_random_suffix = True
 
-    def prepare_data(self) -> None:
+    def download_data(self) -> None:
         """Download DAPO-Math-17k and AIME-2024 from HuggingFace to the data volume."""
         import os
         from huggingface_hub import snapshot_download

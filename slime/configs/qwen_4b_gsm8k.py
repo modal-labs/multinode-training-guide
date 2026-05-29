@@ -95,7 +95,7 @@ class _Slime(SlimeConfig):
     wandb_group = "qwen3-4b-gsm8k"
     disable_wandb_random_suffix = True
 
-    def prepare_data(self) -> None:
+    def download_data(self) -> None:
         """Download GSM8K from HuggingFace and save as parquet to the data volume."""
         from datasets import load_dataset
 

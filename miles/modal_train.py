@@ -242,6 +242,8 @@ def convert_hf_to_megatron_checkpoint(
     image=image,
     gpu=f"{modal_cfg.gpu}:{miles_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
     memory=modal_cfg.memory if modal_cfg and modal_cfg.memory else None,
+    cloud=modal_cfg.cloud if modal_cfg and modal_cfg.cloud else None,
+    region=modal_cfg.region if modal_cfg and modal_cfg.region else None,
     volumes=modal_volumes,
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,

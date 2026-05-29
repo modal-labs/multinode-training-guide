@@ -4,9 +4,31 @@ Aligned to upstream run-glm4.7-355B-A32B.sh, adapted to this repo's config style
 Checkpoint conversion uses 4 nodes x 8 GPUs for tp=8, pp=4.
 """
 
-from configs.base import ModalConfig, SlimeConfig, DATA_PATH, CHECKPOINTS_PATH
+from configs.base import (
+    ModalConfig,
+    SlimeConfig,
+    DATA_PATH,
+    CHECKPOINTS_PATH,
+    HF_CACHE_PATH,
+)
 
-modal = ModalConfig(gpu="H200", memory=(1024, int(2 * 1024 * 1024)))  # 2 TiB in MiB
+modal = ModalConfig(
+    gpu="H100",
+    local_slime="/home/ec2-user/nan_wonderland/slime",
+    patch_files=[
+        "patches/sglang_delta_sync.patch",
+    ],
+    image_run_commands=[
+        # ``modal`` SDK needed at runtime by modal_helpers.delta_sync_hooks
+        # (wired via slime's --custom-delta-{pre-push,pre-read}-path when the
+        # delta-sync config opts in). Non-delta flows pay nothing extra.
+        f"rm -rf {HF_CACHE_PATH}",
+        "uv pip install --system zstandard modal",
+        "cd /sgl-workspace/sglang && patch -p1 < /tmp/sglang_delta_sync.patch && cd /root/slime",
+    ],
+    # region="eu-north-1",
+    memory=(1024, int(2 * 1024 * 1024)),
+)
 
 
 class _Slime(SlimeConfig):
@@ -35,14 +57,14 @@ class _Slime(SlimeConfig):
     num_steps_per_rollout = 4
     balance_data = True
     rollout_stop_token_ids = [151329, 151336, 151338]
-    skip_eval_before_train = True
+    # skip_eval_before_train = True
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     num_rollout = 3000
-    rollout_batch_size = 64
+    rollout_batch_size = 32
     rollout_max_response_len = 8192
     rollout_temperature = 1.0
-    n_samples_per_prompt = 8
+    n_samples_per_prompt = 4
     rollout_num_gpus_per_engine = 32
     sglang_mem_fraction_static = 0.7
     sglang_enable_dp_attention = True
@@ -55,6 +77,9 @@ class _Slime(SlimeConfig):
     sglang_speculative_eagle_topk = 1
     sglang_speculative_num_draft_tokens = 4
     use_fault_tolerance = True
+
+    update_weight_buffer_size = 4 * 512 * 1024 * 1024
+    sglang_update_weight_delta_chunk_bytes = 4 * 512 * 1024 * 1024
 
     # ── Eval ──────────────────────────────────────────────────────────────────
     eval_interval = 20
@@ -110,7 +135,7 @@ class _Slime(SlimeConfig):
     wandb_group = "glm4.7-355b-a32b-dapo-math-8n"
     disable_wandb_random_suffix = True
 
-    def prepare_data(self) -> None:
+    def download_data(self) -> None:
         """Download DAPO-Math-17k and AIME-2024 from HuggingFace to the data volume."""
         import os
         from huggingface_hub import snapshot_download

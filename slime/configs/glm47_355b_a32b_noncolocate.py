@@ -10,14 +10,10 @@ from configs import glm47_355b_a32b as _base
 
 modal = _base.modal
 
-
 class _Slime(_base._Slime):
     # ── Infrastructure ────────────────────────────────────────────────────────
     colocate = False
     rollout_num_gpus = 64
-
-    rollout_batch_size = 32
-    n_samples_per_prompt = 4
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     wandb_group = "glm4.7-355b-a32b-dapo-math-noncolocate"
