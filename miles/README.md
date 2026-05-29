@@ -18,7 +18,7 @@ Run all commands from the repo root.
 Set the config name once:
 
 ```bash
-export EXPERIMENT_CONFIG=qwen3_4b_lora_smoke
+export EXPERIMENT_CONFIG=qwen3_4b_lora
 ```
 
 List available configs:
