@@ -44,8 +44,8 @@ if modal_cfg:
         )
     if modal_cfg.image_run_commands:
         image = image.run_commands(*modal_cfg.image_run_commands)
-    # Ensure system libraries (cuDNN, NCCL) take precedence over pip versions
-    image = image.env({"LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"})
+    if modal_cfg.image_env:
+        image = image.env(modal_cfg.image_env)
 
 with image.imports():
     from ray.job_submission import JobSubmissionClient

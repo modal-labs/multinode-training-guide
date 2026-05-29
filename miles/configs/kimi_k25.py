@@ -24,6 +24,8 @@ modal = ModalConfig(
         # the pip version has H200 symbol mismatches.
         "rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/ 2>/dev/null || true",
         ],
+    # Ensure system libraries (cuDNN, NCCL) take precedence over pip versions.
+    image_env={"LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"},
 )
 
 
