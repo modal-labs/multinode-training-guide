@@ -57,14 +57,13 @@ class _Slime(SlimeConfig):
     num_steps_per_rollout = 4
     balance_data = True
     rollout_stop_token_ids = [151329, 151336, 151338]
-    # skip_eval_before_train = True
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     num_rollout = 3000
-    rollout_batch_size = 32
+    rollout_batch_size = 64
     rollout_max_response_len = 8192
     rollout_temperature = 1.0
-    n_samples_per_prompt = 4
+    n_samples_per_prompt = 8
     rollout_num_gpus_per_engine = 32
     sglang_mem_fraction_static = 0.7
     sglang_enable_dp_attention = True
