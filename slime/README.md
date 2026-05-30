@@ -149,6 +149,19 @@ class _Slime(SlimeConfig):
     }
 ```
 
+## Custom experiments: Windows Computer Use
+
+The `custom/windows_computer_use/` directory contains a full example of VLM RL training
+for Windows desktop tasks. It trains Qwen3-VL-2B to control a Windows VM by looking at
+screenshots and emitting keyboard actions. See the
+[Windows Computer Use README](custom/windows_computer_use/README.md) for details.
+
+```bash
+EXPERIMENT_CONFIG=qwen3vl_windows_computer_use modal run slime/modal_train.py::download_model
+EXPERIMENT_CONFIG=qwen3vl_windows_computer_use modal run slime/modal_train.py::prepare_dataset
+EXPERIMENT_CONFIG=qwen3vl_windows_computer_use modal run -d slime/modal_train.py::train
+```
+
 ## Dev overlay
 
 To test local SLIME changes without rebuilding the image, set `local_slime` in your `ModalConfig`:

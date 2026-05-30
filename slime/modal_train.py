@@ -29,6 +29,7 @@ image = (
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
     .add_local_python_source("modal_helpers", copy=True)
+    .add_local_python_source("custom", copy=True)
 )
 if modal_cfg:
     for patch in modal_cfg.patch_files:
