@@ -14,19 +14,10 @@ from configs.base import (
 
 modal = ModalConfig(
     gpu="H100",
-    # local_slime="/path/to/your/local/slime",  # uncomment for dev overlay
-    patch_files=[
-        "patches/sglang_delta_sync.patch",
-    ],
     image_run_commands=[
-        # ``modal`` SDK needed at runtime by modal_helpers.delta_sync_hooks
-        # (wired via slime's --custom-delta-{pre-push,pre-read}-path when the
-        # delta-sync config opts in). Non-delta flows pay nothing extra.
+        # Remove HF cache for modal volume mount.
         f"rm -rf {HF_CACHE_PATH}",
-        "uv pip install --system zstandard modal",
-        "cd /sgl-workspace/sglang && patch -p1 < /tmp/sglang_delta_sync.patch && cd /root/slime",
     ],
-    # region="eu-north-1",
     memory=(1024, int(2 * 1024 * 1024)),
 )
 
