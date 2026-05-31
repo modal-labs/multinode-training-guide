@@ -8,7 +8,7 @@ import modal
 import modal.experimental
 
 from configs import get_module, _CONFIGS_DIR
-from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH
+from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, ModalConfig
 from modal_helpers.utils import get_checkpoint_conversion_policy
 
 # ── Experiment (client-side only — feeds decorator params) ────────────────────
@@ -24,8 +24,8 @@ SLIME_ROOT = "/root/slime"
 
 image = (
     modal.Image.from_registry(
-        "slimerl/slime:nightly-dev-20260329a"
-    )  # Please check https://hub.docker.com/r/slimerl/slime/tags for the latest version
+        modal_cfg.docker_image if modal_cfg else ModalConfig.docker_image
+    )
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
     .add_local_python_source("modal_helpers", copy=True)
@@ -44,6 +44,8 @@ if modal_cfg:
         )
     if modal_cfg.image_run_commands:
         image = image.run_commands(*modal_cfg.image_run_commands)
+    if modal_cfg.image_env:
+        image = image.env(modal_cfg.image_env)
 
 with image.imports():
     from ray.job_submission import JobSubmissionClient
@@ -51,6 +53,7 @@ with image.imports():
         build_train_cmd,
         get_modal_cluster_context,
         prepare_slime_config,
+        resolve_checkpoint_ref,
         start_ray_head,
     )
 
@@ -74,6 +77,16 @@ RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
 
+def run_config_hook(experiment: str, hook_name: str, mounted_volumes) -> None:
+    """Reload mounted volumes, run a SlimeConfig hook, then commit them."""
+    slime_cfg = get_module(experiment).slime
+    for volume in mounted_volumes:
+        volume.reload()
+    getattr(slime_cfg, hook_name)()
+    for volume in mounted_volumes:
+        volume.commit()
+
+
 @app.local_entrypoint()
 def list_configs():
     """Print all available experiments."""
@@ -91,30 +104,55 @@ def list_configs():
 @app.function(
     image=image,
     volumes={str(HF_CACHE_PATH): hf_cache_volume},
-    timeout=2 * 60 * 60,
+    timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Download the model to the HF cache volume."""
-    from huggingface_hub import snapshot_download
+    """Run the experiment's download_model() against the HF cache volume."""
+    run_config_hook(experiment, "download_model", (hf_cache_volume,))
 
-    slime_cfg = get_module(experiment).slime
-    _ = snapshot_download(repo_id=slime_cfg.hf_checkpoint)
-    hf_cache_volume.commit()
+
+@app.function(
+    image=image,
+    gpu=f"{modal_cfg.gpu}" if modal_cfg else None,
+    volumes=modal_volumes,
+    timeout=4 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def post_process_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run optional GPU model post-processing for the experiment."""
+    run_config_hook(
+        experiment,
+        "post_process_model",
+        (hf_cache_volume, data_volume, checkpoints_volume),
+    )
 
 
 @app.function(
     image=image,
     volumes={str(DATA_PATH): data_volume},
-    timeout=2 * 60 * 60,
+    timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Run the prepare_data() to populate the data volume."""
-    slime_cfg = get_module(experiment).slime
-    data_volume.reload()
-    slime_cfg.prepare_data()
-    data_volume.commit()
+def download_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run the experiment's download_data() against the data volume."""
+    run_config_hook(experiment, "download_data", (data_volume,))
+
+
+@app.function(
+    image=image,
+    gpu=f"{modal_cfg.gpu}" if modal_cfg else None,
+    volumes=modal_volumes,
+    timeout=4 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def post_process_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run optional GPU data post-processing for the experiment."""
+    run_config_hook(
+        experiment,
+        "post_process_data",
+        (hf_cache_volume, data_volume, checkpoints_volume),
+    )
 
 
 @app.function(
@@ -131,10 +169,10 @@ def prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     if slime_cfg
     else lambda fn: fn
 )
-def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
-    """Convert HF checkpoint to torch_dist format when megatron_to_hf_mode is raw."""
-    from huggingface_hub import snapshot_download
-
+def convert_hf_to_megatron_checkpoint(
+    experiment: str = os.environ.get("EXPERIMENT_CONFIG", ""),
+):
+    """Convert HF checkpoint to Megatron torch_dist format in raw mode."""
     slime_cfg = get_module(experiment).slime
 
     if getattr(slime_cfg, "megatron_to_hf_mode", None) == "bridge":
@@ -144,7 +182,11 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
     hf_cache_volume.reload()
     checkpoints_volume.reload()
 
-    hf_path = snapshot_download(slime_cfg.hf_checkpoint, local_files_only=True)
+    conversion_hf_checkpoint = (
+        getattr(slime_cfg, "megatron_conversion_hf_checkpoint", None)
+        or slime_cfg.hf_checkpoint
+    )
+    hf_path = resolve_checkpoint_ref(conversion_hf_checkpoint)
     save_path = str(slime_cfg.ref_load)
     num_nodes, nproc_per_node, extra_args = get_checkpoint_conversion_policy(slime_cfg)
     node_rank, master_addr, _, nnodes = get_modal_cluster_context(num_nodes)
@@ -184,12 +226,16 @@ def convert_checkpoint(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
         f"Conversion layout for {experiment!r}: nodes={num_nodes}, "
         f"nproc_per_node={nproc_per_node}, node_rank={node_rank}"
     )
+    print(
+        f"Converting HF checkpoint {conversion_hf_checkpoint!r} "
+        f"to Megatron torch_dist at {save_path!r}"
+    )
     print(f"Running: bash -c {cmd!r}")
     subprocess.run(["bash", "-c", cmd], check=True, env=env)
     checkpoints_volume.commit()
 
     if node_rank == 0:
-        print(f"Saved torch_dist checkpoint to {save_path}")
+        print(f"Saved Megatron torch_dist checkpoint to {save_path}")
 
 
 @app.function(

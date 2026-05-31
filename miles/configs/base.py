@@ -55,6 +55,8 @@ class ModalConfig:
     memory: tuple[int, int] | None = (
         None  # per-container memory in MiB; None = Modal default
     )
+    cloud: str | None = None  # e.g. "aws", "gcp"
+    region: str | None = None  # e.g. "us-east-2"
     local_miles: str | None = None  # path to local miles repo for dev overlay
     patch_files: list[
         str

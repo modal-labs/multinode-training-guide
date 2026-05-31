@@ -7,10 +7,12 @@ Two separate concerns:
 
 Each experiment defines one instance of each. All non-private, non-callable
 attributes on a SlimeConfig subclass become SLIME CLI args automatically via
-cli_args(). The 'environment' field is the only exception — it is injected
-into the Ray job runtime env, not passed to SLIME directly.
+cli_args(), except launcher instruction fields such as environment,
+async_mode, slime_model_script, source_hf_checkpoint, and
+megatron_conversion_hf_checkpoint.
 """
 
+import json
 import math
 from pathlib import Path
 from typing import Any, Literal
@@ -25,19 +27,31 @@ CHECKPOINTS_PATH = Path("/checkpoints")
 
 GPUType = Literal["H100", "H200", "B200", "B300", "A100"]
 
-# Fields on SlimeConfig that are NOT SLIME CLI args.
-_SLIME_SKIP = {"environment", "async_mode", "slime_model_script"}
+# Fields on SlimeConfig that are launcher instructions, not SLIME CLI args.
+_SLIME_SKIP = {
+    "environment",
+    "async_mode",
+    "slime_model_script",
+    "source_hf_checkpoint",
+    "megatron_conversion_hf_checkpoint",
+}
 
 # SlimeConfig fields that SLIME reads as YAML files at runtime.
 # Users may set these as inline dicts in Python configs; the launcher
 # materializes them to temp YAML files before building the CLI command.
 YAML_CONFIG_FIELDS = ("eval_config", "custom_config_path", "sglang_config")
 
+# SlimeConfig fields that SLIME parses with json.loads().
+# If set as dicts in Python configs, the launcher serializes them with
+# json.dumps() instead of str().
+JSON_CONFIG_FIELDS = ("train_env_vars", "apply_chat_template_kwargs", "multimodal_keys")
+
 
 class ModalConfig:
     """Modal infrastructure configuration — GPU provisioning and image setup only."""
 
-    gpu: GPUType = "H200"
+    docker_image: str = "slimerl/slime:nightly-dev-20260529a"
+    gpu: GPUType = "H100"
     memory: tuple[int, int] | None = (
         None  # per-container memory in MiB; check https://modal.com/docs/guide/resources#memory-limits
     )
@@ -50,6 +64,9 @@ class ModalConfig:
     image_run_commands: list[
         str
     ] = []  # commands to run during image build (e.g. git apply /tmp/my.patch)
+    image_env: dict[
+        str, str
+    ] = {}  # environment variables baked into the image (Modal .env())
 
     def __init__(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():
@@ -60,7 +77,8 @@ class SlimeConfig:
     """Base SLIME training configuration.
 
     Subclass and set class attributes to configure an experiment.
-    All attributes (except 'environment') are forwarded to SLIME as CLI args.
+    All attributes except launcher instruction fields are forwarded to SLIME
+    as CLI args.
     Each experiment must be fully self-contained — no inherited defaults.
 
     Fields in _SLIME_SKIP are launcher instructions, not SLIME CLI args:
@@ -69,6 +87,12 @@ class SlimeConfig:
       slime_model_script — path relative to /root/slime to a shell script that
                            defines MODEL_ARGS for model architecture; sourced
                            before running the train command
+      source_hf_checkpoint — optional upstream HF repo/local path used by
+                             download_model() when hf_checkpoint points at a
+                             converted training checkpoint
+      megatron_conversion_hf_checkpoint — optional HF-format repo/local path to
+                                          convert in convert_hf_to_megatron_checkpoint();
+                                          defaults to hf_checkpoint
 
     Example:
 
@@ -76,6 +100,8 @@ class SlimeConfig:
             async_mode = False
             slime_model_script = ""
             hf_checkpoint = "Qwen/Qwen3-8B"
+            # source_hf_checkpoint = "Qwen/Qwen3-8B"  # optional if different
+            # megatron_conversion_hf_checkpoint = "Qwen/Qwen3-8B"
             actor_num_nodes = 1
             actor_num_gpus_per_node = 8
             megatron_to_hf_mode = "bridge"
@@ -92,6 +118,8 @@ class SlimeConfig:
     }
     async_mode: bool = False  # True → use train_async.py
     slime_model_script: str = ""  # shell script path relative to /root/slime
+    source_hf_checkpoint: str | None = None
+    megatron_conversion_hf_checkpoint: str | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         # Fresh environment dict per instance — never mutate the class-level default.
@@ -127,6 +155,7 @@ class SlimeConfig:
           True       → --flag        (no value)
           False/None → omitted
           list       → --flag v1 v2 ...
+          dict in JSON_CONFIG_FIELDS → --flag '{"k":"v"}'
           other      → --flag value
         """
         out: list[str] = []
@@ -136,14 +165,31 @@ class SlimeConfig:
             flag = f"--{key.replace('_', '-')}"
             if val is True:
                 out.append(flag)
+            elif isinstance(val, dict) and key in JSON_CONFIG_FIELDS:
+                out += [flag, json.dumps(val)]
             elif isinstance(val, list):
                 out += [flag] + [str(v) for v in val]
             else:
                 out += [flag, str(val)]
         return out
 
-    def prepare_data(self) -> None:
-        raise NotImplementedError(f"{type(self).__name__} has no prepare_data()")
+    def download_model(self) -> None:
+        """Required CPU hook for populating the HF cache."""
+        from modal_helpers.utils import resolve_checkpoint_ref
+
+        resolve_checkpoint_ref(
+            self.source_hf_checkpoint or self.hf_checkpoint,
+            local_files_only=False,
+        )
+
+    def post_process_model(self) -> None:
+        """Optional GPU hook; no-op unless explicitly run."""
+
+    def download_data(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} has no download_data()")
+
+    def post_process_data(self) -> None:
+        """Optional GPU hook; no-op unless explicitly run."""
 
     def total_nodes(self) -> int:
         """Total Modal cluster nodes required by this config.

@@ -8,8 +8,10 @@ _SKIP = {"base", "__init__"}
 def get_module(name: str):
     try:
         return importlib.import_module(f"configs.{name}")
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+        if exc.name != f"configs.{name}":
+            raise
         available = sorted(
             f.stem for f in _CONFIGS_DIR.glob("*.py") if f.stem not in _SKIP
         )
-        raise ValueError(f"Unknown config {name!r}. Available: {available}")
+        raise ValueError(f"Unknown config {name!r}. Available: {available}") from exc

@@ -4,9 +4,22 @@ Aligned to upstream run-glm4.7-355B-A32B.sh, adapted to this repo's config style
 Checkpoint conversion uses 4 nodes x 8 GPUs for tp=8, pp=4.
 """
 
-from configs.base import ModalConfig, SlimeConfig, DATA_PATH, CHECKPOINTS_PATH
+from configs.base import (
+    ModalConfig,
+    SlimeConfig,
+    DATA_PATH,
+    CHECKPOINTS_PATH,
+    HF_CACHE_PATH,
+)
 
-modal = ModalConfig(gpu="H200", memory=(1024, int(2 * 1024 * 1024)))  # 2 TiB in MiB
+modal = ModalConfig(
+    gpu="H100",
+    image_run_commands=[
+        # Remove HF cache for modal volume mount.
+        f"rm -rf {HF_CACHE_PATH}",
+    ],
+    memory=(1024, int(2 * 1024 * 1024)),
+)
 
 
 class _Slime(SlimeConfig):
@@ -35,7 +48,6 @@ class _Slime(SlimeConfig):
     num_steps_per_rollout = 4
     balance_data = True
     rollout_stop_token_ids = [151329, 151336, 151338]
-    skip_eval_before_train = True
 
     # ── Rollout ───────────────────────────────────────────────────────────────
     num_rollout = 3000
@@ -55,6 +67,9 @@ class _Slime(SlimeConfig):
     sglang_speculative_eagle_topk = 1
     sglang_speculative_num_draft_tokens = 4
     use_fault_tolerance = True
+
+    update_weight_buffer_size = 4 * 512 * 1024 * 1024
+    sglang_update_weight_delta_chunk_bytes = 4 * 512 * 1024 * 1024
 
     # ── Eval ──────────────────────────────────────────────────────────────────
     eval_interval = 20
@@ -110,7 +125,7 @@ class _Slime(SlimeConfig):
     wandb_group = "glm4.7-355b-a32b-dapo-math-8n"
     disable_wandb_random_suffix = True
 
-    def prepare_data(self) -> None:
+    def download_data(self) -> None:
         """Download DAPO-Math-17k and AIME-2024 from HuggingFace to the data volume."""
         import os
         from huggingface_hub import snapshot_download
