@@ -488,6 +488,8 @@ def train_model(
         "true",
         "--moe_shared_expert_overlap",
         "true",
+        "--recompute_modules",
+        "mhc",
         "--megatron_extra_kwargs",
         json.dumps({"moe_router_score_function": "sigmoid"}),
         "--global_batch_size",
