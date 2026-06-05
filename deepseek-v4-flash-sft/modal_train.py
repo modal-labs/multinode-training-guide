@@ -50,16 +50,37 @@ CHECKPOINTS_DIR = "/checkpoints"
 # Evaluated at decoration time by @clustered.
 N_NODES = int(os.environ.get("N_NODES", "1"))
 
+DEEPSEEK_V4_CONFIG_PATCH = (
+    r"""cat >/usr/local/lib/python3.11/site-packages/sitecustomize.py <<'PY'
+try:
+    from transformers.configuration_utils import PretrainedConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    class DeepseekV4Config(PretrainedConfig):
+        model_type = "deepseek_v4"
+        keys_to_ignore_at_inference = ["past_key_values"]
+        attribute_map = {
+            "intermediate_size": "moe_intermediate_size",
+            "num_local_experts": "n_routed_experts",
+        }
+
+    CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config, exist_ok=True)
+except Exception:
+    pass
+PY"""
+)
+
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "datasets==3.1.0",
-        "huggingface_hub[hf_xet]==1.18.0",
+        "huggingface_hub[hf_xet]==0.36.0",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
         "torch==2.9.1",
-        "transformers==5.10.2",
+        "transformers==4.57.4",
     )
+    .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
 
@@ -80,14 +101,15 @@ msswift_image = (
     .pip_install(
         "datasets==3.1.0",
         "einops==0.8.2",
-        "huggingface_hub[hf_xet]==1.18.0",
+        "huggingface_hub[hf_xet]==0.36.0",
         f"ms-swift @ git+https://github.com/modelscope/ms-swift.git@{MS_SWIFT_COMMIT}",
+        "mcore-bridge==1.4.2",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
-        "transformers==5.10.2",
+        "transformers==4.57.4",
         "wandb==0.19.1",
     )
-    .run_commands("pip install --no-deps mcore-bridge==1.4.2")
+    .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
     .run_commands(
         "pip install --no-build-isolation "
         f"git+https://github.com/Dao-AILab/fast-hadamard-transform.git@{FAST_HADAMARD_TRANSFORM_COMMIT}"
