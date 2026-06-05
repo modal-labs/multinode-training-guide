@@ -483,6 +483,8 @@ def train_model(
         "true",
         "--moe_shared_expert_overlap",
         "true",
+        "--moe_router_score_function",
+        "sigmoid",
         "--global_batch_size",
         str(global_batch_size),
         "--micro_batch_size",
