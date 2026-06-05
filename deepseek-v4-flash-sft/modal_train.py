@@ -528,6 +528,8 @@ def _train_model_impl(
         str(micro_batch_size),
         "--packing",
         "false",
+        "--padding_free",
+        "false",
         "--use_precision_aware_optimizer",
         "true",
         "--lr",
