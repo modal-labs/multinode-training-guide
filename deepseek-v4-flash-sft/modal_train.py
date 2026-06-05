@@ -203,12 +203,12 @@ msswift_image = (
         "einops==0.8.2",
         "huggingface_hub[hf_xet]==0.36.0",
         f"ms-swift @ git+https://github.com/modelscope/ms-swift.git@{MS_SWIFT_COMMIT}",
-        "mcore-bridge==1.4.2",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
         "transformers==4.57.4",
         "wandb==0.19.1",
     )
+    .run_commands("pip install --no-deps mcore-bridge==1.4.2")
     .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
     .run_commands(DEEPSEEK_V4_CONFIG_VERIFY)
     .run_commands(
