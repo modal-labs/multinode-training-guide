@@ -86,8 +86,8 @@ msswift_image = (
         "sentencepiece==0.2.1",
         "transformers==5.10.2",
         "wandb==0.19.1",
-        "mcore-bridge==1.4.2",
     )
+    .run_commands("pip install --no-deps mcore-bridge==1.4.2")
     .run_commands(
         "pip install --no-build-isolation "
         f"git+https://github.com/Dao-AILab/fast-hadamard-transform.git@{FAST_HADAMARD_TRANSFORM_COMMIT}"
