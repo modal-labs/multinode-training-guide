@@ -548,6 +548,8 @@ def _train_model_impl(
         "8",
         "--save_steps",
         str(save_interval),
+        "--save_safetensors",
+        "false",
         "--no_save_optim",
         "true",
         "--no_save_rng",
