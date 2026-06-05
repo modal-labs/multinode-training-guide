@@ -51,14 +51,12 @@ CHECKPOINTS_DIR = "/checkpoints"
 N_NODES = int(os.environ.get("N_NODES", "1"))
 
 DEEPSEEK_V4_CONFIG_PATCH = (
-    r"""cat >/usr/local/lib/python3.11/site-packages/sitecustomize.py <<'PY'
+    r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
 try:
     try:
-        from transformers.configuration_utils import PreTrainedConfig as _BaseConfig
+        from ...configuration_utils import PreTrainedConfig as _BaseConfig
     except ImportError:
-        from transformers.configuration_utils import PretrainedConfig as _BaseConfig
-
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        from ...configuration_utils import PretrainedConfig as _BaseConfig
 
     class DeepseekV4Config(_BaseConfig):
         model_type = "deepseek_v4"
