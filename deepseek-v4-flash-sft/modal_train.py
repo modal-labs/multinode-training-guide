@@ -177,7 +177,7 @@ text = path.read_text()
 text = text.replace(
     "    original_max_position_embeddings: Optional[int] = None\n"
     "    partial_rotary_factor: Optional[float] = None\n",
-    "    original_max_position_embeddings: Optional[int] = None\n"
+    "    original_max_position_embeddings: int = 4096\n"
     "    rotary_scaling_factor: float = 40\n"
     "    beta_fast: float = 32\n"
     "    beta_slow: float = 1\n"
@@ -190,7 +190,7 @@ text = text.replace(
     "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n",
     "            if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:\n"
     "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n"
-    "            for key in ('factor', 'beta_fast', 'beta_slow', 'mscale', 'mscale_all_dim'):\n"
+    "            for key in ('factor', 'original_max_position_embeddings', 'beta_fast', 'beta_slow', 'mscale', 'mscale_all_dim'):\n"
     "                if key in self.rope_scaling:\n"
     "                    attr = 'rotary_scaling_factor' if key == 'factor' else key\n"
     "                    setattr(self, attr, self.rope_scaling[key])\n",
