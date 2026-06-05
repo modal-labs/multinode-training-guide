@@ -86,6 +86,7 @@ msswift_image = (
         "sentencepiece==0.2.1",
         "transformers==4.57.4",
         "wandb==0.19.1",
+        "mcore-bridge==1.4.2",
     )
     .run_commands(
         "pip install --no-build-isolation "

@@ -88,7 +88,7 @@ For a short smoke run that should save after five training steps:
 
 ```bash
 modal run --detach modal_train.py::train_model \
-  --data-folder gsm8k-smoke \
+  --data-folder gsm8k \
   --train-iters 5 \
   --save-interval 5 \
   --run-id smoke-5steps
