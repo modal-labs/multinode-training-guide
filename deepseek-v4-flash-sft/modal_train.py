@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Callable
@@ -49,6 +50,44 @@ CHECKPOINTS_DIR = "/checkpoints"
 
 # Evaluated at decoration time by @clustered.
 N_NODES = int(os.environ.get("N_NODES", "1"))
+
+
+def default_run_id(
+    *,
+    data_folder: str,
+    lora_rank: int,
+    lora_alpha: int,
+    max_epochs: int,
+    train_iters: int,
+    max_length: int,
+    tp_size: int,
+    ep_size: int,
+    pp_size: int,
+    cp_size: int,
+    global_batch_size: int,
+    micro_batch_size: int,
+    lr: float,
+) -> str:
+    run_config = {
+        "cp_size": cp_size,
+        "data_folder": data_folder,
+        "ep_size": ep_size,
+        "global_batch_size": global_batch_size,
+        "lora_alpha": lora_alpha,
+        "lora_rank": lora_rank,
+        "lr": lr,
+        "max_epochs": max_epochs,
+        "max_length": max_length,
+        "micro_batch_size": micro_batch_size,
+        "model": HF_MODEL,
+        "pp_size": pp_size,
+        "tp_size": tp_size,
+        "train_iters": train_iters,
+    }
+    digest = hashlib.sha256(
+        json.dumps(run_config, sort_keys=True).encode()
+    ).hexdigest()[:12]
+    return f"deepseek_v4_flash_sft_{digest}"
 
 DEEPSEEK_V4_CONFIG_PATCH = (
     r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
@@ -345,7 +384,21 @@ def train_model(
 
     cluster_info = modal.experimental.get_cluster_info()
     if run_id is None:
-        run_id = f"deepseek_v4_flash_sft_{cluster_info.cluster_id}"
+        run_id = default_run_id(
+            data_folder=data_folder,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            max_epochs=max_epochs,
+            train_iters=train_iters,
+            max_length=max_length,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=pp_size,
+            cp_size=cp_size,
+            global_batch_size=global_batch_size,
+            micro_batch_size=micro_batch_size,
+            lr=lr,
+        )
 
     node_rank = cluster_info.rank
     n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
