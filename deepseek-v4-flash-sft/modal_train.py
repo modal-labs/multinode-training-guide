@@ -292,6 +292,16 @@ def train_model(
         )
 
     checkpoint_dir = f"{CHECKPOINTS_DIR}/{run_id}"
+
+    resuming = False
+    if os.path.exists(checkpoint_dir):
+        iter_dirs = sorted(
+            d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
+        )
+        if iter_dirs:
+            resuming = True
+            print(f"Resuming from existing checkpoint ({iter_dirs[-1]})")
+
     os.makedirs(checkpoint_dir, exist_ok=True)
     args_json_path = f"{checkpoint_dir}/args.json"
     if not os.path.exists(args_json_path):
@@ -393,6 +403,9 @@ def train_model(
         )
     elif report_to != "none":
         raise ValueError("report_to must be either 'none' or 'wandb'")
+
+    if resuming:
+        megatron_cmd.extend(["--load", checkpoint_dir])
 
     cmd = [
         "torchrun",
