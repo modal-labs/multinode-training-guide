@@ -169,6 +169,34 @@ DEEPSEEK_V4_CONFIG_VERIFY = (
     "python -c \"from transformers.models.auto.configuration_auto import "
     "CONFIG_MAPPING; assert 'deepseek_v4' in CONFIG_MAPPING\""
 )
+MCORE_BRIDGE_DSV4_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py")
+text = path.read_text()
+text = text.replace(
+    "    original_max_position_embeddings: Optional[int] = None\n"
+    "    partial_rotary_factor: Optional[float] = None\n",
+    "    original_max_position_embeddings: Optional[int] = None\n"
+    "    rotary_scaling_factor: float = 40\n"
+    "    beta_fast: float = 32\n"
+    "    beta_slow: float = 1\n"
+    "    mscale: float = 1.0\n"
+    "    mscale_all_dim: float = 0.0\n"
+    "    partial_rotary_factor: Optional[float] = None\n",
+)
+text = text.replace(
+    "            if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:\n"
+    "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n",
+    "            if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:\n"
+    "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n"
+    "            for key in ('factor', 'beta_fast', 'beta_slow', 'mscale', 'mscale_all_dim'):\n"
+    "                if key in self.rope_scaling:\n"
+    "                    attr = 'rotary_scaling_factor' if key == 'factor' else key\n"
+    "                    setattr(self, attr, self.rope_scaling[key])\n",
+)
+path.write_text(text)
+PY"""
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -210,6 +238,7 @@ msswift_image = (
         "wandb==0.19.1",
     )
     .run_commands("pip install --no-deps mcore-bridge==1.4.2")
+    .run_commands(MCORE_BRIDGE_DSV4_PATCH)
     .run_commands(
         "pip install --no-deps "
         f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
