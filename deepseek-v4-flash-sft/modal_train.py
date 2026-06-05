@@ -280,6 +280,7 @@ def train_model(
 
     hf_cache_vol.reload()
     data_volume.reload()
+    checkpoints_volume.reload()
     model_dir = snapshot_download(
         HF_MODEL,
         local_files_only=True,
@@ -314,8 +315,6 @@ def train_model(
         "sft",
         "--model",
         model_dir,
-        "--trust_remote_code",
-        "true",
         "--output_dir",
         checkpoint_dir,
         "--dataset",
@@ -369,7 +368,7 @@ def train_model(
         "flash",
         "--dataset_num_proc",
         "8",
-        "--save_interval",
+        "--save_steps",
         str(save_interval),
         "--no_save_optim",
         "true",
@@ -379,7 +378,7 @@ def train_model(
         "1",
         "--add_version",
         "false",
-        "--log_interval",
+        "--logging_steps",
         "1",
         "--eval_iters",
         "0",
