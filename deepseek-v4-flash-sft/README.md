@@ -84,6 +84,16 @@ By default this launches one 8×B200 node with:
 | LoRA rank | 64 | Raise for quality once the run is stable. |
 | Max length | 4096 | DeepSeek-V4 supports 1M context, but start small. |
 
+For a short smoke run that should save after five training steps:
+
+```bash
+modal run --detach modal_train.py::train_model \
+  --data-folder gsm8k-smoke \
+  --train-iters 5 \
+  --save-interval 5 \
+  --run-id smoke-5steps
+```
+
 ## Scaling
 
 `N_NODES` is evaluated when Modal defines the clustered function:

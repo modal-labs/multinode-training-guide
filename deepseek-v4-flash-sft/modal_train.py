@@ -226,7 +226,10 @@ def smoke_test():
         DATA_DIR: data_volume,
         CHECKPOINTS_DIR: checkpoints_volume,
     },
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
     timeout=86400,
     retries=1,
     memory=1048576,
@@ -240,6 +243,7 @@ def train_model(
     lora_rank: int = DEFAULT_LORA_RANK,
     lora_alpha: int = DEFAULT_LORA_ALPHA,
     max_epochs: int = DEFAULT_MAX_EPOCHS,
+    train_iters: int = 0,
     max_length: int = DEFAULT_MAX_LENGTH,
     tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
@@ -341,8 +345,6 @@ def train_model(
         "false",
         "--use_precision_aware_optimizer",
         "true",
-        "--num_train_epochs",
-        str(max_epochs),
         "--lr",
         str(lr),
         "--lr_warmup_fraction",
@@ -372,6 +374,10 @@ def train_model(
         "--eval_iters",
         "0",
     ]
+    if train_iters > 0:
+        megatron_cmd.extend(["--train_iters", str(train_iters)])
+    else:
+        megatron_cmd.extend(["--num_train_epochs", str(max_epochs)])
 
     if report_to == "wandb":
         if "WANDB_API_KEY" not in os.environ:
