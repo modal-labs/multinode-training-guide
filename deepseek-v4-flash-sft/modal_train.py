@@ -65,6 +65,58 @@ try:
             "intermediate_size": "moe_intermediate_size",
             "num_local_experts": "n_routed_experts",
         }
+        default_compress_rates = {
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        }
+        default_num_hash_layers = 3
+        default_partial_rotary_factor = 64 / 512
+
+        def __init__(self, **kwargs):
+            compress_ratios = kwargs.pop("compress_ratios", None)
+            compress_rate_csa = kwargs.pop("compress_rate_csa", None)
+            compress_rate_hca = kwargs.pop("compress_rate_hca", None)
+            num_hash_layers = kwargs.pop("num_hash_layers", None)
+            qk_rope_head_dim = kwargs.pop("qk_rope_head_dim", None)
+            super().__init__(**kwargs)
+
+            n_layers = self.num_hidden_layers
+            if getattr(self, "compress_rates", None) is None:
+                self.compress_rates = dict(self.default_compress_rates)
+            if compress_rate_csa is not None:
+                self.compress_rates["compressed_sparse_attention"] = compress_rate_csa
+            if compress_rate_hca is not None:
+                self.compress_rates["heavily_compressed_attention"] = compress_rate_hca
+
+            if getattr(self, "layer_types", None) is None and compress_ratios is not None:
+                ratio_to_layer_type = {
+                    0: "sliding_attention",
+                    4: "compressed_sparse_attention",
+                    128: "heavily_compressed_attention",
+                }
+                self.layer_types = [ratio_to_layer_type[r] for r in compress_ratios]
+            if getattr(self, "layer_types", None) is None:
+                interleave = [
+                    "compressed_sparse_attention" if i % 2 else "heavily_compressed_attention"
+                    for i in range(max(n_layers - 2, 0))
+                ]
+                self.layer_types = ["heavily_compressed_attention"] * min(n_layers, 2) + interleave
+            self.layer_types = list(self.layer_types[:n_layers])
+
+            if getattr(self, "mlp_layer_types", None) is None:
+                n_hash = num_hash_layers if num_hash_layers is not None else self.default_num_hash_layers
+                self.mlp_layer_types = ["hash_moe"] * min(n_layers, n_hash) + ["moe"] * max(
+                    0, n_layers - n_hash
+                )
+            self.mlp_layer_types = list(self.mlp_layer_types[:n_layers])
+
+            if getattr(self, "partial_rotary_factor", None) is None:
+                self.partial_rotary_factor = (
+                    qk_rope_head_dim / self.head_dim
+                    if qk_rope_head_dim is not None
+                    else self.default_partial_rotary_factor
+                )
+            self.qk_rope_head_dim = int(self.head_dim * self.partial_rotary_factor)
 
     if "deepseek_v4" not in CONFIG_MAPPING:
         CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
