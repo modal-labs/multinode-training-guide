@@ -115,10 +115,10 @@ required by `mcore-bridge`.
 If `WANDB_API_KEY` is available in the container environment, enable W&B logging with:
 
 ```bash
-modal run --detach modal_train.py::train_model --report-to wandb
+modal run --detach modal_train.py::train_model_wandb
 ```
 
-The default is `--report-to none`.
+The default `train_model` entrypoint does not require `wandb-secret`.
 
 ## Notes on the fallback Megatron path
 

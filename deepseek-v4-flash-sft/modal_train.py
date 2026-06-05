@@ -190,10 +190,23 @@ text = text.replace(
     "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n",
     "            if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:\n"
     "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n"
-    "            for key in ('factor', 'original_max_position_embeddings', 'beta_fast', 'beta_slow', 'mscale', 'mscale_all_dim'):\n"
-    "                if key in self.rope_scaling:\n"
-    "                    attr = 'rotary_scaling_factor' if key == 'factor' else key\n"
-    "                    setattr(self, attr, self.rope_scaling[key])\n",
+    "            if 'factor' in self.rope_scaling:\n"
+    "                self.rotary_scaling_factor = self.rope_scaling['factor']\n"
+    "            if 'original_max_position_embeddings' in self.rope_scaling:\n"
+    "                self.original_max_position_embeddings = self.rope_scaling['original_max_position_embeddings']\n"
+    "            if 'beta_fast' in self.rope_scaling:\n"
+    "                self.beta_fast = self.rope_scaling['beta_fast']\n"
+    "            if 'beta_slow' in self.rope_scaling:\n"
+    "                self.beta_slow = self.rope_scaling['beta_slow']\n"
+    "            if 'mscale' in self.rope_scaling:\n"
+    "                self.mscale = self.rope_scaling['mscale']\n"
+    "            if 'mscale_all_dim' in self.rope_scaling:\n"
+    "                self.mscale_all_dim = self.rope_scaling['mscale_all_dim']\n"
+    "            if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling:\n"
+    "                self.rope_scaling = {\n"
+    "                    'main': dict(self.rope_scaling),\n"
+    "                    'compress': dict(self.rope_scaling),\n"
+    "                }\n",
 )
 path.write_text(text)
 PY"""
@@ -375,26 +388,14 @@ def smoke_test():
     }
 
 
-@app.function(
-    image=msswift_image,
-    gpu="B200:8",
-    volumes={
-        HF_CACHE: hf_cache_vol,
-        DATA_DIR: data_volume,
-        CHECKPOINTS_DIR: checkpoints_volume,
-    },
-    secrets=[
-        modal.Secret.from_name("huggingface-secret"),
-        modal.Secret.from_name("wandb-secret", required_keys=[]),
-    ],
-    timeout=86400,
-    retries=1,
-    memory=1048576,
-    ephemeral_disk=2048000,
-    experimental_options={"efa_enabled": True},
-)
-@clustered(size=N_NODES, rdma=True)
-def train_model(
+TRAINING_VOLUMES = {
+    HF_CACHE: hf_cache_vol,
+    DATA_DIR: data_volume,
+    CHECKPOINTS_DIR: checkpoints_volume,
+}
+
+
+def _train_model_impl(
     run_id: str | None = None,
     data_folder: str = "gsm8k",
     lora_rank: int = DEFAULT_LORA_RANK,
@@ -607,3 +608,104 @@ def train_model(
     checkpoints_volume.commit()
     print(f"Saved checkpoints to {checkpoint_dir}")
     return {"checkpoint_dir": checkpoint_dir, "run_id": run_id}
+
+
+@app.function(
+    image=msswift_image,
+    gpu="B200:8",
+    volumes=TRAINING_VOLUMES,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=86400,
+    retries=1,
+    memory=1048576,
+    ephemeral_disk=2048000,
+    experimental_options={"efa_enabled": True},
+)
+@clustered(size=N_NODES, rdma=True)
+def train_model(
+    run_id: str | None = None,
+    data_folder: str = "gsm8k",
+    lora_rank: int = DEFAULT_LORA_RANK,
+    lora_alpha: int = DEFAULT_LORA_ALPHA,
+    max_epochs: int = DEFAULT_MAX_EPOCHS,
+    train_iters: int = 0,
+    max_length: int = DEFAULT_MAX_LENGTH,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+    global_batch_size: int = 8,
+    micro_batch_size: int = 1,
+    lr: float = 1e-4,
+    save_interval: int = 25,
+):
+    return _train_model_impl(
+        run_id=run_id,
+        data_folder=data_folder,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        max_epochs=max_epochs,
+        train_iters=train_iters,
+        max_length=max_length,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
+        lr=lr,
+        save_interval=save_interval,
+        report_to="none",
+    )
+
+
+@app.function(
+    image=msswift_image,
+    gpu="B200:8",
+    volumes=TRAINING_VOLUMES,
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+    timeout=86400,
+    retries=1,
+    memory=1048576,
+    ephemeral_disk=2048000,
+    experimental_options={"efa_enabled": True},
+)
+@clustered(size=N_NODES, rdma=True)
+def train_model_wandb(
+    run_id: str | None = None,
+    data_folder: str = "gsm8k",
+    lora_rank: int = DEFAULT_LORA_RANK,
+    lora_alpha: int = DEFAULT_LORA_ALPHA,
+    max_epochs: int = DEFAULT_MAX_EPOCHS,
+    train_iters: int = 0,
+    max_length: int = DEFAULT_MAX_LENGTH,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+    global_batch_size: int = 8,
+    micro_batch_size: int = 1,
+    lr: float = 1e-4,
+    save_interval: int = 25,
+):
+    return _train_model_impl(
+        run_id=run_id,
+        data_folder=data_folder,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        max_epochs=max_epochs,
+        train_iters=train_iters,
+        max_length=max_length,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
+        lr=lr,
+        save_interval=save_interval,
+        report_to="wandb",
+    )
