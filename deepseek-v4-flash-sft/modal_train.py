@@ -60,6 +60,7 @@ try:
 
     class DeepseekV4Config(_BaseConfig):
         model_type = "deepseek_v4"
+        has_no_defaults_at_init = True
         keys_to_ignore_at_inference = ["past_key_values"]
         attribute_map = {
             "intermediate_size": "moe_intermediate_size",
