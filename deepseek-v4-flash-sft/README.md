@@ -107,6 +107,8 @@ N_NODES=2 modal run --detach modal_train.py::train_model \
 
 The model-parallel product `TP × EP × PP × CP` must divide `N_NODES × 8`. Keep `TP=1` for
 DeepSeek-V4-Flash until MLA tensor parallelism is supported for the DSv4 hybrid attention path.
+`modal_train.py` pins the Megatron-Core dev commit that provides the DSv4 hybrid attention module
+required by `mcore-bridge`.
 
 ## Optional W&B logging
 

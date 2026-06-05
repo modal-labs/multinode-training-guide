@@ -29,6 +29,7 @@ GPUS_PER_NODE = 8
 
 MS_SWIFT_COMMIT = "5bbdfc5e5d458fda520b1b7cf4643dfa9e0bd348"
 FAST_HADAMARD_TRANSFORM_COMMIT = "e7706faf8d1c3b9f241e36860640ad1dac644ede"
+MEGATRON_CORE_COMMIT = "cefc2520158c7ceba3f9adbe4b547a6f7a118da1"
 clustered = cast(Callable[..., Callable[..., Any]], modal.experimental.clustered)
 
 app = modal.App("example-deepseek-v4-flash-sft")
@@ -209,6 +210,10 @@ msswift_image = (
         "wandb==0.19.1",
     )
     .run_commands("pip install --no-deps mcore-bridge==1.4.2")
+    .run_commands(
+        "pip install --no-deps "
+        f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
+    )
     .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
     .run_commands(DEEPSEEK_V4_CONFIG_VERIFY)
     .run_commands(
