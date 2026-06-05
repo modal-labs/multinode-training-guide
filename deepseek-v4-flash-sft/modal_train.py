@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -259,10 +258,10 @@ def train_model(
 
     from huggingface_hub import snapshot_download
 
-    if run_id is None:
-        run_id = f"deepseek_v4_flash_sft_{int(time.time())}"
-
     cluster_info = modal.experimental.get_cluster_info()
+    if run_id is None:
+        run_id = f"deepseek_v4_flash_sft_{cluster_info.cluster_id}"
+
     node_rank = cluster_info.rank
     n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
     master_addr = (
