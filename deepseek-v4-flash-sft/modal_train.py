@@ -53,10 +53,14 @@ N_NODES = int(os.environ.get("N_NODES", "1"))
 DEEPSEEK_V4_CONFIG_PATCH = (
     r"""cat >/usr/local/lib/python3.11/site-packages/sitecustomize.py <<'PY'
 try:
-    from transformers.configuration_utils import PretrainedConfig
+    try:
+        from transformers.configuration_utils import PreTrainedConfig as _BaseConfig
+    except ImportError:
+        from transformers.configuration_utils import PretrainedConfig as _BaseConfig
+
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    class DeepseekV4Config(PretrainedConfig):
+    class DeepseekV4Config(_BaseConfig):
         model_type = "deepseek_v4"
         keys_to_ignore_at_inference = ["past_key_values"]
         attribute_map = {
@@ -64,9 +68,15 @@ try:
             "num_local_experts": "n_routed_experts",
         }
 
-    CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config, exist_ok=True)
+    if "deepseek_v4" not in CONFIG_MAPPING:
+        CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
 except Exception:
     pass
+PY
+python - <<'PY'
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+assert "deepseek_v4" in CONFIG_MAPPING
 PY"""
 )
 
