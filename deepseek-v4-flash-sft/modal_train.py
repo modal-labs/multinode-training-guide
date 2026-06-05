@@ -28,6 +28,7 @@ CP_SIZE = 1
 GPUS_PER_NODE = 8
 
 MS_SWIFT_COMMIT = "5bbdfc5e5d458fda520b1b7cf4643dfa9e0bd348"
+FAST_HADAMARD_TRANSFORM_COMMIT = "e7706faf8d1c3b9f241e36860640ad1dac644ede"
 clustered = cast(Callable[..., Callable[..., Any]], modal.experimental.clustered)
 
 app = modal.App("example-deepseek-v4-flash-sft")
@@ -88,7 +89,8 @@ msswift_image = (
         "wandb==0.19.1",
     )
     .run_commands(
-        "pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git"
+        "pip install --no-build-isolation "
+        f"git+https://github.com/Dao-AILab/fast-hadamard-transform.git@{FAST_HADAMARD_TRANSFORM_COMMIT}"
     )
     .env(
         {
