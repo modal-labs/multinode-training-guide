@@ -72,12 +72,11 @@ try:
         CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
 except Exception:
     pass
-PY
-python - <<'PY'
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-assert "deepseek_v4" in CONFIG_MAPPING
 PY"""
+)
+DEEPSEEK_V4_CONFIG_VERIFY = (
+    "python -c \"from transformers.models.auto.configuration_auto import "
+    "CONFIG_MAPPING; assert 'deepseek_v4' in CONFIG_MAPPING\""
 )
 
 download_image = (
@@ -91,6 +90,7 @@ download_image = (
         "transformers==4.57.4",
     )
     .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
+    .run_commands(DEEPSEEK_V4_CONFIG_VERIFY)
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
 
@@ -120,6 +120,7 @@ msswift_image = (
         "wandb==0.19.1",
     )
     .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
+    .run_commands(DEEPSEEK_V4_CONFIG_VERIFY)
     .run_commands(
         "pip install --no-build-isolation "
         f"git+https://github.com/Dao-AILab/fast-hadamard-transform.git@{FAST_HADAMARD_TRANSFORM_COMMIT}"
