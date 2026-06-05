@@ -228,7 +228,7 @@ def smoke_test():
     },
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
-        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("wandb-secret", required_keys=[]),
     ],
     timeout=86400,
     retries=1,
