@@ -54,11 +54,11 @@ download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "datasets==3.1.0",
-        "huggingface_hub[hf_xet]==0.36.0",
+        "huggingface_hub[hf_xet]==1.18.0",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
         "torch==2.9.1",
-        "transformers==4.57.4",
+        "transformers==5.10.2",
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
@@ -80,11 +80,11 @@ msswift_image = (
     .pip_install(
         "datasets==3.1.0",
         "einops==0.8.2",
-        "huggingface_hub[hf_xet]==0.36.0",
+        "huggingface_hub[hf_xet]==1.18.0",
         f"ms-swift @ git+https://github.com/modelscope/ms-swift.git@{MS_SWIFT_COMMIT}",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
-        "transformers==4.57.4",
+        "transformers==5.10.2",
         "wandb==0.19.1",
         "mcore-bridge==1.4.2",
     )
