@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 import modal
@@ -90,8 +91,8 @@ def default_run_id(
     ).hexdigest()[:12]
     return f"deepseek_v4_flash_sft_{digest}"
 
-DEEPSEEK_V4_CONFIG_PATCH = (
-    r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
+
+DEEPSEEK_V4_CONFIG_PATCH = r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
 try:
     try:
         from ...configuration_utils import PreTrainedConfig as _BaseConfig
@@ -164,9 +165,8 @@ try:
 except Exception:
     pass
 PY"""
-)
 DEEPSEEK_V4_CONFIG_VERIFY = (
-    "python -c \"from transformers.models.auto.configuration_auto import "
+    'python -c "from transformers.models.auto.configuration_auto import '
     "CONFIG_MAPPING; assert 'deepseek_v4' in CONFIG_MAPPING\""
 )
 MCORE_BRIDGE_DSV4_PATCH = r"""python - <<'PY'
@@ -388,7 +388,7 @@ def smoke_test():
     }
 
 
-TRAINING_VOLUMES = {
+TRAINING_VOLUMES: dict[str | PurePosixPath, modal.Volume | modal.CloudBucketMount] = {
     HF_CACHE: hf_cache_vol,
     DATA_DIR: data_volume,
     CHECKPOINTS_DIR: checkpoints_volume,
