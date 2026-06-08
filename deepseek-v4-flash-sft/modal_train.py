@@ -381,6 +381,7 @@ vllm_image = (
         "path.write_text(text.replace(old, new, 1))\n"
         "PY"
     )
+    .run_commands("python -m pip uninstall -y nvidia-cutlass-dsl")
     .entrypoint([])
     .env({"VLLM_USE_V1": "1"})
 )
