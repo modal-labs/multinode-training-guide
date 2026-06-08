@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Callable
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -211,6 +212,37 @@ text = text.replace(
 path.write_text(text)
 PY"""
 
+SWIFT_PEFT_SAVE_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/swift/megatron/init.py")
+text = path.read_text()
+old = """        if is_master() and not hasattr(self, 'hf_model'):
+            if hasattr(self, 'get_hf_meta_model'):
+                self.hf_model = self.get_hf_meta_model()
+                self.hf_model.model_meta = processor.model_meta
+                self.hf_model.model_info = processor.model_info
+            else:
+                with torch.device('meta'), disable_safe_ddp_context_use_barrier():
+                    self.hf_model = get_model_processor(
+                        args.model_dir, model_type=args.model_type, return_dummy_model=True)[0]
+"""
+new = """        needs_hf_model = not peft_format or (self.is_multimodal and 'all-linear' in args.target_modules)
+        if is_master() and needs_hf_model and not hasattr(self, 'hf_model'):
+            if hasattr(self, 'get_hf_meta_model'):
+                self.hf_model = self.get_hf_meta_model()
+                self.hf_model.model_meta = processor.model_meta
+                self.hf_model.model_info = processor.model_info
+            else:
+                with torch.device('meta'), disable_safe_ddp_context_use_barrier():
+                    self.hf_model = get_model_processor(
+                        args.model_dir, model_type=args.model_type, return_dummy_model=True)[0]
+"""
+if old not in text:
+    raise RuntimeError("Swift PEFT save patch target not found")
+path.write_text(text.replace(old, new))
+PY"""
+
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -252,6 +284,7 @@ msswift_image = (
     )
     .run_commands("pip install --no-deps mcore-bridge==1.4.2")
     .run_commands(MCORE_BRIDGE_DSV4_PATCH)
+    .run_commands(SWIFT_PEFT_SAVE_PATCH)
     .run_commands(
         "pip install --no-deps "
         f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
@@ -713,3 +746,201 @@ def train_model_wandb(
         save_interval=save_interval,
         report_to="wandb",
     )
+
+
+def _extract_gsm8k_answer(text: str) -> str | None:
+    """Extract the numerical answer from a GSM8K-style response.
+
+    Looks for ``#### <number>`` first, then falls back to the last number.
+    """
+    match = re.search(r"####\s*([\d,]+(?:\.\d+)?)", text)
+    if match:
+        return match.group(1).replace(",", "")
+    numbers = re.findall(r"[\d,]+(?:\.\d+)?", text)
+    return numbers[-1].replace(",", "") if numbers else None
+
+
+@app.function(
+    image=msswift_image,
+    gpu="B200:8",
+    volumes=TRAINING_VOLUMES,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=86400,
+    memory=1048576,
+    ephemeral_disk=2048000,
+)
+def export_and_eval(
+    run_id: str,
+    checkpoint_step: int = 5,
+    eval_limit: int = 20,
+    max_model_len: int = 4096,
+    ep_size: int = EP_SIZE,
+):
+    """Export a Megatron LoRA checkpoint, deploy with vLLM, and evaluate.
+
+    Pipeline:
+    1. ``megatron export --to_hf --merge_lora`` converts the mcore LoRA
+       checkpoint into a merged HF safetensors model.
+    2. ``swift deploy`` starts an OpenAI-compatible vLLM server.
+    3. A handful of test prompts verify inference works.
+    4. GSM8K test-split questions are sent to the server and accuracy is
+       reported.
+    """
+    import subprocess
+    import time
+    import urllib.request
+
+    from datasets import load_dataset
+    from huggingface_hub import snapshot_download
+
+    hf_cache_vol.reload()
+    checkpoints_volume.reload()
+
+    model_dir = snapshot_download(
+        HF_MODEL,
+        local_files_only=True,
+        token=os.environ.get("HF_TOKEN"),
+    )
+
+    ckpt_dir = f"{CHECKPOINTS_DIR}/{run_id}/checkpoint-{checkpoint_step}"
+    merged_dir = f"/tmp/merged-hf"
+
+    if not os.path.exists(ckpt_dir):
+        raise RuntimeError(f"Checkpoint not found at {ckpt_dir}")
+
+    # ── Step 1: Export mcore LoRA → merged HF ─────────────────────────
+    os.environ["NPROC_PER_NODE"] = str(GPUS_PER_NODE)
+
+    export_cmd = [
+        "megatron",
+        "export",
+        "--model",
+        model_dir,
+        "--mcore_adapter",
+        ckpt_dir,
+        "--merge_lora",
+        "true",
+        "--to_hf",
+        "true",
+        "--output_dir",
+        merged_dir,
+        "--expert_model_parallel_size",
+        str(ep_size),
+        "--exist_ok",
+        "true",
+    ]
+
+    print(f"[export] {' '.join(export_cmd)}")
+    result = subprocess.run(export_cmd, capture_output=False, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"megatron export failed (exit {result.returncode})")
+    print(f"[export] Merged HF model saved to {merged_dir}")
+
+    # ── Step 2: Deploy with vLLM ──────────────────────────────────────
+    server_proc = subprocess.Popen(
+        [
+            "swift",
+            "deploy",
+            "--model",
+            merged_dir,
+            "--infer_backend",
+            "vllm",
+            "--vllm_max_model_len",
+            str(max_model_len),
+            "--vllm_tensor_parallel_size",
+            str(GPUS_PER_NODE),
+            "--vllm_gpu_memory_utilization",
+            "0.9",
+            "--port",
+            "8000",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    print("[deploy] Waiting for vLLM server…")
+    for attempt in range(180):
+        try:
+            urllib.request.urlopen("http://localhost:8000/health", timeout=5)
+            print(f"[deploy] Server ready after ~{attempt * 5}s")
+            break
+        except Exception:
+            time.sleep(5)
+    else:
+        tail = server_proc.stdout.read()[-3000:] if server_proc.stdout else ""
+        server_proc.kill()
+        raise RuntimeError(f"vLLM server failed to start:\n{tail}")
+
+    # Discover served model name
+    try:
+        resp = urllib.request.urlopen("http://localhost:8000/v1/models")
+        model_name = json.loads(resp.read())["data"][0]["id"]
+    except Exception:
+        model_name = "merged-hf"
+
+    def _chat(prompt: str, max_tokens: int = 512) -> str:
+        body = json.dumps(
+            {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+            }
+        ).encode()
+        req = urllib.request.Request(
+            "http://localhost:8000/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=120)
+        return json.loads(resp.read())["choices"][0]["message"]["content"]
+
+    # ── Step 3: Smoke inference ───────────────────────────────────────
+    smoke_prompts = [
+        "What is 2+2? Give just the number.",
+        "If a train travels 60 mph for 2.5 hours, how far does it go?",
+        "A store sells apples for $0.50 each. How much do 12 cost?",
+    ]
+    print("\n=== Smoke Inference ===")
+    for prompt in smoke_prompts:
+        try:
+            ans = _chat(prompt, max_tokens=256)
+            print(f"Q: {prompt}\nA: {ans[:400]}\n")
+        except Exception as e:
+            print(f"Q: {prompt}\nError: {e}\n")
+
+    # ── Step 4: GSM8K eval ────────────────────────────────────────────
+    print(f"\n=== GSM8K Evaluation (limit={eval_limit}) ===")
+    gsm8k = load_dataset("openai/gsm8k", "main", split="test")
+    if eval_limit:
+        gsm8k = gsm8k.select(range(min(eval_limit, len(gsm8k))))
+
+    correct = 0
+    total = 0
+    for i, row in enumerate(gsm8k):
+        gold = _extract_gsm8k_answer(row["answer"])
+        if gold is None:
+            continue
+        try:
+            response = _chat(row["question"], max_tokens=512)
+            pred = _extract_gsm8k_answer(response)
+            hit = pred is not None and pred == gold
+            correct += hit
+            total += 1
+            tag = "PASS" if hit else "FAIL"
+            print(f"  [{i + 1}/{len(gsm8k)}] {tag}  pred={pred}  gold={gold}")
+        except Exception as e:
+            total += 1
+            print(f"  [{i + 1}/{len(gsm8k)}] ERROR  {e}")
+
+    accuracy = correct / total if total > 0 else 0.0
+    print(f"\n=== GSM8K Result: {correct}/{total} ({accuracy:.1%}) ===")
+
+    server_proc.kill()
+    return {
+        "run_id": run_id,
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+    }
