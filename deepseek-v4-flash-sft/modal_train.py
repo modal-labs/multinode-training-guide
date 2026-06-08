@@ -345,6 +345,42 @@ vllm_image = (
         "path.write_text(text.replace(old, new, 1))\n"
         "PY"
     )
+    .run_commands(
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py')\n"
+        "text = path.read_text()\n"
+        "old = 'from vllm.utils.import_utils import has_cutedsl\\n'\n"
+        "new = 'def has_cutedsl():\\n    return False\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM CUTLASS DSL fallback patch target not found')\n"
+        "path.write_text(text.replace(old, new, 1))\n"
+        "PY"
+    )
+    .run_commands(
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/ops/cache_utils.py')\n"
+        "text = path.read_text()\n"
+        "old = 'from vllm.utils.import_utils import has_cutedsl\\n'\n"
+        "new = 'def has_cutedsl():\\n    return False\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM cache CUTLASS DSL fallback patch target not found')\n"
+        "path.write_text(text.replace(old, new, 1))\n"
+        "PY"
+    )
+    .run_commands(
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/compressor.py')\n"
+        "text = path.read_text()\n"
+        "old = '            if self.head_dim == 512:\\n'\n"
+        "new = '            if False and self.head_dim == 512:\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM compressor Triton fallback patch target not found')\n"
+        "path.write_text(text.replace(old, new, 1))\n"
+        "PY"
+    )
     .entrypoint([])
     .env({"VLLM_USE_V1": "1"})
 )
@@ -976,6 +1012,8 @@ def deploy_and_eval_merged(
     """Deploy the exported model with vLLM, run smoke inference, and eval GSM8K."""
     import subprocess
     import time
+    import traceback
+    import urllib.error
     import urllib.request
 
     from datasets import load_dataset
@@ -1011,6 +1049,9 @@ def deploy_and_eval_merged(
             "fp8",
             "--moe-backend",
             "triton",
+            "--safetensors-load-strategy",
+            "prefetch",
+            "--enforce-eager",
             "--port",
             "8000",
             "--no-enable-log-requests",
@@ -1021,7 +1062,7 @@ def deploy_and_eval_merged(
     )
 
     print("[deploy] Waiting for vLLM server...")
-    for attempt in range(240):
+    for attempt in range(720):
         try:
             urllib.request.urlopen("http://localhost:8000/health", timeout=5)
             print(f"[deploy] Server ready after ~{attempt * 5}s")
@@ -1059,7 +1100,14 @@ def deploy_and_eval_merged(
                 data=body,
                 headers={"Content-Type": "application/json"},
             )
-            resp = urllib.request.urlopen(req, timeout=120)
+            try:
+                resp = urllib.request.urlopen(req, timeout=120)
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode(errors="replace")
+                print(f"[_chat] HTTP {exc.code}: {err_body[:2000]}")
+                raise RuntimeError(
+                    f"vLLM returned HTTP {exc.code}: {err_body[:500]}"
+                ) from None
             return json.loads(resp.read())["choices"][0]["message"]["content"]
 
         smoke_prompts = [
@@ -1100,6 +1148,17 @@ def deploy_and_eval_merged(
             "correct": correct,
             "total": total,
         }
+    except Exception:
+        traceback.print_exc()
+        print("\n=== vLLM server log (last 50000 chars) ===")
+        try:
+            server_log.flush()
+            with open(server_log.name) as _f:
+                log_text = _f.read()
+            print(log_text[-50000:])
+        except Exception as log_err:
+            print(f"Could not read server log: {log_err}")
+        raise
     finally:
         if server_proc.poll() is None:
             server_proc.kill()
