@@ -20,6 +20,7 @@ Use this repository to learn how to build distributed training jobs on Modal.
 - [**`lightning/`**](/lightning/) a simple lightning.ai Fabric example.
 - [**`nanoGPT/`**](/nanoGPT/) training Karpathy's nanoGPT reproduction of OpenAI's GPT-2.
 - [**`resnet50/`**](/resnet50/) training a ResNet50 model on the ImageNet dataset.
+- [**`skyrl-tx/`**](/skyrl-tx/) SkyRL-TX Tinker-compatible SFT and RL on Qwen3-8B.
 - [**`starcoder/`**](/starcoder) accelerated finetuning of Llama-2-7B on Rust and Go code, supporting either `torchrun` or `accelerate`.
 
 # Documentation
