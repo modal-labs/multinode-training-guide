@@ -226,11 +226,16 @@ def _run_tinker_job(
 ) -> None:
     cluster_info = modal.experimental.get_cluster_info()
     rank = cluster_info.rank
-    if not cluster_info.container_ips:
-        raise RuntimeError("Clustered run did not receive container IPs from Modal")
-    n_nodes = len(cluster_info.container_ips)
-    master_addr = cluster_info.container_ips[0]
+    if not cluster_info.container_ipv4_ips:
+        raise RuntimeError("Clustered run did not receive container IPv4 addresses from Modal")
+    n_nodes = len(cluster_info.container_ipv4_ips)
+    master_addr = cluster_info.container_ipv4_ips[0]
     run_key = f"{cluster_info.cluster_id}:{mode}:{model_id}:{COORDINATOR_PORT}"
+    print(
+        f"{mode}_cluster rank={rank} master_addr={master_addr} "
+        f"n_nodes={n_nodes} gpu={GPU_TYPE}:{gpus_per_node}",
+        flush=True,
+    )
 
     if rank > 0:
         _run_worker(run_state, master_addr, n_nodes, rank, run_key)
