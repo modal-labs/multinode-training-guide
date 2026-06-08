@@ -31,7 +31,6 @@ app = modal.App("example-skyrl-tx-qwen")
 
 hf_cache_volume = modal.Volume.from_name("skyrl-tx-hf-cache", create_if_missing=True)
 checkpoint_volume = modal.Volume.from_name("skyrl-tx-checkpoints", create_if_missing=True)
-run_state = modal.Dict.from_name("skyrl-tx-run-state", create_if_missing=True)
 
 example_dir = Path(__file__).parent
 
@@ -129,7 +128,13 @@ def _backend_config(
     }
 
 
-def _run_worker(master_addr: str, n_nodes: int, rank: int, run_key: str) -> None:
+def _run_worker(
+    run_state: modal.Dict,
+    master_addr: str,
+    n_nodes: int,
+    rank: int,
+    run_key: str,
+) -> None:
     log_path = Path(f"/tmp/skyrl_tx_worker_{rank}.log")
     cmd = [
         "uv",
@@ -192,6 +197,7 @@ def _run_client(client_script: str, model_id: str, extra_args: list[str]) -> Non
 
 
 def _run_tinker_job(
+    run_state: modal.Dict,
     mode: str,
     client_script: str,
     model_id: str,
@@ -201,12 +207,14 @@ def _run_tinker_job(
 ) -> None:
     cluster_info = modal.experimental.get_cluster_info()
     rank = cluster_info.rank
-    n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else N_NODES
-    master_addr = cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
-    run_key = f"{mode}:{model_id}:{master_addr}:{COORDINATOR_PORT}"
+    if not cluster_info.container_ips:
+        raise RuntimeError("Clustered run did not receive container IPs from Modal")
+    n_nodes = len(cluster_info.container_ips)
+    master_addr = cluster_info.container_ips[0]
+    run_key = f"{cluster_info.cluster_id}:{mode}:{model_id}:{COORDINATOR_PORT}"
 
     if rank > 0:
-        _run_worker(master_addr, n_nodes, rank, run_key)
+        _run_worker(run_state, master_addr, n_nodes, rank, run_key)
         return
 
     run_state[run_key] = "running"
@@ -276,13 +284,15 @@ def download_model(model_id: str = MODEL_ID, revision: str | None = None) -> Non
     experimental_options={"efa_enabled": True},
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
-def run_sft(
+def run_sft_cluster(
+    run_state: modal.Dict,
     model_id: str = MODEL_ID,
     steps: int = 8,
     lora_rank: int = 8,
     learning_rate: float = 1e-4,
 ) -> None:
     _run_tinker_job(
+        run_state=run_state,
         mode="sft",
         client_script="sft_client.py",
         model_id=model_id,
@@ -309,7 +319,8 @@ def run_sft(
     experimental_options={"efa_enabled": True},
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
-def run_rl(
+def run_rl_cluster(
+    run_state: modal.Dict,
     model_id: str = MODEL_ID,
     steps: int = 4,
     samples_per_prompt: int = 2,
@@ -317,6 +328,7 @@ def run_rl(
     learning_rate: float = 5e-5,
 ) -> None:
     _run_tinker_job(
+        run_state=run_state,
         mode="rl",
         client_script="rl_client.py",
         model_id=model_id,
@@ -333,3 +345,26 @@ def run_rl(
         train_micro_batch_size=max(1, samples_per_prompt),
         lora_rank=lora_rank,
     )
+
+
+@app.local_entrypoint()
+def run_sft(
+    model_id: str = MODEL_ID,
+    steps: int = 8,
+    lora_rank: int = 8,
+    learning_rate: float = 1e-4,
+) -> None:
+    with modal.Dict.ephemeral() as run_state:
+        run_sft_cluster.remote(run_state, model_id, steps, lora_rank, learning_rate)
+
+
+@app.local_entrypoint()
+def run_rl(
+    model_id: str = MODEL_ID,
+    steps: int = 4,
+    samples_per_prompt: int = 2,
+    lora_rank: int = 8,
+    learning_rate: float = 5e-5,
+) -> None:
+    with modal.Dict.ephemeral() as run_state:
+        run_rl_cluster.remote(run_state, model_id, steps, samples_per_prompt, lora_rank, learning_rate)

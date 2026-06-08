@@ -68,8 +68,9 @@ SKYRL_TX_GPUS_PER_NODE=8 modal run --detach skyrl-tx/modal_train.py::run_sft
 
 ## How it works
 
-`run_sft` and `run_rl` are `@modal.experimental.clustered` functions.
-Rank 0 starts the SkyRL-TX Tinker API server:
+`run_sft` and `run_rl` create a per-run ephemeral Modal Dict for coordination,
+then launch clustered `run_sft_cluster` or `run_rl_cluster` functions. Rank 0
+starts the SkyRL-TX Tinker API server:
 
 ```bash
 uv run --extra gpu --extra tinker --extra jax -m skyrl.tinker.api \
