@@ -333,6 +333,18 @@ vllm_image = (
         "path.write_text(text.replace(old, new))\n"
         "PY"
     )
+    .run_commands(
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/attention.py')\n"
+        "text = path.read_text()\n"
+        "old = '        if current_platform.is_rocm():\\n'\n"
+        "new = '        if current_platform.is_rocm() or not hasattr(self.wo_a, \"weight_scale_inv\"):\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM BF16 attention patch target not found')\n"
+        "path.write_text(text.replace(old, new, 1))\n"
+        "PY"
+    )
     .entrypoint([])
     .env({"VLLM_USE_V1": "1"})
 )
