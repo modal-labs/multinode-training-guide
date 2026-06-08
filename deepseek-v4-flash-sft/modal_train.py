@@ -938,6 +938,8 @@ def deploy_and_eval_merged(
             "0.9",
             "--dtype",
             "bfloat16",
+            "--moe-backend",
+            "triton",
             "--port",
             "8000",
             "--no-enable-log-requests",
