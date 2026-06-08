@@ -804,6 +804,10 @@ def _make_config_vllm_compatible(config_path: str) -> None:
 
     config["architectures"] = ["DeepseekV4ForCausalLM"]
     config.setdefault("pad_token_id", config.get("eos_token_id", 1))
+    if "n_routed_experts" in config:
+        config.setdefault("num_local_experts", config["n_routed_experts"])
+    if "moe_intermediate_size" in config:
+        config.setdefault("intermediate_size", config["moe_intermediate_size"])
     vllm_defaults = {
         "compress_rope_theta": 160000,
         "num_nextn_predict_layers": 1,
