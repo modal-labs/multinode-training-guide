@@ -317,6 +317,12 @@ msswift_image = (
     )
 )
 
+vllm_image = (
+    modal.Image.from_registry("vllm/vllm-openai:v0.22.1")
+    .pip_install("datasets==3.1.0")
+    .env({"VLLM_USE_V1": "1"})
+)
+
 
 @app.function(
     image=download_image,
@@ -800,28 +806,14 @@ def _numeric_eq(left: str, right: str) -> bool:
     memory=1048576,
     ephemeral_disk=2048000,
 )
-def export_and_eval(
+def export_checkpoint(
     run_id: str,
     checkpoint_step: int = 5,
-    eval_limit: int = 20,
-    max_model_len: int = 4096,
     ep_size: int = EP_SIZE,
 ):
-    """Export a Megatron LoRA checkpoint, deploy with vLLM, and evaluate.
-
-    Pipeline:
-    1. ``megatron export --to_hf --merge_lora`` converts the mcore LoRA
-       checkpoint into a merged HF safetensors model.
-    2. ``swift deploy`` starts an OpenAI-compatible vLLM server.
-    3. A handful of test prompts verify inference works.
-    4. GSM8K test-split questions are sent to the server and accuracy is
-       reported.
-    """
+    """Export a Megatron LoRA checkpoint into merged HF safetensors."""
     import subprocess
-    import time
-    import urllib.request
 
-    from datasets import load_dataset
     from huggingface_hub import snapshot_download
 
     hf_cache_vol.reload()
@@ -834,14 +826,11 @@ def export_and_eval(
     )
 
     ckpt_dir = f"{CHECKPOINTS_DIR}/{run_id}/checkpoint-{checkpoint_step}"
-    merged_dir = "/tmp/merged-hf"
-
+    merged_dir = f"{CHECKPOINTS_DIR}/{run_id}/merged-hf"
     if not os.path.exists(ckpt_dir):
         raise RuntimeError(f"Checkpoint not found at {ckpt_dir}")
 
-    # -- Step 1: Export mcore LoRA -> merged HF --------------------------
     os.environ["NPROC_PER_NODE"] = str(GPUS_PER_NODE)
-
     export_cmd = [
         "megatron",
         "export",
@@ -865,38 +854,67 @@ def export_and_eval(
     result = subprocess.run(export_cmd, capture_output=False, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
-    print(f"[export] Merged HF model saved to {merged_dir}")
 
     config_path = f"{merged_dir}/config.json"
     with open(config_path) as f:
         exported_config = json.load(f)
-    exported_config["architectures"] = ["TransformersForCausalLM"]
+    exported_config["architectures"] = ["DeepseekV4ForCausalLM"]
     with open(config_path, "w") as f:
         json.dump(exported_config, f, indent=2)
 
-    # -- Step 2: Deploy with vLLM ----------------------------------------
+    checkpoints_volume.commit()
+    print(f"[export] Merged HF model saved to {merged_dir}")
+    return {"merged_dir": merged_dir, "run_id": run_id}
+
+
+@app.function(
+    image=vllm_image,
+    gpu="B200:8",
+    volumes={CHECKPOINTS_DIR: checkpoints_volume},
+    timeout=86400,
+    retries=1,
+    memory=1048576,
+    ephemeral_disk=2048000,
+)
+def deploy_and_eval_merged(
+    run_id: str,
+    eval_limit: int = 20,
+    max_model_len: int = 4096,
+):
+    """Deploy the exported model with vLLM, run smoke inference, and eval GSM8K."""
+    import subprocess
+    import time
+    import urllib.request
+
+    from datasets import load_dataset
+
+    checkpoints_volume.reload()
+    merged_dir = f"{CHECKPOINTS_DIR}/{run_id}/merged-hf"
+    if not os.path.exists(f"{merged_dir}/config.json"):
+        raise RuntimeError(f"Merged HF model not found at {merged_dir}")
+
     server_log_path = "/tmp/vllm-server.log"
     server_log = open(server_log_path, "w")
     server_proc = subprocess.Popen(
         [
-            "swift",
-            "deploy",
+            "python",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
             "--model",
             merged_dir,
-            "--infer_backend",
-            "vllm",
-            "--vllm_max_model_len",
-            str(max_model_len),
-            "--vllm_tensor_parallel_size",
+            "--served-model-name",
+            "deepseek-v4-flash-sft",
+            "--tensor-parallel-size",
             str(GPUS_PER_NODE),
-            "--vllm_gpu_memory_utilization",
+            "--max-model-len",
+            str(max_model_len),
+            "--gpu-memory-utilization",
             "0.9",
-            "--vllm_engine_kwargs",
-            json.dumps({"model_impl": "transformers"}),
-            "--vllm_use_async_engine",
-            "false",
+            "--dtype",
+            "bfloat16",
             "--port",
             "8000",
+            "--disable-log-requests",
         ],
         stdout=server_log,
         stderr=subprocess.STDOUT,
@@ -904,7 +922,7 @@ def export_and_eval(
     )
 
     print("[deploy] Waiting for vLLM server...")
-    for attempt in range(180):
+    for attempt in range(240):
         try:
             urllib.request.urlopen("http://localhost:8000/health", timeout=5)
             print(f"[deploy] Server ready after ~{attempt * 5}s")
@@ -927,17 +945,11 @@ def export_and_eval(
         raise RuntimeError(f"vLLM server failed to start:\n{tail}")
 
     try:
-        # Discover served model name
-        try:
-            resp = urllib.request.urlopen("http://localhost:8000/v1/models")
-            model_name = json.loads(resp.read())["data"][0]["id"]
-        except Exception:
-            model_name = "merged-hf"
 
         def _chat(prompt: str, max_tokens: int = 512) -> str:
             body = json.dumps(
                 {
-                    "model": model_name,
+                    "model": "deepseek-v4-flash-sft",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": max_tokens,
                     "temperature": 0,
@@ -951,7 +963,6 @@ def export_and_eval(
             resp = urllib.request.urlopen(req, timeout=120)
             return json.loads(resp.read())["choices"][0]["message"]["content"]
 
-        # -- Step 3: Smoke inference -----------------------------------------
         smoke_prompts = [
             "What is 2+2? Give just the number.",
             "If a train travels 60 mph for 2.5 hours, how far does it go?",
@@ -959,13 +970,9 @@ def export_and_eval(
         ]
         print("\n=== Smoke Inference ===")
         for prompt in smoke_prompts:
-            try:
-                ans = _chat(prompt, max_tokens=256)
-                print(f"Q: {prompt}\nA: {ans[:400]}\n")
-            except Exception as e:
-                print(f"Q: {prompt}\nError: {e}\n")
+            ans = _chat(prompt, max_tokens=256)
+            print(f"Q: {prompt}\nA: {ans[:400]}\n")
 
-        # -- Step 4: GSM8K eval ----------------------------------------------
         print(f"\n=== GSM8K Evaluation (limit={eval_limit}) ===")
         gsm8k = load_dataset("openai/gsm8k", "main", split="test")
         if eval_limit:
@@ -977,17 +984,13 @@ def export_and_eval(
             gold = _extract_gsm8k_answer(row["answer"])
             if gold is None:
                 continue
-            try:
-                response = _chat(row["question"], max_tokens=512)
-                pred = _extract_gsm8k_answer(response)
-                hit = pred is not None and _numeric_eq(pred, gold)
-                correct += hit
-                total += 1
-                tag = "PASS" if hit else "FAIL"
-                print(f"  [{i + 1}/{len(gsm8k)}] {tag}  pred={pred}  gold={gold}")
-            except Exception as e:
-                total += 1
-                print(f"  [{i + 1}/{len(gsm8k)}] ERROR  {e}")
+            response = _chat(row["question"], max_tokens=512)
+            pred = _extract_gsm8k_answer(response)
+            hit = pred is not None and _numeric_eq(pred, gold)
+            correct += hit
+            total += 1
+            tag = "PASS" if hit else "FAIL"
+            print(f"  [{i + 1}/{len(gsm8k)}] {tag}  pred={pred}  gold={gold}")
 
         accuracy = correct / total if total > 0 else 0.0
         print(f"\n=== GSM8K Result: {correct}/{total} ({accuracy:.1%}) ===")
@@ -1003,3 +1006,26 @@ def export_and_eval(
             server_proc.kill()
         server_proc.wait(timeout=30)
         server_log.close()
+
+
+@app.local_entrypoint()
+def export_and_eval(
+    run_id: str,
+    checkpoint_step: int = 5,
+    eval_limit: int = 20,
+    max_model_len: int = 4096,
+    ep_size: int = EP_SIZE,
+):
+    """Export a checkpoint, deploy the merged model, and run a small eval."""
+    export_checkpoint.remote(
+        run_id=run_id,
+        checkpoint_step=checkpoint_step,
+        ep_size=ep_size,
+    )
+    result = deploy_and_eval_merged.remote(
+        run_id=run_id,
+        eval_limit=eval_limit,
+        max_model_len=max_model_len,
+    )
+    print(json.dumps(result, indent=2))
+    return result
