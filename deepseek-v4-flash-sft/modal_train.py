@@ -798,6 +798,21 @@ def _numeric_eq(left: str, right: str) -> bool:
         return left == right
 
 
+def _make_config_vllm_compatible(config_path: str) -> None:
+    with open(config_path) as f:
+        config = json.load(f)
+
+    config["architectures"] = ["DeepseekV4ForCausalLM"]
+    if isinstance(config.get("mlp_layer_types"), list):
+        config["mlp_layer_types"] = [
+            "moe" if layer_type == "hash_moe" else layer_type
+            for layer_type in config["mlp_layer_types"]
+        ]
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+
 @app.function(
     image=msswift_image,
     gpu="B200:8",
@@ -857,12 +872,7 @@ def export_checkpoint(
     if result.returncode != 0:
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
 
-    config_path = f"{merged_dir}/config.json"
-    with open(config_path) as f:
-        exported_config = json.load(f)
-    exported_config["architectures"] = ["DeepseekV4ForCausalLM"]
-    with open(config_path, "w") as f:
-        json.dump(exported_config, f, indent=2)
+    _make_config_vllm_compatible(f"{merged_dir}/config.json")
 
     checkpoints_volume.commit()
     print(f"[export] Merged HF model saved to {merged_dir}")
@@ -892,8 +902,11 @@ def deploy_and_eval_merged(
 
     checkpoints_volume.reload()
     merged_dir = f"{CHECKPOINTS_DIR}/{run_id}/merged-hf"
-    if not os.path.exists(f"{merged_dir}/config.json"):
+    config_path = f"{merged_dir}/config.json"
+    if not os.path.exists(config_path):
         raise RuntimeError(f"Merged HF model not found at {merged_dir}")
+    _make_config_vllm_compatible(config_path)
+    checkpoints_volume.commit()
 
     server_log_path = "/tmp/vllm-server.log"
     server_log = open(server_log_path, "w")
