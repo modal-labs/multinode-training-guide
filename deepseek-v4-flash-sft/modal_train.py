@@ -212,37 +212,6 @@ text = text.replace(
 path.write_text(text)
 PY"""
 
-SWIFT_PEFT_SAVE_PATCH = r"""python - <<'PY'
-from pathlib import Path
-
-path = Path("/usr/local/lib/python3.11/site-packages/swift/megatron/init.py")
-text = path.read_text()
-old = """        if is_master() and not hasattr(self, 'hf_model'):
-            if hasattr(self, 'get_hf_meta_model'):
-                self.hf_model = self.get_hf_meta_model()
-                self.hf_model.model_meta = processor.model_meta
-                self.hf_model.model_info = processor.model_info
-            else:
-                with torch.device('meta'), disable_safe_ddp_context_use_barrier():
-                    self.hf_model = get_model_processor(
-                        args.model_dir, model_type=args.model_type, return_dummy_model=True)[0]
-"""
-new = """        needs_hf_model = not peft_format or (self.is_multimodal and 'all-linear' in args.target_modules)
-        if is_master() and needs_hf_model and not hasattr(self, 'hf_model'):
-            if hasattr(self, 'get_hf_meta_model'):
-                self.hf_model = self.get_hf_meta_model()
-                self.hf_model.model_meta = processor.model_meta
-                self.hf_model.model_info = processor.model_info
-            else:
-                with torch.device('meta'), disable_safe_ddp_context_use_barrier():
-                    self.hf_model = get_model_processor(
-                        args.model_dir, model_type=args.model_type, return_dummy_model=True)[0]
-"""
-if old not in text:
-    raise RuntimeError("Swift PEFT save patch target not found")
-path.write_text(text.replace(old, new))
-PY"""
-
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -284,7 +253,6 @@ msswift_image = (
     )
     .run_commands("pip install --no-deps mcore-bridge==1.4.2")
     .run_commands(MCORE_BRIDGE_DSV4_PATCH)
-    .run_commands(SWIFT_PEFT_SAVE_PATCH)
     .run_commands(
         "pip install --no-deps "
         f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
@@ -803,12 +771,12 @@ def export_and_eval(
     )
 
     ckpt_dir = f"{CHECKPOINTS_DIR}/{run_id}/checkpoint-{checkpoint_step}"
-    merged_dir = f"/tmp/merged-hf"
+    merged_dir = "/tmp/merged-hf"
 
     if not os.path.exists(ckpt_dir):
         raise RuntimeError(f"Checkpoint not found at {ckpt_dir}")
 
-    # ── Step 1: Export mcore LoRA → merged HF ─────────────────────────
+    # -- Step 1: Export mcore LoRA -> merged HF --------------------------
     os.environ["NPROC_PER_NODE"] = str(GPUS_PER_NODE)
 
     export_cmd = [
@@ -836,7 +804,7 @@ def export_and_eval(
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
     print(f"[export] Merged HF model saved to {merged_dir}")
 
-    # ── Step 2: Deploy with vLLM ──────────────────────────────────────
+    # -- Step 2: Deploy with vLLM ----------------------------------------
     server_proc = subprocess.Popen(
         [
             "swift",
@@ -859,7 +827,7 @@ def export_and_eval(
         text=True,
     )
 
-    print("[deploy] Waiting for vLLM server…")
+    print("[deploy] Waiting for vLLM server...")
     for attempt in range(180):
         try:
             urllib.request.urlopen("http://localhost:8000/health", timeout=5)
@@ -896,7 +864,7 @@ def export_and_eval(
         resp = urllib.request.urlopen(req, timeout=120)
         return json.loads(resp.read())["choices"][0]["message"]["content"]
 
-    # ── Step 3: Smoke inference ───────────────────────────────────────
+    # -- Step 3: Smoke inference -----------------------------------------
     smoke_prompts = [
         "What is 2+2? Give just the number.",
         "If a train travels 60 mph for 2.5 hours, how far does it go?",
@@ -910,7 +878,7 @@ def export_and_eval(
         except Exception as e:
             print(f"Q: {prompt}\nError: {e}\n")
 
-    # ── Step 4: GSM8K eval ────────────────────────────────────────────
+    # -- Step 4: GSM8K eval ----------------------------------------------
     print(f"\n=== GSM8K Evaluation (limit={eval_limit}) ===")
     gsm8k = load_dataset("openai/gsm8k", "main", split="test")
     if eval_limit:
