@@ -859,6 +859,13 @@ def export_and_eval(
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
     print(f"[export] Merged HF model saved to {merged_dir}")
 
+    config_path = f"{merged_dir}/config.json"
+    with open(config_path) as f:
+        exported_config = json.load(f)
+    exported_config["architectures"] = ["TransformersForCausalLM"]
+    with open(config_path, "w") as f:
+        json.dump(exported_config, f, indent=2)
+
     # -- Step 2: Deploy with vLLM ----------------------------------------
     server_log_path = "/tmp/vllm-server.log"
     server_log = open(server_log_path, "w")
@@ -876,6 +883,8 @@ def export_and_eval(
             str(GPUS_PER_NODE),
             "--vllm_gpu_memory_utilization",
             "0.9",
+            "--vllm_engine_kwargs",
+            json.dumps({"model_impl": "transformers"}),
             "--port",
             "8000",
         ],
