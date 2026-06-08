@@ -803,6 +803,17 @@ def _make_config_vllm_compatible(config_path: str) -> None:
         config = json.load(f)
 
     config["architectures"] = ["DeepseekV4ForCausalLM"]
+    config.setdefault("expert_dtype", "fp4")
+    config.setdefault(
+        "quantization_config",
+        {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
+    )
     if isinstance(config.get("mlp_layer_types"), list):
         config["mlp_layer_types"] = [
             "moe" if layer_type == "hash_moe" else layer_type
