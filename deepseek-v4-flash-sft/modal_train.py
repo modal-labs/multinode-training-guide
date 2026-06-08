@@ -916,7 +916,7 @@ def deploy_and_eval_merged(
             "bfloat16",
             "--port",
             "8000",
-            "--disable-log-requests",
+            "--no-enable-log-requests",
         ],
         stdout=server_log,
         stderr=subprocess.STDOUT,
