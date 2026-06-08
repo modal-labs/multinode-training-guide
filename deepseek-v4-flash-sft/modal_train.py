@@ -1162,7 +1162,12 @@ def deploy_and_eval_merged(
         raise
     finally:
         if server_proc.poll() is None:
-            server_proc.kill()
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+                server_proc.wait(timeout=30)
         server_proc.wait(timeout=30)
         server_log.close()
 
