@@ -112,13 +112,14 @@ def _wait_for_server(process: subprocess.Popen[bytes], log_path: Path) -> None:
 def _backend_config(
     master_addr: str,
     n_nodes: int,
+    gpus_per_node: int,
     train_micro_batch_size: int,
     lora_rank: int,
 ) -> dict[str, object]:
     return {
         "max_lora_adapters": 2,
         "max_lora_rank": max(1, lora_rank),
-        "tensor_parallel_size": GPUS_PER_NODE,
+        "tensor_parallel_size": gpus_per_node,
         "fully_sharded_data_parallel_size": n_nodes,
         "train_micro_batch_size": train_micro_batch_size,
         "sample_max_num_sequences": 64,
@@ -202,6 +203,7 @@ def _run_tinker_job(
     client_script: str,
     model_id: str,
     client_args: list[str],
+    gpus_per_node: int,
     train_micro_batch_size: int,
     lora_rank: int,
 ) -> None:
@@ -219,7 +221,13 @@ def _run_tinker_job(
 
     run_state[run_key] = "running"
     log_path = Path(f"/tmp/skyrl_tx_{mode}_api.log")
-    backend_config = _backend_config(master_addr, n_nodes, train_micro_batch_size, lora_rank)
+    backend_config = _backend_config(
+        master_addr,
+        n_nodes,
+        gpus_per_node,
+        train_micro_batch_size,
+        lora_rank,
+    )
     cmd = [
         "uv",
         "run",
@@ -290,6 +298,7 @@ def run_sft_cluster(
     steps: int = 8,
     lora_rank: int = 8,
     learning_rate: float = 1e-4,
+    gpus_per_node: int = GPUS_PER_NODE,
 ) -> None:
     _run_tinker_job(
         run_state=run_state,
@@ -304,6 +313,7 @@ def run_sft_cluster(
             "--learning-rate",
             str(learning_rate),
         ],
+        gpus_per_node=gpus_per_node,
         train_micro_batch_size=1,
         lora_rank=lora_rank,
     )
@@ -326,6 +336,7 @@ def run_rl_cluster(
     samples_per_prompt: int = 2,
     lora_rank: int = 8,
     learning_rate: float = 5e-5,
+    gpus_per_node: int = GPUS_PER_NODE,
 ) -> None:
     _run_tinker_job(
         run_state=run_state,
@@ -342,6 +353,7 @@ def run_rl_cluster(
             "--learning-rate",
             str(learning_rate),
         ],
+        gpus_per_node=gpus_per_node,
         train_micro_batch_size=max(1, samples_per_prompt),
         lora_rank=lora_rank,
     )
@@ -355,7 +367,7 @@ def run_sft(
     learning_rate: float = 1e-4,
 ) -> None:
     with modal.Dict.ephemeral() as run_state:
-        run_sft_cluster.remote(run_state, model_id, steps, lora_rank, learning_rate)
+        run_sft_cluster.remote(run_state, model_id, steps, lora_rank, learning_rate, GPUS_PER_NODE)
 
 
 @app.local_entrypoint()
@@ -367,4 +379,12 @@ def run_rl(
     learning_rate: float = 5e-5,
 ) -> None:
     with modal.Dict.ephemeral() as run_state:
-        run_rl_cluster.remote(run_state, model_id, steps, samples_per_prompt, lora_rank, learning_rate)
+        run_rl_cluster.remote(
+            run_state,
+            model_id,
+            steps,
+            samples_per_prompt,
+            lora_rank,
+            learning_rate,
+            GPUS_PER_NODE,
+        )
