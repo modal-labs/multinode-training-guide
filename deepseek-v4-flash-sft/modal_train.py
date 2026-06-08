@@ -796,6 +796,7 @@ def _numeric_eq(left: str, right: str) -> bool:
     volumes=TRAINING_VOLUMES,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=86400,
+    retries=1,
     memory=1048576,
     ephemeral_disk=2048000,
 )
