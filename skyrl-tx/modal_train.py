@@ -40,12 +40,11 @@ image = (
     .apt_install(
         "build-essential",
         "ca-certificates",
-        "curl",
         "git",
         "libnuma1",
         "numactl",
     )
-    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
+    .pip_install("uv==0.11.19")
     .env(
         {
             "PATH": "/root/.local/bin:/usr/local/cuda/bin:${PATH}",
