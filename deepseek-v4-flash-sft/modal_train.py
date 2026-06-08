@@ -803,7 +803,29 @@ def _make_config_vllm_compatible(config_path: str) -> None:
         config = json.load(f)
 
     config["architectures"] = ["DeepseekV4ForCausalLM"]
-    config.setdefault("expert_dtype", "fp4")
+    vllm_defaults = {
+        "expert_dtype": "fp4",
+        "hc_eps": 1e-6,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "index_topk": 512,
+        "num_hash_layers": 3,
+        "num_nextn_predict_layers": 1,
+        "o_groups": 8,
+        "o_lora_rank": 1024,
+        "q_lora_rank": 1024,
+        "qk_rope_head_dim": 64,
+        "compress_rope_theta": 160000,
+        "routed_scaling_factor": 1.5,
+        "scoring_func": "sqrtsoftplus",
+        "sliding_window": 128,
+        "swiglu_limit": 10.0,
+        "topk_method": "noaux_tc",
+    }
+    for key, value in vllm_defaults.items():
+        config.setdefault(key, value)
     config.setdefault(
         "quantization_config",
         {
