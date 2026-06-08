@@ -803,6 +803,7 @@ def _make_config_vllm_compatible(config_path: str) -> None:
         config = json.load(f)
 
     config["architectures"] = ["DeepseekV4ForCausalLM"]
+    config.setdefault("pad_token_id", config.get("eos_token_id", 1))
     vllm_defaults = {
         "compress_rope_theta": 160000,
         "num_nextn_predict_layers": 1,
