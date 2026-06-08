@@ -885,7 +885,10 @@ def _make_config_vllm_compatible(config_path: str) -> None:
 def export_checkpoint(
     run_id: str,
     checkpoint_step: int = 5,
+    tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
 ):
     """Export a Megatron LoRA checkpoint into merged HF safetensors."""
     import subprocess
@@ -920,8 +923,14 @@ def export_checkpoint(
         "true",
         "--output_dir",
         merged_dir,
+        "--tensor_model_parallel_size",
+        str(tp_size),
         "--expert_model_parallel_size",
         str(ep_size),
+        "--pipeline_model_parallel_size",
+        str(pp_size),
+        "--context_parallel_size",
+        str(cp_size),
         "--exist_ok",
         "true",
     ]
@@ -1092,13 +1101,19 @@ def export_and_eval(
     checkpoint_step: int = 5,
     eval_limit: int = 20,
     max_model_len: int = 4096,
+    tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
 ):
     """Export a checkpoint, deploy the merged model, and run a small eval."""
     export_checkpoint.remote(
         run_id=run_id,
         checkpoint_step=checkpoint_step,
+        tp_size=tp_size,
         ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
     )
     result = deploy_and_eval_merged.remote(
         run_id=run_id,
