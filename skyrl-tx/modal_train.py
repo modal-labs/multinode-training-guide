@@ -94,7 +94,7 @@ def _terminate_process_group(process: subprocess.Popen[bytes], timeout: int = 30
 
 def _wait_for_server(process: subprocess.Popen[bytes], log_path: Path) -> None:
     deadline = time.monotonic() + 45 * 60
-    url = f"http://localhost:{TINKER_PORT}/healthz"
+    url = f"http://localhost:{TINKER_PORT}/api/v1/healthz"
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(
