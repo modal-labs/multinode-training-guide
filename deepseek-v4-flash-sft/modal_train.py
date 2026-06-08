@@ -320,6 +320,7 @@ msswift_image = (
 vllm_image = (
     modal.Image.from_registry("vllm/vllm-openai:v0.22.1", add_python="3.12")
     .run_commands("python -m pip install datasets==3.1.0")
+    .entrypoint([])
     .env({"VLLM_USE_V1": "1"})
 )
 
