@@ -321,6 +321,18 @@ vllm_image = (
     modal.Image.from_registry("vllm/vllm-openai:v0.22.1")
     .run_commands("ln -sf $(which python3) /usr/local/bin/python")
     .run_commands("python -m pip install datasets==3.1.0")
+    .run_commands(
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/model.py')\n"
+        "text = path.read_text()\n"
+        "old = '        self.scale_fmt = config.quantization_config[\"scale_fmt\"]\\n'\n"
+        'new = \'        self.scale_fmt = getattr(config, "quantization_config", {"scale_fmt": "ue8m0"})["scale_fmt"]\\n\'\n'
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM scale_fmt patch target not found')\n"
+        "path.write_text(text.replace(old, new))\n"
+        "PY"
+    )
     .entrypoint([])
     .env({"VLLM_USE_V1": "1"})
 )
@@ -825,18 +837,20 @@ def _make_config_vllm_compatible(config_path: str) -> None:
     }
     for key, value in vllm_defaults.items():
         config.setdefault(key, value)
-    config.setdefault(
-        "quantization_config",
-        {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        },
-    )
     if config.get("dtype") == "bfloat16":
         config.pop("expert_dtype", None)
+        config.pop("quantization_config", None)
+    else:
+        config.setdefault(
+            "quantization_config",
+            {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "scale_fmt": "ue8m0",
+                "weight_block_size": [128, 128],
+            },
+        )
     if isinstance(config.get("mlp_layer_types"), list):
         config["mlp_layer_types"] = [
             "moe" if layer_type == "hash_moe" else layer_type
