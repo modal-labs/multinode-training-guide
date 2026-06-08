@@ -808,6 +808,17 @@ def _make_config_vllm_compatible(config_path: str) -> None:
             "moe" if layer_type == "hash_moe" else layer_type
             for layer_type in config["mlp_layer_types"]
         ]
+    if not isinstance(config.get("compress_ratios"), list) and isinstance(
+        config.get("layer_types"), list
+    ):
+        layer_type_to_ratio = {
+            "sliding_attention": 0,
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        }
+        config["compress_ratios"] = [
+            layer_type_to_ratio[layer_type] for layer_type in config["layer_types"]
+        ]
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
