@@ -175,20 +175,28 @@ from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py")
 text = path.read_text()
-text = text.replace(
+rope_fields_old = (
     "    original_max_position_embeddings: Optional[int] = None\n"
-    "    partial_rotary_factor: Optional[float] = None\n",
+    "    partial_rotary_factor: Optional[float] = None\n"
+)
+rope_fields_new = (
     "    original_max_position_embeddings: int = 4096\n"
     "    rotary_scaling_factor: float = 40\n"
     "    beta_fast: float = 32\n"
     "    beta_slow: float = 1\n"
     "    mscale: float = 1.0\n"
     "    mscale_all_dim: float = 0.0\n"
-    "    partial_rotary_factor: Optional[float] = None\n",
+    "    partial_rotary_factor: Optional[float] = None\n"
 )
-text = text.replace(
+if rope_fields_old not in text:
+    raise RuntimeError("mcore_bridge rope field patch target not found")
+text = text.replace(rope_fields_old, rope_fields_new)
+
+rope_scaling_old = (
     "            if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:\n"
-    "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n",
+    "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n"
+)
+rope_scaling_new = (
     "            if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:\n"
     "                self.rope_scaling['rope_type'] = self.rope_scaling['type']\n"
     "            if 'factor' in self.rope_scaling:\n"
@@ -207,9 +215,19 @@ text = text.replace(
     "                self.rope_scaling = {\n"
     "                    'main': dict(self.rope_scaling),\n"
     "                    'compress': dict(self.rope_scaling),\n"
-    "                }\n",
+    "                }\n"
 )
+if rope_scaling_old not in text:
+    raise RuntimeError("mcore_bridge rope scaling patch target not found")
+text = text.replace(rope_scaling_old, rope_scaling_new)
 path.write_text(text)
+PY"""
+MCORE_BRIDGE_DSV4_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py").read_text()
+assert "rotary_scaling_factor: float = 40" in text
+assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
 PY"""
 
 download_image = (
@@ -253,6 +271,7 @@ msswift_image = (
     )
     .run_commands("pip install --no-deps mcore-bridge==1.4.2")
     .run_commands(MCORE_BRIDGE_DSV4_PATCH)
+    .run_commands(MCORE_BRIDGE_DSV4_VERIFY)
     .run_commands(
         "pip install --no-deps "
         f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
