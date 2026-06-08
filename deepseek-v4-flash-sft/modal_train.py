@@ -804,38 +804,21 @@ def _make_config_vllm_compatible(config_path: str) -> None:
 
     config["architectures"] = ["DeepseekV4ForCausalLM"]
     vllm_defaults = {
-        "expert_dtype": "fp4",
-        "hc_eps": 1e-6,
-        "hc_mult": 4,
-        "hc_sinkhorn_iters": 20,
-        "index_head_dim": 128,
-        "index_n_heads": 64,
-        "index_topk": 512,
-        "num_hash_layers": 3,
+        "compress_rope_theta": 160000,
         "num_nextn_predict_layers": 1,
         "o_groups": 8,
         "o_lora_rank": 1024,
         "q_lora_rank": 1024,
         "qk_rope_head_dim": 64,
-        "compress_rope_theta": 160000,
         "routed_scaling_factor": 1.5,
-        "scoring_func": "sqrtsoftplus",
         "sliding_window": 128,
         "swiglu_limit": 10.0,
-        "topk_method": "noaux_tc",
     }
     for key, value in vllm_defaults.items():
         config.setdefault(key, value)
-    config.setdefault(
-        "quantization_config",
-        {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        },
-    )
+    if config.get("dtype") == "bfloat16":
+        config.pop("expert_dtype", None)
+        config.pop("quantization_config", None)
     if isinstance(config.get("mlp_layer_types"), list):
         config["mlp_layer_types"] = [
             "moe" if layer_type == "hash_moe" else layer_type
@@ -971,11 +954,8 @@ def deploy_and_eval_merged(
             "0.9",
             "--dtype",
             "bfloat16",
-            "--kv-cache-dtype",
-            "fp8",
-            "--moe-backend",
-            "deep_gemm_mega_moe",
-            "--enable-expert-parallel",
+            "--model-impl",
+            "transformers",
             "--port",
             "8000",
             "--no-enable-log-requests",
