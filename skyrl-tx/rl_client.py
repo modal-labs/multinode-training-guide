@@ -112,7 +112,10 @@ def main() -> None:
                     continue
                 response = tokenizer.decode(response_tokens, skip_special_tokens=True)
                 reward = reward_for(response, answer)
-                old_logprobs = list(sequence.logprobs or [0.0] * len(response_tokens))
+                if sequence.logprobs is None:
+                    old_logprobs = [0.0] * len(response_tokens)
+                else:
+                    old_logprobs = [float(logprob) for logprob in sequence.logprobs]
                 data.append(make_policy_datum(prompt_tokens, response_tokens, old_logprobs, reward))
                 rewards.append(reward)
 

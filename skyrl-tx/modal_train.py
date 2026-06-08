@@ -110,10 +110,15 @@ def _wait_for_server(process: subprocess.Popen[bytes], log_path: Path) -> None:
     raise TimeoutError(f"Timed out waiting for {url}\n{_tail(log_path)}")
 
 
-def _backend_config(master_addr: str, n_nodes: int, train_micro_batch_size: int) -> dict[str, object]:
+def _backend_config(
+    master_addr: str,
+    n_nodes: int,
+    train_micro_batch_size: int,
+    lora_rank: int,
+) -> dict[str, object]:
     return {
         "max_lora_adapters": 2,
-        "max_lora_rank": 8,
+        "max_lora_rank": max(1, lora_rank),
         "tensor_parallel_size": GPUS_PER_NODE,
         "fully_sharded_data_parallel_size": n_nodes,
         "train_micro_batch_size": train_micro_batch_size,
@@ -192,6 +197,7 @@ def _run_tinker_job(
     model_id: str,
     client_args: list[str],
     train_micro_batch_size: int,
+    lora_rank: int,
 ) -> None:
     cluster_info = modal.experimental.get_cluster_info()
     rank = cluster_info.rank
@@ -205,7 +211,7 @@ def _run_tinker_job(
 
     run_state[run_key] = "running"
     log_path = Path(f"/tmp/skyrl_tx_{mode}_api.log")
-    backend_config = _backend_config(master_addr, n_nodes, train_micro_batch_size)
+    backend_config = _backend_config(master_addr, n_nodes, train_micro_batch_size, lora_rank)
     cmd = [
         "uv",
         "run",
@@ -289,6 +295,7 @@ def run_sft(
             str(learning_rate),
         ],
         train_micro_batch_size=1,
+        lora_rank=lora_rank,
     )
 
 
@@ -324,4 +331,5 @@ def run_rl(
             str(learning_rate),
         ],
         train_micro_batch_size=max(1, samples_per_prompt),
+        lora_rank=lora_rank,
     )
