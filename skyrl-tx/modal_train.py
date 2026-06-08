@@ -140,6 +140,7 @@ def _run_worker(
     cmd = [
         "uv",
         "run",
+        "--no-sync",
         "--extra",
         "gpu",
         "--extra",
@@ -182,6 +183,7 @@ def _run_client(client_script: str, model_id: str, extra_args: list[str]) -> Non
     cmd = [
         "uv",
         "run",
+        "--no-sync",
         "--extra",
         "tinker",
         "--with",
@@ -246,6 +248,7 @@ def _run_tinker_job(
     cmd = [
         "uv",
         "run",
+        "--no-sync",
         "--extra",
         "gpu",
         "--extra",
