@@ -123,7 +123,7 @@ try:
             qk_rope_head_dim = kwargs.pop("qk_rope_head_dim", None)
             super().__init__(**kwargs)
 
-            n_layers = self.num_hidden_layers
+            n_layers = getattr(self, "num_hidden_layers", 0)
             if getattr(self, "compress_rates", None) is None:
                 self.compress_rates = dict(self.default_compress_rates)
             if compress_rate_csa is not None:
@@ -155,11 +155,11 @@ try:
 
             if getattr(self, "partial_rotary_factor", None) is None:
                 self.partial_rotary_factor = (
-                    qk_rope_head_dim / self.head_dim
+                    qk_rope_head_dim / getattr(self, "head_dim", 1)
                     if qk_rope_head_dim is not None
                     else self.default_partial_rotary_factor
                 )
-            self.qk_rope_head_dim = int(self.head_dim * self.partial_rotary_factor)
+            self.qk_rope_head_dim = int(getattr(self, "head_dim", 1) * self.partial_rotary_factor)
 
     if "deepseek_v4" not in CONFIG_MAPPING:
         CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
