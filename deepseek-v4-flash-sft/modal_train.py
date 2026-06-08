@@ -886,7 +886,7 @@ def _make_config_vllm_compatible(config_path: str) -> None:
     }
     for key, value in vllm_defaults.items():
         config.setdefault(key, value)
-    if config.get("dtype") == "bfloat16":
+    if config.get("torch_dtype") == "bfloat16" or config.get("dtype") == "bfloat16":
         config.pop("expert_dtype", None)
         config.pop("quantization_config", None)
     else:
