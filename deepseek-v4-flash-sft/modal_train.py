@@ -825,9 +825,18 @@ def _make_config_vllm_compatible(config_path: str) -> None:
     }
     for key, value in vllm_defaults.items():
         config.setdefault(key, value)
+    config.setdefault(
+        "quantization_config",
+        {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
+    )
     if config.get("dtype") == "bfloat16":
         config.pop("expert_dtype", None)
-        config.pop("quantization_config", None)
     if isinstance(config.get("mlp_layer_types"), list):
         config["mlp_layer_types"] = [
             "moe" if layer_type == "hash_moe" else layer_type
@@ -963,8 +972,10 @@ def deploy_and_eval_merged(
             "0.9",
             "--dtype",
             "bfloat16",
-            "--model-impl",
-            "transformers",
+            "--kv-cache-dtype",
+            "fp8",
+            "--moe-backend",
+            "triton",
             "--port",
             "8000",
             "--no-enable-log-requests",
