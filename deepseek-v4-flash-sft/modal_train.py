@@ -885,6 +885,8 @@ def export_and_eval(
             "0.9",
             "--vllm_engine_kwargs",
             json.dumps({"model_impl": "transformers"}),
+            "--vllm_use_async_engine",
+            "false",
             "--port",
             "8000",
         ],
@@ -903,7 +905,7 @@ def export_and_eval(
             if server_proc.poll() is not None:
                 server_log.flush()
                 with open(server_log_path) as f:
-                    tail = f.read()[-3000:]
+                    tail = f.read()[-20000:]
                 server_log.close()
                 raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
             time.sleep(5)
@@ -912,7 +914,7 @@ def export_and_eval(
         server_proc.wait(timeout=30)
         server_log.flush()
         with open(server_log_path) as f:
-            tail = f.read()[-3000:]
+            tail = f.read()[-20000:]
         server_log.close()
         raise RuntimeError(f"vLLM server failed to start:\n{tail}")
 
