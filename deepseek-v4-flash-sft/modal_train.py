@@ -862,77 +862,80 @@ def export_and_eval(
         server_log.close()
         raise RuntimeError(f"vLLM server failed to start:\n{tail}")
 
-    # Discover served model name
     try:
-        resp = urllib.request.urlopen("http://localhost:8000/v1/models")
-        model_name = json.loads(resp.read())["data"][0]["id"]
-    except Exception:
-        model_name = "merged-hf"
-
-    def _chat(prompt: str, max_tokens: int = 512) -> str:
-        body = json.dumps(
-            {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0,
-            }
-        ).encode()
-        req = urllib.request.Request(
-            "http://localhost:8000/v1/chat/completions",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-        resp = urllib.request.urlopen(req, timeout=120)
-        return json.loads(resp.read())["choices"][0]["message"]["content"]
-
-    # -- Step 3: Smoke inference -----------------------------------------
-    smoke_prompts = [
-        "What is 2+2? Give just the number.",
-        "If a train travels 60 mph for 2.5 hours, how far does it go?",
-        "A store sells apples for $0.50 each. How much do 12 cost?",
-    ]
-    print("\n=== Smoke Inference ===")
-    for prompt in smoke_prompts:
+        # Discover served model name
         try:
-            ans = _chat(prompt, max_tokens=256)
-            print(f"Q: {prompt}\nA: {ans[:400]}\n")
-        except Exception as e:
-            print(f"Q: {prompt}\nError: {e}\n")
+            resp = urllib.request.urlopen("http://localhost:8000/v1/models")
+            model_name = json.loads(resp.read())["data"][0]["id"]
+        except Exception:
+            model_name = "merged-hf"
 
-    # -- Step 4: GSM8K eval ----------------------------------------------
-    print(f"\n=== GSM8K Evaluation (limit={eval_limit}) ===")
-    gsm8k = load_dataset("openai/gsm8k", "main", split="test")
-    if eval_limit:
-        gsm8k = gsm8k.select(range(min(eval_limit, len(gsm8k))))
+        def _chat(prompt: str, max_tokens: int = 512) -> str:
+            body = json.dumps(
+                {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                }
+            ).encode()
+            req = urllib.request.Request(
+                "http://localhost:8000/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=120)
+            return json.loads(resp.read())["choices"][0]["message"]["content"]
 
-    correct = 0
-    total = 0
-    for i, row in enumerate(gsm8k):
-        gold = _extract_gsm8k_answer(row["answer"])
-        if gold is None:
-            continue
-        try:
-            response = _chat(row["question"], max_tokens=512)
-            pred = _extract_gsm8k_answer(response)
-            hit = pred is not None and pred == gold
-            correct += hit
-            total += 1
-            tag = "PASS" if hit else "FAIL"
-            print(f"  [{i + 1}/{len(gsm8k)}] {tag}  pred={pred}  gold={gold}")
-        except Exception as e:
-            total += 1
-            print(f"  [{i + 1}/{len(gsm8k)}] ERROR  {e}")
+        # -- Step 3: Smoke inference -----------------------------------------
+        smoke_prompts = [
+            "What is 2+2? Give just the number.",
+            "If a train travels 60 mph for 2.5 hours, how far does it go?",
+            "A store sells apples for $0.50 each. How much do 12 cost?",
+        ]
+        print("\n=== Smoke Inference ===")
+        for prompt in smoke_prompts:
+            try:
+                ans = _chat(prompt, max_tokens=256)
+                print(f"Q: {prompt}\nA: {ans[:400]}\n")
+            except Exception as e:
+                print(f"Q: {prompt}\nError: {e}\n")
 
-    accuracy = correct / total if total > 0 else 0.0
-    print(f"\n=== GSM8K Result: {correct}/{total} ({accuracy:.1%}) ===")
+        # -- Step 4: GSM8K eval ----------------------------------------------
+        print(f"\n=== GSM8K Evaluation (limit={eval_limit}) ===")
+        gsm8k = load_dataset("openai/gsm8k", "main", split="test")
+        if eval_limit:
+            gsm8k = gsm8k.select(range(min(eval_limit, len(gsm8k))))
 
-    server_proc.kill()
-    server_proc.wait(timeout=30)
-    server_log.close()
-    return {
-        "run_id": run_id,
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total,
-    }
+        correct = 0
+        total = 0
+        for i, row in enumerate(gsm8k):
+            gold = _extract_gsm8k_answer(row["answer"])
+            if gold is None:
+                continue
+            try:
+                response = _chat(row["question"], max_tokens=512)
+                pred = _extract_gsm8k_answer(response)
+                hit = pred is not None and pred == gold
+                correct += hit
+                total += 1
+                tag = "PASS" if hit else "FAIL"
+                print(f"  [{i + 1}/{len(gsm8k)}] {tag}  pred={pred}  gold={gold}")
+            except Exception as e:
+                total += 1
+                print(f"  [{i + 1}/{len(gsm8k)}] ERROR  {e}")
+
+        accuracy = correct / total if total > 0 else 0.0
+        print(f"\n=== GSM8K Result: {correct}/{total} ({accuracy:.1%}) ===")
+
+        return {
+            "run_id": run_id,
+            "accuracy": accuracy,
+            "correct": correct,
+            "total": total,
+        }
+    finally:
+        if server_proc.poll() is None:
+            server_proc.kill()
+        server_proc.wait(timeout=30)
+        server_log.close()
