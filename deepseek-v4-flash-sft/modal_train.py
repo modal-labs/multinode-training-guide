@@ -470,12 +470,22 @@ def _train_model_impl(
 
     resuming = False
     if os.path.exists(checkpoint_dir):
-        iter_dirs = sorted(
-            d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
+
+        def checkpoint_sort_key(name: str) -> int:
+            match = re.search(r"(?:checkpoint-|iter_)(\d+)", name)
+            return int(match.group(1)) if match else -1
+
+        checkpoint_dirs = sorted(
+            (
+                d
+                for d in os.listdir(checkpoint_dir)
+                if d.startswith("checkpoint-") or d.startswith("iter_")
+            ),
+            key=checkpoint_sort_key,
         )
-        if iter_dirs:
+        if checkpoint_dirs:
             resuming = True
-            print(f"Resuming from existing checkpoint ({iter_dirs[-1]})")
+            print(f"Resuming from existing checkpoint ({checkpoint_dirs[-1]})")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     args_json_path = f"{checkpoint_dir}/args.json"
@@ -805,6 +815,8 @@ def export_and_eval(
     print(f"[export] Merged HF model saved to {merged_dir}")
 
     # -- Step 2: Deploy with vLLM ----------------------------------------
+    server_log_path = "/tmp/vllm-server.log"
+    server_log = open(server_log_path, "w")
     server_proc = subprocess.Popen(
         [
             "swift",
@@ -822,7 +834,7 @@ def export_and_eval(
             "--port",
             "8000",
         ],
-        stdout=subprocess.PIPE,
+        stdout=server_log,
         stderr=subprocess.STDOUT,
         text=True,
     )
@@ -834,10 +846,20 @@ def export_and_eval(
             print(f"[deploy] Server ready after ~{attempt * 5}s")
             break
         except Exception:
+            if server_proc.poll() is not None:
+                server_log.flush()
+                with open(server_log_path) as f:
+                    tail = f.read()[-3000:]
+                server_log.close()
+                raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
             time.sleep(5)
     else:
-        tail = server_proc.stdout.read()[-3000:] if server_proc.stdout else ""
         server_proc.kill()
+        server_proc.wait(timeout=30)
+        server_log.flush()
+        with open(server_log_path) as f:
+            tail = f.read()[-3000:]
+        server_log.close()
         raise RuntimeError(f"vLLM server failed to start:\n{tail}")
 
     # Discover served model name
@@ -906,6 +928,8 @@ def export_and_eval(
     print(f"\n=== GSM8K Result: {correct}/{total} ({accuracy:.1%}) ===")
 
     server_proc.kill()
+    server_proc.wait(timeout=30)
+    server_log.close()
     return {
         "run_id": run_id,
         "accuracy": accuracy,
