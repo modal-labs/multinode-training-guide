@@ -783,6 +783,13 @@ def _extract_gsm8k_answer(text: str) -> str | None:
     return numbers[-1].replace(",", "") if numbers else None
 
 
+def _numeric_eq(left: str, right: str) -> bool:
+    try:
+        return float(left) == float(right)
+    except ValueError:
+        return left == right
+
+
 @app.function(
     image=msswift_image,
     gpu="B200:8",
@@ -972,7 +979,7 @@ def export_and_eval(
             try:
                 response = _chat(row["question"], max_tokens=512)
                 pred = _extract_gsm8k_answer(response)
-                hit = pred is not None and pred == gold
+                hit = pred is not None and _numeric_eq(pred, gold)
                 correct += hit
                 total += 1
                 tag = "PASS" if hit else "FAIL"
