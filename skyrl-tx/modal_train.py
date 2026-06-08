@@ -197,6 +197,21 @@ def _run_client(client_script: str, model_id: str, extra_args: list[str]) -> Non
     subprocess.run(cmd, cwd=SKYRL_ROOT, check=True)
 
 
+def _commit_and_print_checkpoints(mode: str) -> None:
+    checkpoint_root = Path(CHECKPOINTS_DIR) / mode
+    checkpoint_files = sorted(checkpoint_root.rglob("*.tar.gz"))
+    if not checkpoint_files:
+        raise RuntimeError(f"No {mode} checkpoints were written under {checkpoint_root}")
+    for checkpoint_file in checkpoint_files:
+        relative_path = checkpoint_file.relative_to(checkpoint_root)
+        print(
+            f"{mode}_checkpoint_file={relative_path} bytes={checkpoint_file.stat().st_size}",
+            flush=True,
+        )
+    checkpoint_volume.commit()
+    print(f"{mode}_checkpoint_volume_committed={len(checkpoint_files)}", flush=True)
+
+
 def _run_tinker_job(
     run_state: modal.Dict,
     mode: str,
@@ -262,6 +277,7 @@ def _run_tinker_job(
             )
         _wait_for_server(process, log_path)
         _run_client(client_script, model_id, client_args)
+        _commit_and_print_checkpoints(mode)
     finally:
         run_state[run_key] = "done"
         if process is not None:

@@ -65,6 +65,42 @@ def make_policy_datum(
     )
 
 
+def build_rollout_batch(training_client, tokenizer, samples_per_prompt: int, step: int) -> tuple[list[types.Datum], list[float]]:
+    sampler = training_client.save_weights_and_get_sampling_client(name=f"rl_step_{step}")
+    data: list[types.Datum] = []
+    rewards: list[float] = []
+
+    for offset, (question, answer) in enumerate(PROMPTS):
+        prompt_tokens = tokenizer.encode(make_prompt(question), add_special_tokens=True)
+        sample = sampler.sample(
+            prompt=types.ModelInput.from_ints(prompt_tokens),
+            num_samples=samples_per_prompt,
+            sampling_params=types.SamplingParams(
+                max_tokens=24,
+                temperature=1.0,
+                top_p=1.0,
+                top_k=-1,
+                seed=step * 1000 + offset,
+            ),
+        ).result()
+        for sequence in sample.sequences:
+            response_tokens = list(sequence.tokens)
+            if not response_tokens:
+                continue
+            response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+            reward = reward_for(response, answer)
+            if sequence.logprobs is None:
+                old_logprobs = [0.0] * len(response_tokens)
+            else:
+                old_logprobs = [float(logprob) for logprob in sequence.logprobs]
+            data.append(make_policy_datum(prompt_tokens, response_tokens, old_logprobs, reward))
+            rewards.append(reward)
+
+    if not data:
+        raise RuntimeError("No rollout tokens were sampled; cannot run RL update")
+    return data, rewards
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:8000")
@@ -88,40 +124,10 @@ def main() -> None:
         eps=1e-8,
     )
 
+    data: list[types.Datum] = []
+    rewards: list[float] = []
     for step in range(args.steps):
-        sampler = training_client.save_weights_and_get_sampling_client(name=f"rl_step_{step}")
-        data: list[types.Datum] = []
-        rewards: list[float] = []
-
-        for offset, (question, answer) in enumerate(PROMPTS):
-            prompt_tokens = tokenizer.encode(make_prompt(question), add_special_tokens=True)
-            sample = sampler.sample(
-                prompt=types.ModelInput.from_ints(prompt_tokens),
-                num_samples=args.samples_per_prompt,
-                sampling_params=types.SamplingParams(
-                    max_tokens=24,
-                    temperature=1.0,
-                    top_p=1.0,
-                    top_k=-1,
-                    seed=step * 1000 + offset,
-                ),
-            ).result()
-            for sequence in sample.sequences:
-                response_tokens = list(sequence.tokens)
-                if not response_tokens:
-                    continue
-                response = tokenizer.decode(response_tokens, skip_special_tokens=True)
-                reward = reward_for(response, answer)
-                if sequence.logprobs is None:
-                    old_logprobs = [0.0] * len(response_tokens)
-                else:
-                    old_logprobs = [float(logprob) for logprob in sequence.logprobs]
-                data.append(make_policy_datum(prompt_tokens, response_tokens, old_logprobs, reward))
-                rewards.append(reward)
-
-        if not data:
-            raise RuntimeError("No rollout tokens were sampled; cannot run RL update")
-
+        data, rewards = build_rollout_batch(training_client, tokenizer, args.samples_per_prompt, step)
         forward = training_client.forward_backward(
             data,
             "ppo",
@@ -134,6 +140,22 @@ def main() -> None:
             f"loss_outputs={len(forward.loss_fn_outputs)}",
             flush=True,
         )
+
+    state_path = training_client.save_state(name=f"rl_state_step_{args.steps}").result().path
+    print(f"rl_state_checkpoint={state_path}", flush=True)
+    restored_client = service_client.create_training_client_from_state(state_path)
+    restored_forward = restored_client.forward_backward(
+        data,
+        "ppo",
+        {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
+    ).result()
+    print(f"rl_restored_eval_loss_outputs={len(restored_forward.loss_fn_outputs)}", flush=True)
+
+    sampler_path = training_client.save_weights_for_sampler(name=f"rl_sampler_step_{args.steps}").result().path
+    print(f"rl_sampler_checkpoint={sampler_path}", flush=True)
+    eval_data, eval_rewards = build_rollout_batch(training_client, tokenizer, args.samples_per_prompt, args.steps)
+    mean_eval_reward = sum(eval_rewards) / len(eval_rewards)
+    print(f"rl_eval mean_reward={mean_eval_reward:.3f} trajectories={len(eval_data)}", flush=True)
 
 
 if __name__ == "__main__":

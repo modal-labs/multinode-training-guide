@@ -46,6 +46,10 @@ def sum_loss(result) -> float:
     return total
 
 
+def eval_loss(training_client, batch: list[types.Datum]) -> float:
+    return sum_loss(training_client.forward_backward(batch, "cross_entropy").result())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:8000")
@@ -62,6 +66,7 @@ def main() -> None:
     )
     tokenizer = training_client.get_tokenizer()
     batch = [make_datum(tokenizer, question, answer) for question, answer in EXAMPLES]
+    eval_batch = [make_datum(tokenizer, "What is 6 * 7?", " 42")]
     optimizer = types.AdamParams(
         learning_rate=args.learning_rate,
         beta1=0.9,
@@ -74,6 +79,14 @@ def main() -> None:
         training_client.optim_step(optimizer).result()
         print(f"sft_step={step} loss={sum_loss(forward):.4f}", flush=True)
 
+    state_path = training_client.save_state(name=f"sft_state_step_{args.steps}").result().path
+    print(f"sft_state_checkpoint={state_path}", flush=True)
+    restored_client = service_client.create_training_client_from_state(state_path)
+    restored_loss = eval_loss(restored_client, eval_batch)
+    print(f"sft_restored_eval_loss={restored_loss:.4f}", flush=True)
+
+    sampler_path = training_client.save_weights_for_sampler(name=f"sft_sampler_step_{args.steps}").result().path
+    print(f"sft_sampler_checkpoint={sampler_path}", flush=True)
     sampler = training_client.save_weights_and_get_sampling_client(name="sft_smoke")
     prompt = "Solve the arithmetic problem. Answer with only the integer.\nQuestion: What is 6 * 7?\nAnswer:"
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
