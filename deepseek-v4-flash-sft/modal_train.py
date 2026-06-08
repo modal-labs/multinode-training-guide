@@ -95,10 +95,12 @@ def default_run_id(
 
 DEEPSEEK_V4_CONFIG_PATCH = r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
 try:
+    from ...modeling_utils import PreTrainedModel as _PreTrainedModel
     try:
         from ...configuration_utils import PreTrainedConfig as _BaseConfig
     except ImportError:
         from ...configuration_utils import PretrainedConfig as _BaseConfig
+    from ...models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
     class DeepseekV4Config(_BaseConfig):
         model_type = "deepseek_v4"
@@ -163,12 +165,29 @@ try:
 
     if "deepseek_v4" not in CONFIG_MAPPING:
         CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
+
+    class DeepseekV4ForCausalLM(_PreTrainedModel):
+        config_class = DeepseekV4Config
+        base_model_prefix = "model"
+        _no_split_modules = []
+
+        def __init__(self, config):
+            super().__init__(config)
+
+        def forward(self, *args, **kwargs):
+            raise NotImplementedError("DeepSeek-V4 export only uses this as a meta model")
+
+    MODEL_FOR_CAUSAL_LM_MAPPING.register(DeepseekV4Config, DeepseekV4ForCausalLM)
 except Exception:
     pass
 PY"""
 DEEPSEEK_V4_CONFIG_VERIFY = (
-    'python -c "from transformers.models.auto.configuration_auto import '
-    "CONFIG_MAPPING; assert 'deepseek_v4' in CONFIG_MAPPING\""
+    "python - <<'PY'\n"
+    "from transformers.models.auto.configuration_auto import CONFIG_MAPPING\n"
+    "from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING\n"
+    "config_cls = CONFIG_MAPPING['deepseek_v4']\n"
+    "assert MODEL_FOR_CAUSAL_LM_MAPPING[config_cls].__name__ == 'DeepseekV4ForCausalLM'\n"
+    "PY"
 )
 MCORE_BRIDGE_DSV4_PATCH = r"""python - <<'PY'
 from pathlib import Path
