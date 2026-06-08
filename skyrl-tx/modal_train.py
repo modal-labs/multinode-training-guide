@@ -24,8 +24,8 @@ TINKER_PORT = 8000
 COORDINATOR_PORT = 7777
 
 N_NODES = int(os.environ.get("SKYRL_TX_N_NODES", "2"))
-GPUS_PER_NODE = int(os.environ.get("SKYRL_TX_GPUS_PER_NODE", "4"))
-GPU_TYPE = os.environ.get("SKYRL_TX_GPU_TYPE", "H100")
+GPUS_PER_NODE = 8
+GPU_TYPE = "H100"
 
 app = modal.App("example-skyrl-tx-qwen")
 

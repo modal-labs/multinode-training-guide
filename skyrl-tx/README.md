@@ -7,7 +7,7 @@ It uses `Qwen/Qwen3-8B` by default and exercises both:
 - supervised fine-tuning with Tinker's `cross_entropy` loss
 - policy-gradient RL with Tinker's `ppo` loss over sampled arithmetic rollouts
 
-The default topology is 2 nodes × 4 H100 GPUs. Within each node SkyRL-TX uses
+The default topology is 2 nodes × 8 H100 GPUs. Within each node SkyRL-TX uses
 tensor parallelism; across nodes it uses JAX FSDP.
 
 ## Prerequisites
@@ -44,26 +44,21 @@ initialization, and first compile can take several minutes.
 
 ## Cluster sizing
 
-The launcher reads these environment variables at import time:
+The launcher reads this sizing environment variable at import time:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SKYRL_TX_N_NODES` | `2` | Number of Modal containers in the JAX cluster |
-| `SKYRL_TX_GPUS_PER_NODE` | `4` | GPUs visible to each JAX process |
-| `SKYRL_TX_GPU_TYPE` | `H100` | Modal GPU type |
+
+Each container always requests a full `H100:8` node. Partial H100 allocations do
+not work for multi-node SkyRL-TX runs.
 
 For the default `Qwen/Qwen3-8B` run:
 
 ```text
-total GPUs = SKYRL_TX_N_NODES × SKYRL_TX_GPUS_PER_NODE = 8
-tensor_parallel_size = SKYRL_TX_GPUS_PER_NODE = 4
+total GPUs = SKYRL_TX_N_NODES × 8 = 16 by default
+tensor_parallel_size = 8
 fully_sharded_data_parallel_size = SKYRL_TX_N_NODES = 2
-```
-
-To run on 2 nodes × 8 H100s:
-
-```bash
-SKYRL_TX_GPUS_PER_NODE=8 modal run --detach skyrl-tx/modal_train.py::run_sft
 ```
 
 ## How it works
@@ -76,7 +71,7 @@ starts the SkyRL-TX Tinker API server:
 uv run --extra gpu --extra tinker --extra jax -m skyrl.tinker.api \
   --base-model Qwen/Qwen3-8B \
   --backend jax \
-  --backend-config '{"tensor_parallel_size": 4, "fully_sharded_data_parallel_size": 2, ...}'
+  --backend-config '{"tensor_parallel_size": 8, "fully_sharded_data_parallel_size": 2, ...}'
 ```
 
 Ranks 1..N start SkyRL-TX JAX workers:
