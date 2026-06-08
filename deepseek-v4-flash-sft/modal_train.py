@@ -949,6 +949,8 @@ def deploy_and_eval_merged(
             "0.9",
             "--dtype",
             "bfloat16",
+            "--kv-cache-dtype",
+            "fp8",
             "--moe-backend",
             "triton",
             "--port",
