@@ -636,7 +636,7 @@ def _train_model_impl(
         "--context_parallel_size",
         str(cp_size),
         "--sequence_parallel",
-        str(cp_size > 1).lower(),
+        str(tp_size > 1 or cp_size > 1).lower(),
         "--moe_permute_fusion",
         "true",
         "--moe_grouped_gemm",
@@ -948,7 +948,9 @@ def _make_vllm_model_view(model_path: str) -> str:
     retries=1,
     memory=1048576,
     ephemeral_disk=2048000,
+    experimental_options={"efa_enabled": True},
 )
+@clustered(size=N_NODES, rdma=True)
 def export_checkpoint(
     run_id: str,
     checkpoint_step: int = 5,
@@ -961,6 +963,19 @@ def export_checkpoint(
     import subprocess
 
     from huggingface_hub import snapshot_download
+
+    cluster_info = modal.experimental.get_cluster_info()
+    node_rank = cluster_info.rank
+    n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
+    master_addr = (
+        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
+    )
+    model_parallel_size = tp_size * ep_size * pp_size * cp_size
+    total_gpus = n_nodes * GPUS_PER_NODE
+    if total_gpus % model_parallel_size != 0:
+        raise ValueError(
+            f"TP×EP×PP×CP={model_parallel_size} must divide {total_gpus} total GPUs"
+        )
 
     hf_cache_vol.reload()
     checkpoints_volume.reload()
@@ -976,7 +991,6 @@ def export_checkpoint(
     if not os.path.exists(ckpt_dir):
         raise RuntimeError(f"Checkpoint not found at {ckpt_dir}")
 
-    os.environ["NPROC_PER_NODE"] = str(GPUS_PER_NODE)
     export_cmd = [
         "megatron",
         "export",
@@ -1001,9 +1015,24 @@ def export_checkpoint(
         "--exist_ok",
         "true",
     ]
+    cmd = [
+        "torchrun",
+        "--no_python",
+        "--nproc_per_node",
+        str(GPUS_PER_NODE),
+        "--nnodes",
+        str(n_nodes),
+        "--node_rank",
+        str(node_rank),
+        "--master_addr",
+        master_addr,
+        "--master_port",
+        "29500",
+        *export_cmd,
+    ]
 
-    print(f"[export] {' '.join(export_cmd)}")
-    result = subprocess.run(export_cmd, capture_output=False, text=True)
+    print(f"[export] {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=False, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
 
@@ -1042,8 +1071,7 @@ def deploy_and_eval_merged(
     config_path = f"{merged_dir}/config.json"
     if not os.path.exists(config_path):
         raise RuntimeError(f"Merged HF model not found at {merged_dir}")
-    _make_config_vllm_compatible(config_path)
-    checkpoints_volume.commit()
+    serve_dir = _make_vllm_model_view(merged_dir)
 
     server_log_path = "/tmp/vllm-server.log"
     server_log = open(server_log_path, "w")
@@ -1053,7 +1081,7 @@ def deploy_and_eval_merged(
             "-m",
             "vllm.entrypoints.openai.api_server",
             "--model",
-            merged_dir,
+            serve_dir,
             "--served-model-name",
             "deepseek-v4-flash-sft",
             "--tensor-parallel-size",
@@ -1490,7 +1518,7 @@ def eval_summarization(
     config_path = f"{model_path}/config.json"
     if not os.path.exists(config_path):
         raise RuntimeError(f"Model not found at {model_path}")
-    served_model_path = _make_vllm_model_view(model_path)
+    served_model_path = _make_vllm_model_view(cast(str, model_path))
 
     server_log_path = "/tmp/vllm-server.log"
     server_log = open(server_log_path, "w")
