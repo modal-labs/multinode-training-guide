@@ -272,6 +272,40 @@ text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_c
 assert "rotary_scaling_factor: float = 40" in text
 assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
 PY"""
+MCORE_DSV4_CP_ROPE_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py")
+text = path.read_text()
+old = (
+    "    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)\n"
+    "    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)\n"
+    "\n"
+    "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n"
+)
+new = (
+    "    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)\n"
+    "    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)\n"
+    "\n"
+    "    if cos_.size(0) != t.size(0):\n"
+    "        repeats = (t.size(0) + cos_.size(0) - 1) // cos_.size(0)\n"
+    "        repeat_shape = [1] * cos_.dim()\n"
+    "        repeat_shape[0] = repeats\n"
+    "        cos_ = cos_.repeat(*repeat_shape)[: t.size(0)]\n"
+    "        sin_ = sin_.repeat(*repeat_shape)[: t.size(0)]\n"
+    "\n"
+    "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n"
+)
+if old not in text:
+    raise RuntimeError("Megatron RoPE CP patch target not found")
+path.write_text(text.replace(old, new))
+PY"""
+MCORE_DSV4_CP_ROPE_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py").read_text()
+assert "if cos_.size(0) != t.size(0):" in text
+PY"""
 
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -320,6 +354,8 @@ msswift_image = (
         "pip install --no-deps "
         f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
     )
+    .run_commands(MCORE_DSV4_CP_ROPE_PATCH)
+    .run_commands(MCORE_DSV4_CP_ROPE_VERIFY)
     .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
     .run_commands(DEEPSEEK_V4_MODELING_PATCH)
     .run_commands(DEEPSEEK_V4_CONFIG_VERIFY)
