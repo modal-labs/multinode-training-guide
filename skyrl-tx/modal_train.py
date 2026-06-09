@@ -204,7 +204,7 @@ def _backend_config(
     lora_rank: int,
 ) -> dict[str, object]:
     return {
-        "max_lora_adapters": 2,
+        "max_lora_adapters": 8,
         "max_lora_rank": max(1, lora_rank),
         "tensor_parallel_size": gpus_per_node,
         "fully_sharded_data_parallel_size": n_nodes,
