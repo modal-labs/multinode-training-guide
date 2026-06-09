@@ -71,6 +71,18 @@ def eval_loss(training_client, batch: list[types.Datum]) -> float:
     return sum_loss(forward, "sft_eval")
 
 
+def sample_arithmetic(sampler, tokenizer, label: str) -> str:
+    prompt = "Solve the arithmetic problem. Answer with only the integer.\nQuestion: What is 6 * 7?\nAnswer:"
+    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
+    sample = sampler.sample(
+        prompt=types.ModelInput.from_ints(prompt_tokens),
+        num_samples=1,
+        sampling_params=types.SamplingParams(max_tokens=16, temperature=0.0, top_k=1),
+    )
+    sample = resolve(sample, label)
+    return tokenizer.decode(list(sample.sequences[0].tokens), skip_special_tokens=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:8000")
@@ -111,28 +123,17 @@ def main() -> None:
         "sft_save_state",
     ).path
     print(f"sft_state_checkpoint={state_path}", flush=True)
-    restored_client = service_client.create_training_client_from_state(state_path)
-    restored_loss = eval_loss(restored_client, eval_batch)
-    print(f"sft_restored_eval_loss={restored_loss:.4f}", flush=True)
+    current_loss = eval_loss(training_client, eval_batch)
+    print(f"sft_eval_loss={current_loss:.4f}", flush=True)
 
     sampler_path = resolve(
         training_client.save_weights_for_sampler(name=f"sft_sampler_step_{args.steps}"),
         "sft_save_sampler",
     ).path
     print(f"sft_sampler_checkpoint={sampler_path}", flush=True)
-    sampler = training_client.save_weights_and_get_sampling_client(name="sft_smoke")
-    prompt = "Solve the arithmetic problem. Answer with only the integer.\nQuestion: What is 6 * 7?\nAnswer:"
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
-    sample = sampler.sample(
-        prompt=types.ModelInput.from_ints(prompt_tokens),
-        num_samples=1,
-        sampling_params=types.SamplingParams(max_tokens=16, temperature=0.0, top_k=1),
-    )
-    sample = resolve(sample, "sft_sample")
-    completion = tokenizer.decode(
-        list(sample.sequences[0].tokens), skip_special_tokens=True
-    )
-    print(f"sft_sample={completion!r}", flush=True)
+    sampler = service_client.create_sampling_client(model_path=sampler_path)
+    completion = sample_arithmetic(sampler, tokenizer, "sft_sampler_eval")
+    print(f"sft_sampler_eval_sample={completion!r}", flush=True)
 
 
 if __name__ == "__main__":

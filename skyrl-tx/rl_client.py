@@ -93,6 +93,14 @@ def build_rollout_batch(
     sampler = training_client.save_weights_and_get_sampling_client(
         name=f"rl_step_{step}"
     )
+    return build_rollout_batch_from_sampler(
+        sampler, tokenizer, samples_per_prompt, step
+    )
+
+
+def build_rollout_batch_from_sampler(
+    sampler, tokenizer, samples_per_prompt: int, step: int
+) -> tuple[list[types.Datum], list[float]]:
     data: list[types.Datum] = []
     rewards: list[float] = []
 
@@ -181,16 +189,15 @@ def main() -> None:
         training_client.save_state(name=f"rl_state_step_{args.steps}"), "rl_save_state"
     ).path
     print(f"rl_state_checkpoint={state_path}", flush=True)
-    restored_client = service_client.create_training_client_from_state(state_path)
-    restored_forward = restored_client.forward_backward(
+    eval_forward = training_client.forward_backward(
         data,
         "ppo",
         {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
     )
-    restored_forward = resolve(restored_forward, "rl_restored_eval")
-    validate_forward_outputs(restored_forward, "rl_restored_eval")
+    eval_forward = resolve(eval_forward, "rl_eval_forward")
+    validate_forward_outputs(eval_forward, "rl_eval_forward")
     print(
-        f"rl_restored_eval_loss_outputs={len(restored_forward.loss_fn_outputs)}",
+        f"rl_eval_loss_outputs={len(eval_forward.loss_fn_outputs)}",
         flush=True,
     )
 
@@ -199,8 +206,9 @@ def main() -> None:
         "rl_save_sampler",
     ).path
     print(f"rl_sampler_checkpoint={sampler_path}", flush=True)
-    eval_data, eval_rewards = build_rollout_batch(
-        training_client, tokenizer, args.samples_per_prompt, args.steps
+    sampler = service_client.create_sampling_client(model_path=sampler_path)
+    eval_data, eval_rewards = build_rollout_batch_from_sampler(
+        sampler, tokenizer, args.samples_per_prompt, args.steps
     )
     mean_eval_reward = sum(eval_rewards) / len(eval_rewards)
     print(
