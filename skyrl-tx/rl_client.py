@@ -133,7 +133,7 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--samples-per-prompt", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=1e-8)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
     args = parser.parse_args()
 
     service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
@@ -145,7 +145,7 @@ def main() -> None:
     optimizer = types.AdamParams(
         learning_rate=args.learning_rate,
         beta1=0.9,
-        beta2=0.999,
+        beta2=0.95,
         eps=1e-8,
     )
 
