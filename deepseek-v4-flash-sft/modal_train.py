@@ -1616,6 +1616,7 @@ def eval_summarization(
 def long_context_loop(
     run_id: str = "longctx-60k-summary",
     data_folder: str = "meeting_summaries",
+    num_train_examples: int = 64,
     train_iters: int = 5,
     save_interval: int = 5,
     max_length: int = 65536,
@@ -1626,6 +1627,8 @@ def long_context_loop(
     ep_size: int = EP_SIZE,
     pp_size: int = PP_SIZE,
     cp_size: int = CP_SIZE,
+    global_batch_size: int = 8,
+    micro_batch_size: int = 1,
 ):
     """Full long-context loop: baseline eval → train → export → post-training eval."""
     print("=" * 60)
@@ -1639,7 +1642,7 @@ def long_context_loop(
     print("\n[Step 1/5] Preparing long-context dataset...")
     prepare_summary_dataset.remote(
         data_folder=data_folder,
-        num_examples=max(5, train_iters),
+        num_examples=max(num_train_examples, train_iters * global_batch_size),
         target_tokens=target_tokens,
     )
 
@@ -1667,8 +1670,8 @@ def long_context_loop(
         ep_size=ep_size,
         pp_size=pp_size,
         cp_size=cp_size,
-        global_batch_size=1,
-        micro_batch_size=1,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
     )
     print(f"  Training done: {train_result}")
 
