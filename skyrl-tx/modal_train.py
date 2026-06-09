@@ -109,6 +109,18 @@ def _wait_for_server(process: subprocess.Popen[bytes], log_path: Path) -> None:
     raise TimeoutError(f"Timed out waiting for {url}\n{_tail(log_path)}")
 
 
+def _wait_for_coordinator_launch(run_state: modal.Dict, run_key: str) -> None:
+    deadline = time.monotonic() + 10 * 60
+    while time.monotonic() < deadline:
+        status = run_state.get(run_key)
+        if status == "running":
+            return
+        if status == "done":
+            raise RuntimeError("Coordinator completed before worker startup")
+        time.sleep(2)
+    raise TimeoutError("Timed out waiting for coordinator startup")
+
+
 def _backend_config(
     master_addr: str,
     n_nodes: int,
@@ -136,6 +148,7 @@ def _run_worker(
     rank: int,
     run_key: str,
 ) -> None:
+    _wait_for_coordinator_launch(run_state, run_key)
     log_path = Path(f"/tmp/skyrl_tx_worker_{rank}.log")
     cmd = [
         "uv",
@@ -241,7 +254,6 @@ def _run_tinker_job(
         _run_worker(run_state, master_addr, n_nodes, rank, run_key)
         return
 
-    run_state[run_key] = "running"
     log_path = Path(f"/tmp/skyrl_tx_{mode}_api.log")
     backend_config = _backend_config(
         master_addr,
@@ -283,6 +295,7 @@ def _run_tinker_job(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        run_state[run_key] = "running"
         _wait_for_server(process, log_path)
         _run_client(client_script, model_id, client_args)
         _commit_and_print_checkpoints(mode)
