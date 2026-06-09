@@ -56,6 +56,13 @@ def validate_forward_outputs(result, label: str) -> None:
                     raise RuntimeError(f"Non-finite {label} {key} value: {scalar}")
 
 
+def validate_optimizer_metrics(result, label: str) -> None:
+    for key, value in (result.metrics or {}).items():
+        metric = float(value)
+        if not math.isfinite(metric):
+            raise RuntimeError(f"Non-finite {label} metric {key}: {metric}")
+
+
 def make_prompt(question: str) -> str:
     return (
         "Solve the arithmetic problem. Answer with only the final integer.\n"
@@ -126,7 +133,7 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--samples-per-prompt", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--learning-rate", type=float, default=1e-8)
     args = parser.parse_args()
 
     service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
@@ -153,7 +160,8 @@ def main() -> None:
         )
         forward = resolve(forward, f"rl_step_{step}")
         validate_forward_outputs(forward, f"rl_step_{step}")
-        resolve(training_client.optim_step(optimizer), f"rl_optim_step_{step}")
+        optim = resolve(training_client.optim_step(optimizer), f"rl_optim_step_{step}")
+        validate_optimizer_metrics(optim, f"rl_optim_step_{step}")
         mean_reward = sum(rewards) / len(rewards)
         print(
             f"rl_step={step} mean_reward={mean_reward:.3f} trajectories={len(data)} "

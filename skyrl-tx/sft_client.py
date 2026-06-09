@@ -57,6 +57,13 @@ def sum_loss(result, label: str) -> float:
     return total
 
 
+def validate_optimizer_metrics(result, label: str) -> None:
+    for key, value in (result.metrics or {}).items():
+        metric = float(value)
+        if not math.isfinite(metric):
+            raise RuntimeError(f"Non-finite {label} metric {key}: {metric}")
+
+
 def eval_loss(training_client, batch: list[types.Datum]) -> float:
     forward = resolve(training_client.forward_backward(batch, "cross_entropy"), "sft_eval")
     return sum_loss(forward, "sft_eval")
@@ -68,7 +75,7 @@ def main() -> None:
     parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--steps", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--learning-rate", type=float, default=1e-8)
     args = parser.parse_args()
 
     service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
@@ -88,7 +95,8 @@ def main() -> None:
 
     for step in range(args.steps):
         forward = resolve(training_client.forward_backward(batch, "cross_entropy"), f"sft_step_{step}")
-        resolve(training_client.optim_step(optimizer), f"sft_optim_step_{step}")
+        optim = resolve(training_client.optim_step(optimizer), f"sft_optim_step_{step}")
+        validate_optimizer_metrics(optim, f"sft_optim_step_{step}")
         print(f"sft_step={step} loss={sum_loss(forward, f'sft_step_{step}'):.4f}", flush=True)
 
     state_path = resolve(training_client.save_state(name=f"sft_state_step_{args.steps}"), "sft_save_state").path
