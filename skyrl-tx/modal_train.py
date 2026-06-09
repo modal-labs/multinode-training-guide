@@ -167,31 +167,7 @@ def _patch_skyrl_checkpointing() -> None:
         logger.info(f"Saved training checkpoint to {output_path}")
 """,
     )
-    source = source.replace(
-        """    def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:
-        \"\"\"Load training checkpoint using Flax checkpoints.\"\"\"
-        checkpoint = checkpoints.restore_checkpoint(
-            ckpt_dir=checkpoint_path,
-            target=self._extract_checkpoint_data(model_id),
-            prefix="checkpoint_",
-        )
-""",
-        """    def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:
-        \"\"\"Load training checkpoint using Flax checkpoints.\"\"\"
-        checkpointer = ocp.Checkpointer(
-            ocp.PyTreeCheckpointHandler(
-                multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=None)
-            )
-        )
-        checkpoint = checkpoints.restore_checkpoint(
-            ckpt_dir=checkpoint_path,
-            target=self._extract_checkpoint_data(model_id),
-            prefix="checkpoint_",
-            orbax_checkpointer=checkpointer,
-        )
-""",
-    )
-    if source.count("orbax_checkpointer=checkpointer") != 2:
+    if source.count("orbax_checkpointer=checkpointer") != 1:
         raise RuntimeError("Failed to patch SkyRL JAX checkpointing")
     jax_backend_path.write_text(source)
 
