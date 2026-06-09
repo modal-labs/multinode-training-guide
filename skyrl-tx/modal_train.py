@@ -295,7 +295,22 @@ def _checkpoint_artifacts(checkpoint_root: Path) -> list[Path]:
 def _commit_and_print_checkpoints(mode: str, run_id: str) -> None:
     checkpoint_root = Path(CHECKPOINTS_DIR) / mode / run_id
     checkpoint_artifacts = _checkpoint_artifacts(checkpoint_root)
+    results_path = checkpoint_root / "cookbook_results.jsonl"
     if not checkpoint_artifacts:
+        if mode == "cookbook" and results_path.exists():
+            print(
+                f"{mode}_checkpoint_artifacts=0; committing cookbook results only",
+                flush=True,
+            )
+            print(
+                f"{mode}_cookbook_results={run_id}/cookbook_results.jsonl "
+                f"bytes={_path_size(results_path)}",
+                flush=True,
+            )
+            print(results_path.read_text(errors="replace"), flush=True)
+            checkpoint_volume.commit()
+            print(f"{mode}_checkpoint_volume_committed=0", flush=True)
+            return
         raise RuntimeError(
             f"No {mode} checkpoints were written under {checkpoint_root}"
         )
@@ -306,7 +321,6 @@ def _commit_and_print_checkpoints(mode: str, run_id: str) -> None:
             f"bytes={_path_size(checkpoint_artifact)}",
             flush=True,
         )
-    results_path = checkpoint_root / "cookbook_results.jsonl"
     if results_path.exists():
         print(
             f"{mode}_cookbook_results={run_id}/cookbook_results.jsonl bytes={_path_size(results_path)}",
