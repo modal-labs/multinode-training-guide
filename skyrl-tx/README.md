@@ -65,6 +65,12 @@ Run the cookbook compatibility smoke suite:
 modal run --detach skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
 ```
 
+Run a single cookbook probe by name:
+
+```bash
+modal run --detach skyrl-tx/modal_train.py::run_cookbook --lora-rank 4 --example sl_loop
+```
+
 Use detached mode for the training jobs; the image build, model load, JAX
 initialization, and first compile can take several minutes.
 

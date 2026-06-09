@@ -53,7 +53,7 @@ Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.math_rl`
 Validated with:
 
 ```bash
-modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4 --example math_rl
 ```
 
 Recorded result on 2 x `H100:8`: **PASS**. The smoke sampled a short arithmetic

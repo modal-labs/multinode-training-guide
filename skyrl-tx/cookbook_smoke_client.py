@@ -439,6 +439,7 @@ EXAMPLES = [
     ("search_tool", "expected_partial"),
     ("vlm_classifier", "expected_partial"),
 ]
+EXAMPLE_NAMES = [name for name, _ in EXAMPLES]
 
 
 def main() -> None:
@@ -446,6 +447,13 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
     parser.add_argument("--lora-rank", type=int, default=4)
+    parser.add_argument(
+        "--example",
+        action="append",
+        choices=EXAMPLE_NAMES,
+        default=None,
+        help="Run one example probe. Repeat to run multiple; omit to run all.",
+    )
     parser.add_argument("--results-path", type=Path, default=None)
     args = parser.parse_args()
 
@@ -455,7 +463,10 @@ def main() -> None:
     if args.results_path is not None:
         args.results_path.parent.mkdir(parents=True, exist_ok=True)
 
+    selected_examples = set(args.example or EXAMPLE_NAMES)
     for example, expectation in EXAMPLES:
+        if example not in selected_examples:
+            continue
         started = time.monotonic()
         try:
             payload = getattr(runner, example)()

@@ -53,7 +53,7 @@ Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.code_rl`
 Validated with:
 
 ```bash
-modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4 --example code_rl
 ```
 
 Recorded result on 2 x `H100:8`: **PASS** for the model-side path. The smoke

@@ -54,7 +54,7 @@ Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.distillation
 Validated with:
 
 ```bash
-modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4 --example distillation_on_policy
 ```
 
 Recorded result on 2 x `H100:8`: **PASS** for a same-server teacher. The smoke

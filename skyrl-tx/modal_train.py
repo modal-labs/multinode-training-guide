@@ -507,14 +507,18 @@ def run_cookbook_cluster(
     run_state: modal.Dict,
     model_id: str = MODEL_ID,
     lora_rank: int = 4,
+    example: str | None = None,
     gpus_per_node: int = GPUS_PER_NODE,
 ) -> None:
+    client_args = ["--lora-rank", str(lora_rank)]
+    if example is not None:
+        client_args.extend(["--example", example])
     _run_tinker_job(
         run_state,
         mode="cookbook",
         client_script="cookbook_smoke_client.py",
         model_id=model_id,
-        client_args=["--lora-rank", str(lora_rank)],
+        client_args=client_args,
         gpus_per_node=gpus_per_node,
         train_micro_batch_size=1,
         lora_rank=lora_rank,
@@ -538,9 +542,10 @@ def run_sft(
 def run_cookbook(
     model_id: str = MODEL_ID,
     lora_rank: int = 4,
+    example: str | None = None,
 ) -> None:
     with modal.Dict.ephemeral() as run_state:
-        run_cookbook_cluster.remote(run_state, model_id, lora_rank, GPUS_PER_NODE)
+        run_cookbook_cluster.remote(run_state, model_id, lora_rank, example, GPUS_PER_NODE)
 
 
 @app.local_entrypoint()

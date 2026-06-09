@@ -54,7 +54,7 @@ Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.preference_d
 Validated with:
 
 ```bash
-modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4 --example preference_dpo
 ```
 
 Recorded result on 2 x `H100:8`: **PASS**. The smoke created a frozen reference
