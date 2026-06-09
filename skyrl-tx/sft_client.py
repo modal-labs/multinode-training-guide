@@ -65,7 +65,9 @@ def validate_optimizer_metrics(result, label: str) -> None:
 
 
 def eval_loss(training_client, batch: list[types.Datum]) -> float:
-    forward = resolve(training_client.forward_backward(batch, "cross_entropy"), "sft_eval")
+    forward = resolve(
+        training_client.forward_backward(batch, "cross_entropy"), "sft_eval"
+    )
     return sum_loss(forward, "sft_eval")
 
 
@@ -94,12 +96,20 @@ def main() -> None:
     )
 
     for step in range(args.steps):
-        forward = resolve(training_client.forward_backward(batch, "cross_entropy"), f"sft_step_{step}")
+        forward = resolve(
+            training_client.forward_backward(batch, "cross_entropy"), f"sft_step_{step}"
+        )
         optim = resolve(training_client.optim_step(optimizer), f"sft_optim_step_{step}")
         validate_optimizer_metrics(optim, f"sft_optim_step_{step}")
-        print(f"sft_step={step} loss={sum_loss(forward, f'sft_step_{step}'):.4f}", flush=True)
+        print(
+            f"sft_step={step} loss={sum_loss(forward, f'sft_step_{step}'):.4f}",
+            flush=True,
+        )
 
-    state_path = resolve(training_client.save_state(name=f"sft_state_step_{args.steps}"), "sft_save_state").path
+    state_path = resolve(
+        training_client.save_state(name=f"sft_state_step_{args.steps}"),
+        "sft_save_state",
+    ).path
     print(f"sft_state_checkpoint={state_path}", flush=True)
     restored_client = service_client.create_training_client_from_state(state_path)
     restored_loss = eval_loss(restored_client, eval_batch)
@@ -119,7 +129,9 @@ def main() -> None:
         sampling_params=types.SamplingParams(max_tokens=16, temperature=0.0, top_k=1),
     )
     sample = resolve(sample, "sft_sample")
-    completion = tokenizer.decode(list(sample.sequences[0].tokens), skip_special_tokens=True)
+    completion = tokenizer.decode(
+        list(sample.sequences[0].tokens), skip_special_tokens=True
+    )
     print(f"sft_sample={completion!r}", flush=True)
 
 

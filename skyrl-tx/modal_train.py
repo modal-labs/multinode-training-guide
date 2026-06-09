@@ -30,7 +30,9 @@ GPU_TYPE = "H100"
 app = modal.App("example-skyrl-tx-qwen")
 
 hf_cache_volume = modal.Volume.from_name("skyrl-tx-hf-cache", create_if_missing=True)
-checkpoint_volume = modal.Volume.from_name("skyrl-tx-checkpoints", create_if_missing=True)
+checkpoint_volume = modal.Volume.from_name(
+    "skyrl-tx-checkpoints", create_if_missing=True
+)
 
 example_dir = Path(__file__).parent
 
@@ -81,7 +83,9 @@ def _tail(path: Path, max_lines: int = 120) -> str:
     return "\n".join(path.read_text(errors="replace").splitlines()[-max_lines:])
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes], timeout: int = 30) -> None:
+def _terminate_process_group(
+    process: subprocess.Popen[bytes], timeout: int = 30
+) -> None:
     if process.poll() is not None:
         return
     os.killpg(process.pid, signal.SIGTERM)
@@ -121,6 +125,77 @@ def _wait_for_coordinator_launch(run_state: modal.Dict, run_key: str) -> None:
     raise TimeoutError("Timed out waiting for coordinator startup")
 
 
+def _patch_skyrl_checkpointing() -> None:
+    jax_backend_path = SKYRL_ROOT / "skyrl" / "backends" / "jax.py"
+    source = jax_backend_path.read_text()
+    if "primary_host=None" in source:
+        return
+
+    source = source.replace(
+        "from flax.training import checkpoints\n",
+        "import orbax.checkpoint as ocp\nfrom flax.training import checkpoints\n",
+    )
+    source = source.replace(
+        """    def save_checkpoint(self, output_path: AnyPath, model_id: str) -> None:
+        \"\"\"Save training checkpoint using Flax checkpoints.\"\"\"
+        checkpoint_data = self._extract_checkpoint_data(model_id)
+        checkpoints.save_checkpoint_multiprocess(
+            target=checkpoint_data,
+            ckpt_dir=output_path,
+            step=0,
+            prefix="checkpoint_",
+            overwrite=True,
+        )
+        logger.info(f"Saved training checkpoint to {output_path}")
+""",
+        """    def save_checkpoint(self, output_path: AnyPath, model_id: str) -> None:
+        \"\"\"Save training checkpoint using Flax checkpoints.\"\"\"
+        checkpoint_data = self._extract_checkpoint_data(model_id)
+        checkpointer = ocp.Checkpointer(
+            ocp.PyTreeCheckpointHandler(
+                multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=None)
+            )
+        )
+        checkpoints.save_checkpoint_multiprocess(
+            target=checkpoint_data,
+            ckpt_dir=output_path,
+            step=0,
+            prefix="checkpoint_",
+            overwrite=True,
+            orbax_checkpointer=checkpointer,
+        )
+        logger.info(f"Saved training checkpoint to {output_path}")
+""",
+    )
+    source = source.replace(
+        """    def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:
+        \"\"\"Load training checkpoint using Flax checkpoints.\"\"\"
+        checkpoint = checkpoints.restore_checkpoint(
+            ckpt_dir=checkpoint_path,
+            target=self._extract_checkpoint_data(model_id),
+            prefix="checkpoint_",
+        )
+""",
+        """    def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:
+        \"\"\"Load training checkpoint using Flax checkpoints.\"\"\"
+        checkpointer = ocp.Checkpointer(
+            ocp.PyTreeCheckpointHandler(
+                multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=None)
+            )
+        )
+        checkpoint = checkpoints.restore_checkpoint(
+            ckpt_dir=checkpoint_path,
+            target=self._extract_checkpoint_data(model_id),
+            prefix="checkpoint_",
+            orbax_checkpointer=checkpointer,
+        )
+""",
+    )
+    if source.count("orbax_checkpointer=checkpointer") != 2:
+        raise RuntimeError("Failed to patch SkyRL JAX checkpointing")
+    jax_backend_path.write_text(source)
+
+
 def _backend_config(
     master_addr: str,
     n_nodes: int,
@@ -148,6 +223,7 @@ def _run_worker(
     rank: int,
     run_key: str,
 ) -> None:
+    _patch_skyrl_checkpointing()
     _wait_for_coordinator_launch(run_state, run_key)
     log_path = Path(f"/tmp/skyrl_tx_worker_{rank}.log")
     cmd = [
@@ -181,7 +257,11 @@ def _run_worker(
         while process.poll() is None:
             if run_state.get(run_key) == "done":
                 _terminate_process_group(process)
-                print(f"worker_rank={rank} stopped after coordinator completed", flush=True)
+                checkpoint_volume.commit()
+                print(
+                    f"worker_rank={rank} stopped after coordinator completed",
+                    flush=True,
+                )
                 print(_tail(log_path), flush=True)
                 return
             time.sleep(5)
@@ -212,15 +292,23 @@ def _run_client(client_script: str, model_id: str, extra_args: list[str]) -> Non
     subprocess.run(cmd, cwd=SKYRL_ROOT, check=True)
 
 
+def _path_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
+
+
 def _commit_and_print_checkpoints(mode: str) -> None:
     checkpoint_root = Path(CHECKPOINTS_DIR) / mode
     checkpoint_files = sorted(checkpoint_root.rglob("*.tar.gz"))
     if not checkpoint_files:
-        raise RuntimeError(f"No {mode} checkpoints were written under {checkpoint_root}")
+        raise RuntimeError(
+            f"No {mode} checkpoints were written under {checkpoint_root}"
+        )
     for checkpoint_file in checkpoint_files:
         relative_path = checkpoint_file.relative_to(checkpoint_root)
         print(
-            f"{mode}_checkpoint_file={relative_path} bytes={checkpoint_file.stat().st_size}",
+            f"{mode}_checkpoint_file={relative_path} bytes={_path_size(checkpoint_file)}",
             flush=True,
         )
     checkpoint_volume.commit()
@@ -237,10 +325,13 @@ def _run_tinker_job(
     train_micro_batch_size: int,
     lora_rank: int,
 ) -> None:
+    _patch_skyrl_checkpointing()
     cluster_info = modal.experimental.get_cluster_info()
     rank = cluster_info.rank
     if not cluster_info.container_ipv4_ips:
-        raise RuntimeError("Clustered run did not receive container IPv4 addresses from Modal")
+        raise RuntimeError(
+            "Clustered run did not receive container IPv4 addresses from Modal"
+        )
     n_nodes = len(cluster_info.container_ipv4_ips)
     master_addr = cluster_info.container_ipv4_ips[0]
     run_key = f"{cluster_info.cluster_id}:{mode}:{model_id}:{COORDINATOR_PORT}"
@@ -404,7 +495,9 @@ def run_sft(
     learning_rate: float = 1e-6,
 ) -> None:
     with modal.Dict.ephemeral() as run_state:
-        run_sft_cluster.remote(run_state, model_id, steps, lora_rank, learning_rate, GPUS_PER_NODE)
+        run_sft_cluster.remote(
+            run_state, model_id, steps, lora_rank, learning_rate, GPUS_PER_NODE
+        )
 
 
 @app.local_entrypoint()
