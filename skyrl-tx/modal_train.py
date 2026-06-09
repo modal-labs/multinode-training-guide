@@ -274,8 +274,8 @@ def _path_size(path: Path) -> int:
     return sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
 
 
-def _commit_and_print_checkpoints(mode: str) -> None:
-    checkpoint_root = Path(CHECKPOINTS_DIR) / mode
+def _commit_and_print_checkpoints(mode: str, run_id: str) -> None:
+    checkpoint_root = Path(CHECKPOINTS_DIR) / mode / run_id
     checkpoint_files = sorted(checkpoint_root.rglob("*.tar.gz"))
     if not checkpoint_files:
         raise RuntimeError(
@@ -284,7 +284,7 @@ def _commit_and_print_checkpoints(mode: str) -> None:
     for checkpoint_file in checkpoint_files:
         relative_path = checkpoint_file.relative_to(checkpoint_root)
         print(
-            f"{mode}_checkpoint_file={relative_path} bytes={_path_size(checkpoint_file)}",
+            f"{mode}_checkpoint_file={run_id}/{relative_path} bytes={_path_size(checkpoint_file)}",
             flush=True,
         )
     checkpoint_volume.commit()
@@ -311,6 +311,7 @@ def _run_tinker_job(
     n_nodes = len(cluster_info.container_ipv4_ips)
     master_addr = cluster_info.container_ipv4_ips[0]
     run_key = f"{cluster_info.cluster_id}:{mode}:{model_id}:{COORDINATOR_PORT}"
+    run_id = f"{cluster_info.cluster_id}-{mode}"
     print(
         f"{mode}_cluster rank={rank} master_addr={master_addr} "
         f"n_nodes={n_nodes} gpu={GPU_TYPE}:{gpus_per_node}",
@@ -348,7 +349,7 @@ def _run_tinker_job(
         "--port",
         str(TINKER_PORT),
         "--checkpoints-base",
-        str(Path(CHECKPOINTS_DIR) / mode),
+        str(Path(CHECKPOINTS_DIR) / mode / run_id),
         "--backend-config",
         json.dumps(backend_config),
     ]
@@ -365,7 +366,7 @@ def _run_tinker_job(
         run_state[run_key] = "running"
         _wait_for_server(process, log_path)
         _run_client(client_script, model_id, client_args)
-        _commit_and_print_checkpoints(mode)
+        _commit_and_print_checkpoints(mode, run_id)
     finally:
         run_state[run_key] = "done"
         if process is not None:
