@@ -61,12 +61,11 @@ def get_checkpoint_conversion_policy(slime_cfg) -> tuple[int, int, list[str]]:
         if nproc_per_node > gpus_per_node:
             continue
 
+        # Don't forward training TP/PP into conversion. slime's converter runs
+        # TP=1 and auto-shards by pipeline (PP = world_size); forwarding TP>1 with
+        # PP=1 makes TP*PP exceed world_size and trips Megatron's validate_args.
+        # The torch_dist output is reshardable, so the conversion layout is irrelevant.
         extra_args: list[str] = []
-        if tp > 1 or pp > 1:
-            extra_args += [
-                f"--tensor-model-parallel-size {tp}",
-                f"--pipeline-model-parallel-size {pp}",
-            ]
         for attr, flag in _CONVERSION_EXTRA_ARGS:
             if x := getattr(slime_cfg, attr, None):
                 extra_args.append(f"--{flag} {x}")
