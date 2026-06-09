@@ -636,7 +636,7 @@ def _train_model_impl(
         "--context_parallel_size",
         str(cp_size),
         "--sequence_parallel",
-        "false",
+        str(cp_size > 1).lower(),
         "--moe_permute_fusion",
         "true",
         "--moe_grouped_gemm",
