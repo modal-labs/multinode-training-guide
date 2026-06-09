@@ -1013,7 +1013,9 @@ def export_checkpoint(
     cp_size: int = CP_SIZE,
 ):
     """Export a Megatron LoRA checkpoint into merged HF safetensors."""
+    import shutil
     import subprocess
+    import time
 
     from huggingface_hub import snapshot_download
 
@@ -1092,10 +1094,33 @@ def export_checkpoint(
     if result.returncode != 0:
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
 
-    if node_rank == 0:
-        _make_config_vllm_compatible(f"{merged_dir}/config.json")
+    sync_dir = f"{CHECKPOINTS_DIR}/{run_id}/.export-sync-{checkpoint_step}"
+    if node_rank != 0:
+        os.makedirs(sync_dir, exist_ok=True)
+        with open(f"{sync_dir}/node-{node_rank}.done", "w") as f:
+            f.write("done\n")
+        checkpoints_volume.commit()
+    else:
+        expected_markers = [
+            f"{sync_dir}/node-{rank}.done" for rank in range(1, n_nodes)
+        ]
+        deadline = time.monotonic() + 600
+        while expected_markers and not all(
+            os.path.exists(path) for path in expected_markers
+        ):
+            if time.monotonic() > deadline:
+                missing = [
+                    path for path in expected_markers if not os.path.exists(path)
+                ]
+                raise RuntimeError(
+                    f"Timed out waiting for export volume commits: {missing}"
+                )
+            checkpoints_volume.reload()
+            time.sleep(2)
 
-    checkpoints_volume.commit()
+        shutil.rmtree(sync_dir, ignore_errors=True)
+        _make_config_vllm_compatible(f"{merged_dir}/config.json")
+        checkpoints_volume.commit()
     print(f"[export] Merged HF model saved to {merged_dir}")
     return {"merged_dir": merged_dir, "run_id": run_id}
 
