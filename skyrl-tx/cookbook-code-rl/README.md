@@ -45,3 +45,22 @@ The code-execution sandbox is the main non-SkyRL dependency. Full-scale code RL
 also has high variance and long rollout latency, so it needs a dedicated Modal
 validation run before calling it production-ready. KL/post-KL settings remain
 unvalidated for this SkyRL-TX example.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.code_rl`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS** for the model-side path. The smoke
+sampled a code-shaped prompt, supplied a client-side reward, ran one
+`importance_sampling` forward/backward step, and applied one optimizer step. It
+did **not** run SandboxFusion/Docker/Modal sandbox tests.
+
+```json
+{"example":"code_rl","status":"PASS","loss_sum":-497.1251588719726,"loss_values":38,"duration_seconds":11.802,"external_dependency":"sandbox not exercised"}
+```

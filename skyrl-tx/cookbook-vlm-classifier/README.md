@@ -1,6 +1,6 @@
 # Tinker cookbook compatibility: `vlm_classifier`
 
-Status: **not supported by this SkyRL-TX Modal example**
+Status: **partial API smoke only; real VLM support is not provided by this text-only example**
 
 Source recipe: `tinker_cookbook.recipes.vlm_classifier.train`
 
@@ -43,3 +43,23 @@ To support this recipe, the example would need a different launch path:
 Do not expect `vlm_classifier` to work by simply pointing it at the current
 `skyrl-tx/modal_train.py` server. Text-only SFT/RL support does not imply VLM
 support, even though the Tinker API type definitions include image chunks.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.vlm_classifier`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS** for API acceptance only. The smoke sent
+a `ModelInput` containing text chunks plus a 1x1 PNG `ImageChunk` and completed a
+`cross_entropy` update. This is **not** evidence of real image understanding: the
+server was still launched with text-only `Qwen/Qwen3-8B`, and the current example
+does not configure a Qwen3-VL renderer or image tensor path.
+
+```json
+{"example":"vlm_classifier","status":"PASS","loss_sum":-126.9375,"loss_values":20,"duration_seconds":0.61,"caveat":"API accepted image chunk; visual conditioning unvalidated"}
+```

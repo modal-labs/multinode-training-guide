@@ -46,3 +46,21 @@ The backend-facing training path is supported:
 No text-SFT backend feature is missing. The risk is mostly scale: full public
 datasets plus frequent eval/checkpoint cadence will be much heavier than the
 small Modal smoke in this repo.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.chat_sl`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS**. The smoke used the tokenizer chat
+template when available, trained only assistant-token labels with
+`cross_entropy`, and applied one optimizer step.
+
+```json
+{"example":"chat_sl","status":"PASS","loss_sum":-49.1875,"loss_values":32,"duration_seconds":0.771}
+```

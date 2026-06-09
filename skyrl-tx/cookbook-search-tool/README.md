@@ -45,3 +45,22 @@ The retrieval/indexing stack is outside SkyRL-TX. The public cookbook's intended
 Wikipedia-scale index can require substantial RAM and separate service
 orchestration. KL/post-KL paths should remain disabled unless prompt-logprob
 support is separately validated.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.search_tool`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS** for the model-side transcript path.
+The smoke rendered a toy search observation into text, sampled a response, ran
+one `importance_sampling` forward/backward step, and applied one optimizer step.
+It did **not** start Chroma or build a Wikipedia retrieval index.
+
+```json
+{"example":"search_tool","status":"PASS","loss_sum":-795.1834402664549,"loss_values":78,"duration_seconds":22.584,"external_dependency":"Chroma not exercised"}
+```

@@ -1,6 +1,6 @@
 # Tinker cookbook compatibility: `preference/dpo`
 
-Status: **partial: likely backend-compatible, not validated**
+Status: **partial: custom-loss smoke validated; full recipe still needs dataset adaptation**
 
 Source recipe: `tinker_cookbook.recipes.preference.dpo.train`
 
@@ -41,7 +41,27 @@ Most primitives exist in the pinned SkyRL-TX server:
 
 ## Unsupported or risky pieces
 
-This should be treated as unvalidated until a real Modal run proves
-`compute_logprobs` and `forward_backward_custom` end-to-end. SkyRL's current
+The tiny custom-loss smoke passed, but full DPO should still be treated as
+partial support until a real preference dataset run validates renderer choices,
+batch sizing, and reference-logprob alignment at recipe scale. SkyRL's current
 Tinker limitation docs still flag prompt logprobs as not ready, which is exactly
 the API surface DPO depends on for reference logprobs.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.preference_dpo`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS**. The smoke created a frozen reference
+sampler from the current policy, computed reference logprobs for one
+chosen/rejected pair, ran `forward_backward_custom(...)` with a DPO-style
+client-side Torch loss, and applied one optimizer step.
+
+```json
+{"example":"preference_dpo","status":"PASS","loss_sum":-69.27671873848885,"loss_values":44,"duration_seconds":52.007}
+```

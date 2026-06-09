@@ -45,3 +45,21 @@ ready. The JAX code path contains prompt-logprob plumbing, but this Modal exampl
 has not validated cookbook KL/post-KL. Treat `kl_penalty_coef > 0`,
 `compute_post_kl=True`, and non-default loss experiments such as CISPO as
 unvalidated.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.math_rl`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS**. The smoke sampled a short arithmetic
+rollout, assigned a scalar reward/advantage, ran one `importance_sampling`
+forward/backward step, and applied one optimizer step.
+
+```json
+{"example":"math_rl","status":"PASS","loss_sum":-590.7610627205562,"loss_values":60,"duration_seconds":12.805}
+```

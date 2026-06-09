@@ -44,3 +44,21 @@ The model-side requirements are supported:
 The default `rl_loop` does not use a KL penalty, prompt logprobs, tools, or
 images, so there is no known SkyRL-TX feature blocker. Large benchmark runs
 still need normal training validation for throughput, memory, and reward quality.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.rl_loop`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS**. The smoke synced sampler weights,
+sampled a rollout from the SkyRL-TX server, reused generated-token logprobs, ran
+one `importance_sampling` forward/backward step, and applied one optimizer step.
+
+```json
+{"example":"rl_loop","status":"PASS","loss_sum":-265.6109986276941,"loss_values":34,"duration_seconds":49.045}
+```

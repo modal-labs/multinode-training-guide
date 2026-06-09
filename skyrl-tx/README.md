@@ -24,11 +24,11 @@ shape:
 | `chat_sl` | Supported for text-only chat SFT | [cookbook-chat-sl](cookbook-chat-sl/) |
 | `math_rl` | Supported for default no-KL RL; partial for KL diagnostics | [cookbook-math-rl](cookbook-math-rl/) |
 | `code_rl` | Partial: sandbox infrastructure is external | [cookbook-code-rl](cookbook-code-rl/) |
-| `preference/dpo` | Partial: likely compatible, not validated | [cookbook-preference-dpo](cookbook-preference-dpo/) |
-| `preference/rlhf` | Partial: stages map, full pipeline needs adaptation | [cookbook-preference-rlhf](cookbook-preference-rlhf/) |
-| `distillation/on_policy_distillation` | Mostly unsupported as written | [cookbook-distillation-on-policy](cookbook-distillation-on-policy/) |
+| `preference/dpo` | Partial: custom DPO smoke passed; full recipe still needs dataset adaptation | [cookbook-preference-dpo](cookbook-preference-dpo/) |
+| `preference/rlhf` | Partial: reward-policy smoke passed; full pipeline needs adaptation | [cookbook-preference-rlhf](cookbook-preference-rlhf/) |
+| `distillation/on_policy_distillation` | Partial: same-server teacher smoke passed; separate teacher models remain unvalidated | [cookbook-distillation-on-policy](cookbook-distillation-on-policy/) |
 | `search_tool` | Partial: retrieval stack is external | [cookbook-search-tool](cookbook-search-tool/) |
-| `vlm_classifier` | Not supported by this text-only example | [cookbook-vlm-classifier](cookbook-vlm-classifier/) |
+| `vlm_classifier` | Partial API smoke only; real VLM support is not provided by this text-only example | [cookbook-vlm-classifier](cookbook-vlm-classifier/) |
 
 ## Prerequisites
 
@@ -57,6 +57,12 @@ Run the RL smoke:
 
 ```bash
 modal run --detach skyrl-tx/modal_train.py::run_rl
+```
+
+Run the cookbook compatibility smoke suite:
+
+```bash
+modal run --detach skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
 ```
 
 Use detached mode for the training jobs; the image build, model load, JAX
@@ -103,8 +109,8 @@ uv run --extra gpu --extra tinker --extra jax -m skyrl.backends.jax \
   --process-id <rank>
 ```
 
-After the API server reports healthy, rank 0 runs either `sft_client.py` or
-`rl_client.py` against `http://localhost:8000`.
+After the API server reports healthy, rank 0 runs `sft_client.py`,
+`rl_client.py`, or `cookbook_smoke_client.py` against `http://localhost:8000`.
 
 ## Volumes
 
@@ -132,6 +138,9 @@ rl_sampler_checkpoint=file://...
 rl_eval mean_reward=... trajectories=...
 rl_checkpoint_file=... bytes=...
 rl_checkpoint_volume_committed=...
+cookbook_result={"example": "...", "status": "PASS", ...}
+cookbook_summary={"passed": 10, "unexpected_failures": 0}
+cookbook_cookbook_results=.../cookbook_results.jsonl bytes=...
 ```
 
 ## Adjusting the smoke

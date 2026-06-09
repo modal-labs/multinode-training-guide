@@ -248,7 +248,12 @@ def _run_worker(
             _terminate_process_group(process)
 
 
-def _run_client(client_script: str, model_id: str, extra_args: list[str]) -> None:
+def _run_client(
+    client_script: str,
+    model_id: str,
+    extra_args: list[str],
+    results_path: Path | None = None,
+) -> None:
     cmd = [
         "uv",
         "run",
@@ -265,6 +270,8 @@ def _run_client(client_script: str, model_id: str, extra_args: list[str]) -> Non
         model_id,
         *extra_args,
     ]
+    if results_path is not None:
+        cmd.extend(["--results-path", str(results_path)])
     subprocess.run(cmd, cwd=SKYRL_ROOT, check=True)
 
 
@@ -287,6 +294,13 @@ def _commit_and_print_checkpoints(mode: str, run_id: str) -> None:
             f"{mode}_checkpoint_file={run_id}/{relative_path} bytes={_path_size(checkpoint_file)}",
             flush=True,
         )
+    results_path = checkpoint_root / "cookbook_results.jsonl"
+    if results_path.exists():
+        print(
+            f"{mode}_cookbook_results={run_id}/cookbook_results.jsonl bytes={_path_size(results_path)}",
+            flush=True,
+        )
+        print(results_path.read_text(errors="replace"), flush=True)
     checkpoint_volume.commit()
     print(f"{mode}_checkpoint_volume_committed={len(checkpoint_files)}", flush=True)
 
@@ -365,7 +379,10 @@ def _run_tinker_job(
             )
         run_state[run_key] = "running"
         _wait_for_server(process, log_path)
-        _run_client(client_script, model_id, client_args)
+        results_path = None
+        if client_script == "cookbook_smoke_client.py":
+            results_path = Path(CHECKPOINTS_DIR) / mode / run_id / "cookbook_results.jsonl"
+        _run_client(client_script, model_id, client_args, results_path)
         _commit_and_print_checkpoints(mode, run_id)
     finally:
         run_state[run_key] = "done"
@@ -464,6 +481,34 @@ def run_rl_cluster(
     )
 
 
+@app.function(
+    image=image,
+    gpu=f"{GPU_TYPE}:{GPUS_PER_NODE}",
+    volumes={HF_CACHE: hf_cache_volume, CHECKPOINTS_DIR: checkpoint_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=24 * 60 * 60,
+    memory=262144,
+    experimental_options={"efa_enabled": True},
+)
+@modal.experimental.clustered(size=N_NODES, rdma=True)
+def run_cookbook_cluster(
+    run_state: modal.Dict,
+    model_id: str = MODEL_ID,
+    lora_rank: int = 4,
+    gpus_per_node: int = GPUS_PER_NODE,
+) -> None:
+    _run_tinker_job(
+        run_state,
+        mode="cookbook",
+        client_script="cookbook_smoke_client.py",
+        model_id=model_id,
+        client_args=["--lora-rank", str(lora_rank)],
+        gpus_per_node=gpus_per_node,
+        train_micro_batch_size=1,
+        lora_rank=lora_rank,
+    )
+
+
 @app.local_entrypoint()
 def run_sft(
     model_id: str = MODEL_ID,
@@ -475,6 +520,15 @@ def run_sft(
         run_sft_cluster.remote(
             run_state, model_id, steps, lora_rank, learning_rate, GPUS_PER_NODE
         )
+
+
+@app.local_entrypoint()
+def run_cookbook(
+    model_id: str = MODEL_ID,
+    lora_rank: int = 4,
+) -> None:
+    with modal.Dict.ephemeral() as run_state:
+        run_cookbook_cluster.remote(run_state, model_id, lora_rank, GPUS_PER_NODE)
 
 
 @app.local_entrypoint()

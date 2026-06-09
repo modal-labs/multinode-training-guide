@@ -1,6 +1,6 @@
 # Tinker cookbook compatibility: `distillation/on_policy_distillation`
 
-Status: **mostly unsupported as written; partial if converted to same-model no-KL RL**
+Status: **partial: same-server teacher smoke validated; separate teacher models remain unvalidated**
 
 Source recipe: `tinker_cookbook.recipes.distillation.on_policy_distillation`
 
@@ -42,8 +42,26 @@ Only the generic pieces are supported:
 ## Unsupported or risky pieces
 
 As written, the recipe depends on teacher prompt logprobs through
-`compute_logprobs_async` and on using potentially different teacher/student base
-models. The current SkyRL-TX Modal example loads one text model, and SkyRL's
-Tinker limitation docs still mark prompt-logprob/KL workflows as not ready.
-Therefore the actual distillation objective is not supported by this example
-until a dedicated prompt-logprob teacher run is validated.
+`compute_logprobs_async` and can use different teacher/student base models. The
+same-server teacher smoke passed, but the current SkyRL-TX Modal example still
+loads one text model. Treat separate teacher models, larger KL-heavy runs, and
+non-default student/teacher renderer combinations as unvalidated.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.distillation_on_policy`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS** for a same-server teacher. The smoke
+sampled from a checkpoint-backed teacher sampler, called `compute_logprobs` on
+the sampled trajectory, converted the teacher/student logprob difference into an
+advantage, ran one `importance_sampling` update, and applied one optimizer step.
+
+```json
+{"example":"distillation_on_policy","status":"PASS","loss_sum":-232.4375,"loss_values":26,"teacher_logprobs":12,"duration_seconds":48.351}
+```

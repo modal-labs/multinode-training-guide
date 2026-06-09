@@ -44,3 +44,21 @@ This maps directly to the SkyRL-TX path used by the Modal example:
 No backend feature blocks this recipe. The remaining risks are operational:
 dataset download time, checkpoint volume capacity, and the need to use a model
 name/renderer pair that matches the loaded SkyRL-TX model.
+
+## Executed SkyRL-TX smoke
+
+Smoke code: `skyrl-tx/cookbook_smoke_client.py::CookbookSmokeRunner.sl_loop`
+
+Validated with:
+
+```bash
+modal run skyrl-tx/modal_train.py::run_cookbook --lora-rank 4
+```
+
+Recorded result on 2 x `H100:8`: **PASS**. The smoke ran one
+`cross_entropy` forward/backward step, one optimizer step, saved a training-state
+checkpoint, saved sampler weights, and wrote `cookbook_results.jsonl`.
+
+```json
+{"example":"sl_loop","status":"PASS","loss_sum":-31.875,"loss_values":28,"duration_seconds":29.689}
+```
