@@ -10,6 +10,26 @@ It uses `Qwen/Qwen3-8B` by default and exercises both:
 The default topology is 2 nodes × 8 H100 GPUs. Within each node SkyRL-TX uses
 tensor parallelism; across nodes it uses JAX FSDP.
 
+## Tinker cookbook compatibility reports
+
+These notes assess 10 public
+[Tinker cookbook](https://github.com/thinking-machines-lab/tinker-cookbook)
+recipes against this example's pinned SkyRL-TX JAX backend and Modal launch
+shape:
+
+| Cookbook recipe | Status | Report |
+| --- | --- | --- |
+| `sl_loop` | Supported | [cookbook-sl-loop](cookbook-sl-loop/) |
+| `rl_loop` | Supported for default no-KL loop | [cookbook-rl-loop](cookbook-rl-loop/) |
+| `chat_sl` | Supported for text-only chat SFT | [cookbook-chat-sl](cookbook-chat-sl/) |
+| `math_rl` | Supported for default no-KL RL; partial for KL diagnostics | [cookbook-math-rl](cookbook-math-rl/) |
+| `code_rl` | Partial: sandbox infrastructure is external | [cookbook-code-rl](cookbook-code-rl/) |
+| `preference/dpo` | Partial: likely compatible, not validated | [cookbook-preference-dpo](cookbook-preference-dpo/) |
+| `preference/rlhf` | Partial: stages map, full pipeline needs adaptation | [cookbook-preference-rlhf](cookbook-preference-rlhf/) |
+| `distillation/on_policy_distillation` | Mostly unsupported as written | [cookbook-distillation-on-policy](cookbook-distillation-on-policy/) |
+| `search_tool` | Partial: retrieval stack is external | [cookbook-search-tool](cookbook-search-tool/) |
+| `vlm_classifier` | Not supported by this text-only example | [cookbook-vlm-classifier](cookbook-vlm-classifier/) |
+
 ## Prerequisites
 
 - Modal CLI installed and authenticated
