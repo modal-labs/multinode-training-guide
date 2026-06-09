@@ -281,17 +281,29 @@ def _path_size(path: Path) -> int:
     return sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
 
 
+def _checkpoint_artifacts(checkpoint_root: Path) -> list[Path]:
+    archives = sorted(checkpoint_root.rglob("*.tar.gz"))
+    if archives:
+        return archives
+    return sorted(
+        child
+        for child in checkpoint_root.rglob("*")
+        if child.is_file() and child.name != "cookbook_results.jsonl"
+    )
+
+
 def _commit_and_print_checkpoints(mode: str, run_id: str) -> None:
     checkpoint_root = Path(CHECKPOINTS_DIR) / mode / run_id
-    checkpoint_files = sorted(checkpoint_root.rglob("*.tar.gz"))
-    if not checkpoint_files:
+    checkpoint_artifacts = _checkpoint_artifacts(checkpoint_root)
+    if not checkpoint_artifacts:
         raise RuntimeError(
             f"No {mode} checkpoints were written under {checkpoint_root}"
         )
-    for checkpoint_file in checkpoint_files:
-        relative_path = checkpoint_file.relative_to(checkpoint_root)
+    for checkpoint_artifact in checkpoint_artifacts:
+        relative_path = checkpoint_artifact.relative_to(checkpoint_root)
         print(
-            f"{mode}_checkpoint_file={run_id}/{relative_path} bytes={_path_size(checkpoint_file)}",
+            f"{mode}_checkpoint_artifact={run_id}/{relative_path} "
+            f"bytes={_path_size(checkpoint_artifact)}",
             flush=True,
         )
     results_path = checkpoint_root / "cookbook_results.jsonl"
@@ -302,7 +314,7 @@ def _commit_and_print_checkpoints(mode: str, run_id: str) -> None:
         )
         print(results_path.read_text(errors="replace"), flush=True)
     checkpoint_volume.commit()
-    print(f"{mode}_checkpoint_volume_committed={len(checkpoint_files)}", flush=True)
+    print(f"{mode}_checkpoint_volume_committed={len(checkpoint_artifacts)}", flush=True)
 
 
 def _run_tinker_job(
