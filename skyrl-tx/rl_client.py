@@ -149,6 +149,8 @@ def main() -> None:
     parser.add_argument("--samples-per-prompt", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be at least 1 for RL")
 
     service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
     training_client = service_client.create_lora_training_client(

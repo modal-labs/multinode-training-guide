@@ -485,6 +485,8 @@ def run_rl(
     lora_rank: int = 8,
     learning_rate: float = 1e-6,
 ) -> None:
+    if steps < 1:
+        raise ValueError("run_rl requires steps >= 1")
     with modal.Dict.ephemeral() as run_state:
         run_rl_cluster.remote(
             run_state,
