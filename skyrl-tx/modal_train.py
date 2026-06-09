@@ -136,6 +136,33 @@ def _patch_skyrl_checkpointing() -> None:
         "import orbax.checkpoint as ocp\nfrom flax.training import checkpoints\n",
     )
     source = source.replace(
+        """            _broadcast_command(
+                RpcPayload(method=method, kwargs={k: serialize(k, v) for k, v in kwargs.items()}),
+                process_id=self.process_id,
+            )
+        return getattr(super(), method)(**kwargs)
+""",
+        """            _broadcast_command(
+                RpcPayload(method=method, kwargs={k: serialize(k, v) for k, v in kwargs.items()}),
+                process_id=self.process_id,
+            )
+            if method != "__init__":
+                multihost_utils.sync_global_devices(f"SkyRL:Rpc:{method}")
+        return getattr(super(), method)(**kwargs)
+""",
+    )
+    source = source.replace(
+        """        payload: RpcPayload = _broadcast_command(None, process_id=process_id)
+
+        if not hasattr(backend, payload.method):
+""",
+        """        payload: RpcPayload = _broadcast_command(None, process_id=process_id)
+        multihost_utils.sync_global_devices(f"SkyRL:Rpc:{payload.method}")
+
+        if not hasattr(backend, payload.method):
+""",
+    )
+    source = source.replace(
         """    def save_checkpoint(self, output_path: AnyPath, model_id: str) -> None:
         \"\"\"Save training checkpoint using Flax checkpoints.\"\"\"
         checkpoint_data = self._extract_checkpoint_data(model_id)
@@ -167,7 +194,10 @@ def _patch_skyrl_checkpointing() -> None:
         logger.info(f"Saved training checkpoint to {output_path}")
 """,
     )
-    if source.count("orbax_checkpointer=checkpointer") != 1:
+    if (
+        source.count("orbax_checkpointer=checkpointer") != 1
+        or source.count("SkyRL:Rpc:") != 2
+    ):
         raise RuntimeError("Failed to patch SkyRL JAX checkpointing")
     jax_backend_path.write_text(source)
 
