@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportMissingImports=false
 
 import argparse
+import math
 import re
 
 import numpy as np
@@ -10,6 +11,7 @@ import tinker
 from tinker import types
 
 
+RESULT_TIMEOUT_SECONDS = 20 * 60
 STRICT_INTEGER_RE = re.compile(r"-?\d+")
 PROMPTS = [
     ("What is 13 + 29?", "42"),
@@ -39,6 +41,19 @@ def reward_for(response: str, answer: str) -> float:
     if prediction is not None:
         return 0.1
     return 0.0
+
+
+def resolve(future, label: str):
+    return future.result(timeout=RESULT_TIMEOUT_SECONDS)
+
+
+def validate_forward_outputs(result, label: str) -> None:
+    for output in result.loss_fn_outputs:
+        for key, tensor in output.items():
+            for value in tensor.data:
+                scalar = float(value)
+                if not math.isfinite(scalar):
+                    raise RuntimeError(f"Non-finite {label} {key} value: {scalar}")
 
 
 def make_prompt(question: str) -> str:
@@ -82,7 +97,8 @@ def build_rollout_batch(training_client, tokenizer, samples_per_prompt: int, ste
                 top_k=-1,
                 seed=step * 1000 + offset,
             ),
-        ).result()
+        )
+        sample = resolve(sample, f"rl_sample_step_{step}_{offset}")
         for sequence in sample.sequences:
             response_tokens = list(sequence.tokens)
             if not response_tokens:
@@ -93,6 +109,8 @@ def build_rollout_batch(training_client, tokenizer, samples_per_prompt: int, ste
                 old_logprobs = [0.0] * len(response_tokens)
             else:
                 old_logprobs = [float(logprob) for logprob in sequence.logprobs]
+                if not all(math.isfinite(logprob) for logprob in old_logprobs):
+                    old_logprobs = [0.0] * len(response_tokens)
             data.append(make_policy_datum(prompt_tokens, response_tokens, old_logprobs, reward))
             rewards.append(reward)
 
@@ -108,7 +126,7 @@ def main() -> None:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--samples-per-prompt", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
     args = parser.parse_args()
 
     service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
@@ -132,8 +150,10 @@ def main() -> None:
             data,
             "ppo",
             {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
-        ).result()
-        training_client.optim_step(optimizer).result()
+        )
+        forward = resolve(forward, f"rl_step_{step}")
+        validate_forward_outputs(forward, f"rl_step_{step}")
+        resolve(training_client.optim_step(optimizer), f"rl_optim_step_{step}")
         mean_reward = sum(rewards) / len(rewards)
         print(
             f"rl_step={step} mean_reward={mean_reward:.3f} trajectories={len(data)} "
@@ -141,17 +161,22 @@ def main() -> None:
             flush=True,
         )
 
-    state_path = training_client.save_state(name=f"rl_state_step_{args.steps}").result().path
+    state_path = resolve(training_client.save_state(name=f"rl_state_step_{args.steps}"), "rl_save_state").path
     print(f"rl_state_checkpoint={state_path}", flush=True)
     restored_client = service_client.create_training_client_from_state(state_path)
     restored_forward = restored_client.forward_backward(
         data,
         "ppo",
         {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
-    ).result()
+    )
+    restored_forward = resolve(restored_forward, "rl_restored_eval")
+    validate_forward_outputs(restored_forward, "rl_restored_eval")
     print(f"rl_restored_eval_loss_outputs={len(restored_forward.loss_fn_outputs)}", flush=True)
 
-    sampler_path = training_client.save_weights_for_sampler(name=f"rl_sampler_step_{args.steps}").result().path
+    sampler_path = resolve(
+        training_client.save_weights_for_sampler(name=f"rl_sampler_step_{args.steps}"),
+        "rl_save_sampler",
+    ).path
     print(f"rl_sampler_checkpoint={sampler_path}", flush=True)
     eval_data, eval_rewards = build_rollout_batch(training_client, tokenizer, args.samples_per_prompt, args.steps)
     mean_eval_reward = sum(eval_rewards) / len(eval_rewards)

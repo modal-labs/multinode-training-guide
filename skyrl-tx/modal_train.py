@@ -321,7 +321,7 @@ def run_sft_cluster(
     model_id: str = MODEL_ID,
     steps: int = 8,
     lora_rank: int = 8,
-    learning_rate: float = 1e-4,
+    learning_rate: float = 1e-6,
     gpus_per_node: int = GPUS_PER_NODE,
 ) -> None:
     _run_tinker_job(
@@ -359,7 +359,7 @@ def run_rl_cluster(
     steps: int = 4,
     samples_per_prompt: int = 2,
     lora_rank: int = 8,
-    learning_rate: float = 5e-5,
+    learning_rate: float = 1e-6,
     gpus_per_node: int = GPUS_PER_NODE,
 ) -> None:
     _run_tinker_job(
@@ -388,7 +388,7 @@ def run_sft(
     model_id: str = MODEL_ID,
     steps: int = 8,
     lora_rank: int = 8,
-    learning_rate: float = 1e-4,
+    learning_rate: float = 1e-6,
 ) -> None:
     with modal.Dict.ephemeral() as run_state:
         run_sft_cluster.remote(run_state, model_id, steps, lora_rank, learning_rate, GPUS_PER_NODE)
@@ -400,7 +400,7 @@ def run_rl(
     steps: int = 4,
     samples_per_prompt: int = 2,
     lora_rank: int = 8,
-    learning_rate: float = 5e-5,
+    learning_rate: float = 1e-6,
 ) -> None:
     with modal.Dict.ephemeral() as run_state:
         run_rl_cluster.remote(

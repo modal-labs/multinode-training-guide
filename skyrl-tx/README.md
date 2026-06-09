@@ -117,9 +117,11 @@ rl_checkpoint_volume_committed=...
 Both entrypoints expose small training-loop knobs:
 
 ```bash
-modal run --detach skyrl-tx/modal_train.py::run_sft --steps 16 --lora-rank 8
-modal run --detach skyrl-tx/modal_train.py::run_rl --steps 8 --samples-per-prompt 4
+modal run --detach skyrl-tx/modal_train.py::run_sft --steps 16 --lora-rank 8 --learning-rate 1e-6
+modal run --detach skyrl-tx/modal_train.py::run_rl --steps 8 --samples-per-prompt 4 --learning-rate 1e-6
 ```
 
 The clients intentionally use tiny arithmetic datasets so the example validates
-the end-to-end SkyRL-TX path without requiring a full benchmark-scale run.
+the end-to-end SkyRL-TX path without requiring a full benchmark-scale run. The
+default `1e-6` learning rate keeps short LoRA smoke runs stable on the tiny
+batches used here.

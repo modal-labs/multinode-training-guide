@@ -3,10 +3,13 @@ from __future__ import annotations
 # pyright: reportMissingImports=false
 
 import argparse
+import math
 import numpy as np
 import tinker
 from tinker import types
 
+
+RESULT_TIMEOUT_SECONDS = 20 * 60
 
 EXAMPLES = [
     ("What is 17 + 25?", " 42"),
@@ -39,15 +42,24 @@ def make_datum(tokenizer, question: str, answer: str) -> types.Datum:
     )
 
 
-def sum_loss(result) -> float:
+def resolve(future, label: str):
+    return future.result(timeout=RESULT_TIMEOUT_SECONDS)
+
+
+def sum_loss(result, label: str) -> float:
     total = 0.0
     for output in result.loss_fn_outputs:
-        total += float(sum(output["elementwise_loss"].data))
+        for value in output["elementwise_loss"].data:
+            loss = float(value)
+            if not math.isfinite(loss):
+                raise RuntimeError(f"Non-finite {label} loss value: {loss}")
+            total += loss
     return total
 
 
 def eval_loss(training_client, batch: list[types.Datum]) -> float:
-    return sum_loss(training_client.forward_backward(batch, "cross_entropy").result())
+    forward = resolve(training_client.forward_backward(batch, "cross_entropy"), "sft_eval")
+    return sum_loss(forward, "sft_eval")
 
 
 def main() -> None:
@@ -56,7 +68,7 @@ def main() -> None:
     parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--steps", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
     args = parser.parse_args()
 
     service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
@@ -75,17 +87,20 @@ def main() -> None:
     )
 
     for step in range(args.steps):
-        forward = training_client.forward_backward(batch, "cross_entropy").result()
-        training_client.optim_step(optimizer).result()
-        print(f"sft_step={step} loss={sum_loss(forward):.4f}", flush=True)
+        forward = resolve(training_client.forward_backward(batch, "cross_entropy"), f"sft_step_{step}")
+        resolve(training_client.optim_step(optimizer), f"sft_optim_step_{step}")
+        print(f"sft_step={step} loss={sum_loss(forward, f'sft_step_{step}'):.4f}", flush=True)
 
-    state_path = training_client.save_state(name=f"sft_state_step_{args.steps}").result().path
+    state_path = resolve(training_client.save_state(name=f"sft_state_step_{args.steps}"), "sft_save_state").path
     print(f"sft_state_checkpoint={state_path}", flush=True)
     restored_client = service_client.create_training_client_from_state(state_path)
     restored_loss = eval_loss(restored_client, eval_batch)
     print(f"sft_restored_eval_loss={restored_loss:.4f}", flush=True)
 
-    sampler_path = training_client.save_weights_for_sampler(name=f"sft_sampler_step_{args.steps}").result().path
+    sampler_path = resolve(
+        training_client.save_weights_for_sampler(name=f"sft_sampler_step_{args.steps}"),
+        "sft_save_sampler",
+    ).path
     print(f"sft_sampler_checkpoint={sampler_path}", flush=True)
     sampler = training_client.save_weights_and_get_sampling_client(name="sft_smoke")
     prompt = "Solve the arithmetic problem. Answer with only the integer.\nQuestion: What is 6 * 7?\nAnswer:"
@@ -94,7 +109,8 @@ def main() -> None:
         prompt=types.ModelInput.from_ints(prompt_tokens),
         num_samples=1,
         sampling_params=types.SamplingParams(max_tokens=16, temperature=0.0, top_k=1),
-    ).result()
+    )
+    sample = resolve(sample, "sft_sample")
     completion = tokenizer.decode(list(sample.sequences[0].tokens), skip_special_tokens=True)
     print(f"sft_sample={completion!r}", flush=True)
 
