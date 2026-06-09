@@ -93,6 +93,25 @@ def default_run_id(
     return f"deepseek_v4_flash_sft_{digest}"
 
 
+def _pipeline_layout(model_dir: str, pp_size: int) -> str | None:
+    if pp_size <= 1:
+        return None
+
+    with open(os.path.join(model_dir, "config.json")) as f:
+        config = json.load(f)
+    num_layers = config["num_hidden_layers"]
+    base_layers, extra_layers = divmod(num_layers, pp_size)
+    stages = []
+    for stage_idx in range(pp_size):
+        stage_layers = base_layers + int(stage_idx < extra_layers)
+        stages.append(
+            ("E" if stage_idx == 0 else "")
+            + ("t" * stage_layers)
+            + ("L" if stage_idx == pp_size - 1 else "")
+        )
+    return "|".join(stages)
+
+
 DEEPSEEK_V4_CONFIG_PATCH = r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
 try:
     try:
@@ -688,6 +707,9 @@ def _train_model_impl(
         "--eval_iters",
         "0",
     ]
+    pipeline_layout = _pipeline_layout(model_dir, pp_size)
+    if pipeline_layout is not None:
+        megatron_cmd.extend(["--pipeline_model_parallel_layout", pipeline_layout])
     if train_iters > 0:
         megatron_cmd.extend(["--train_iters", str(train_iters)])
     else:
@@ -1015,6 +1037,9 @@ def export_checkpoint(
         "--exist_ok",
         "true",
     ]
+    pipeline_layout = _pipeline_layout(model_dir, pp_size)
+    if pipeline_layout is not None:
+        export_cmd.extend(["--pipeline_model_parallel_layout", pipeline_layout])
     cmd = [
         "torchrun",
         "--no_python",
