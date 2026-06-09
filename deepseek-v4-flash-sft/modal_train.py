@@ -921,6 +921,24 @@ def _make_config_vllm_compatible(config_path: str) -> None:
         json.dump(config, f, indent=2)
 
 
+def _make_vllm_model_view(model_path: str) -> str:
+    """Create a temporary symlinked model view with a vLLM-compatible config."""
+    import shutil
+    import tempfile
+
+    view_dir = tempfile.mkdtemp(prefix="vllm-model-")
+    for name in os.listdir(model_path):
+        src = os.path.join(model_path, name)
+        dst = os.path.join(view_dir, name)
+        if name == "config.json":
+            shutil.copy2(src, dst)
+        else:
+            os.symlink(src, dst, target_is_directory=os.path.isdir(src))
+
+    _make_config_vllm_compatible(os.path.join(view_dir, "config.json"))
+    return view_dir
+
+
 @app.function(
     image=msswift_image,
     gpu="B200:8",
@@ -1472,8 +1490,7 @@ def eval_summarization(
     config_path = f"{model_path}/config.json"
     if not os.path.exists(config_path):
         raise RuntimeError(f"Model not found at {model_path}")
-    _make_config_vllm_compatible(config_path)
-    checkpoints_volume.commit()
+    served_model_path = _make_vllm_model_view(model_path)
 
     server_log_path = "/tmp/vllm-server.log"
     server_log = open(server_log_path, "w")
@@ -1483,7 +1500,7 @@ def eval_summarization(
             "-m",
             "vllm.entrypoints.openai.api_server",
             "--model",
-            model_path,
+            served_model_path,
             "--served-model-name",
             "deepseek-v4-flash-sft",
             "--tensor-parallel-size",
@@ -1568,6 +1585,7 @@ def eval_summarization(
         )
         result["label"] = label
         result["model_path"] = model_path
+        result["served_model_path"] = served_model_path
         result["max_model_len"] = max_model_len
         return result
 
