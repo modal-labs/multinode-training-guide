@@ -21,7 +21,7 @@ WANDB_PROJECT = "deepseek-v4-flash-sft"
 DEFAULT_MAX_EPOCHS = 1
 DEFAULT_MAX_LENGTH = 4096
 DEFAULT_LORA_RANK = 64
-DEFAULT_LORA_ALPHA = 16
+DEFAULT_LORA_ALPHA = 64
 
 TP_SIZE = 1
 PP_SIZE = 1
@@ -1036,7 +1036,8 @@ def export_checkpoint(
     if result.returncode != 0:
         raise RuntimeError(f"megatron export failed (exit {result.returncode})")
 
-    _make_config_vllm_compatible(f"{merged_dir}/config.json")
+    if node_rank == 0:
+        _make_config_vllm_compatible(f"{merged_dir}/config.json")
 
     checkpoints_volume.commit()
     print(f"[export] Merged HF model saved to {merged_dir}")

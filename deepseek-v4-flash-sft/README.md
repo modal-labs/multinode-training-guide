@@ -81,7 +81,7 @@ By default this launches one 8×B200 node with:
 | EP | 8 | One expert-parallel group across the node. |
 | PP | 1 | Increase this when scaling beyond the bring-up shape. |
 | CP | 1 | Increase only for longer-context runs. |
-| LoRA rank | 64 | Raise for quality once the run is stable. |
+| LoRA rank / alpha | 64 / 64 | Increase rank for quality once the run is stable. |
 | Max length | 4096 | DeepSeek-V4 supports 1M context, but start small. |
 
 For a short smoke run that should save after five training steps:
