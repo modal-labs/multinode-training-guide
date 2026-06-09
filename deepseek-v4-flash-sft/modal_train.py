@@ -281,11 +281,17 @@ old = (
     "    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)\n"
     "    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)\n"
     "\n"
+    "    if inverse:\n"
+    "        sin_ = -sin_\n"
+    "\n"
     "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n"
 )
 new = (
     "    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)\n"
     "    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)\n"
+    "\n"
+    "    if inverse:\n"
+    "        sin_ = -sin_\n"
     "\n"
     "    if cos_.size(0) != t.size(0):\n"
     "        repeats = (t.size(0) + cos_.size(0) - 1) // cos_.size(0)\n"
