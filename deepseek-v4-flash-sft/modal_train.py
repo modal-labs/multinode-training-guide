@@ -1199,3 +1199,495 @@ def export_and_eval(
     )
     print(json.dumps(result, indent=2))
     return result
+
+
+# ─── Long-context meeting summarization ──────────────────────────────────────
+
+MEETING_TOPICS = [
+    ("Q3 product roadmap", "finalize feature priorities for next quarter"),
+    ("Customer onboarding overhaul", "redesign the signup-to-value flow"),
+    (
+        "Infrastructure cost reduction",
+        "cut cloud spend by 20% without sacrificing latency",
+    ),
+    ("ML pipeline reliability", "reduce training failures from 15% to under 3%"),
+    ("Hiring plan for H2", "align headcount with revenue targets"),
+]
+
+SPEAKERS = [
+    "Alex Chen (Engineering Lead)",
+    "Maria Santos (Product Manager)",
+    "James Liu (Data Science)",
+    "Rachel Kim (Design)",
+    "David Thompson (Ops/Infra)",
+    "Sarah Johnson (CTO)",
+    "Mike Williams (Sales Lead)",
+]
+
+DISCUSSION_BLOCKS = [
+    "Let me share some context on this. We've been tracking the metrics for the past six weeks and the trend is clear — {topic_detail}. The data shows a 34% improvement when we apply the new approach, but there's a catch: we need at least three sprints to integrate it properly.",
+    "I want to push back a bit here. From the customer perspective, what matters most is time-to-value. Our NPS scores dropped 12 points last quarter specifically because of friction in this area. If we don't address {topic_detail} now, we risk losing two enterprise accounts that are up for renewal in September.",
+    "The technical debt situation is worse than we thought. I ran an audit last week and found that 40% of our test suite is flaky because of shared state. This directly impacts {topic_detail} because we can't ship with confidence. My proposal is a two-week stability sprint before we take on new features.",
+    "From a design standpoint, we've done three rounds of user testing on this. The results are surprisingly consistent — users want fewer steps, not more options. For {topic_detail}, I'd recommend we cut the configuration wizard from seven pages to three and use smart defaults.",
+    "Looking at this from the ops side, our current capacity planning assumes 2x growth by Q4. If {topic_detail} drives the adoption we expect, we'll need to pre-provision infrastructure in at least two new regions. The lead time for that is six weeks minimum.",
+    "I've been talking to the enterprise sales team about this. Three of our top-10 prospects specifically asked about {topic_detail} in their last calls. If we can demo this at the conference in October, we have a strong pipeline to close $2.4M in new ARR.",
+    "Let me add the ML perspective. Our models are currently retrained weekly, but for {topic_detail} to work well, we need near-real-time updates. I've prototyped a streaming approach that reduces latency from 7 days to under 4 hours, but it requires a new serving infrastructure.",
+    "I want to flag a risk. Last time we tried something similar to {topic_detail}, we underestimated the data migration complexity by 3x. I think we need a dedicated workstream just for backwards compatibility.",
+    "From the customer success side, I've been collecting feedback for two months. The number one request — and this directly relates to {topic_detail} — is better visibility into what's happening. They want a dashboard, they want alerts, they want to feel in control.",
+    "The competitive landscape is shifting fast. Two of our main competitors announced features in this space last month. For {topic_detail}, I think we need to be more aggressive with our timeline, even if it means cutting scope on the first release.",
+    "Let me share some numbers. Our current system processes about 10,000 requests per second during peak hours. To support {topic_detail} at scale, we need to handle 10x that without adding more than 50ms of latency. I've been benchmarking three different approaches.",
+    "I spoke with the legal team about this yesterday. There are compliance implications for {topic_detail} that we haven't fully addressed — specifically around data retention and right-to-erasure. We need to loop them in before we finalize the architecture.",
+]
+
+
+def _generate_meeting_transcript(
+    topic_idx: int, target_tokens: int = 60000, seed: int = 42
+) -> tuple[str, str, list[str]]:
+    """Generate a synthetic meeting transcript of approximately target_tokens length.
+
+    Returns (transcript, summary, action_items) where action_items are the
+    planted facts that a good summary should identify.
+    """
+    import random
+
+    rng = random.Random(seed + topic_idx)
+    topic_name, topic_detail = MEETING_TOPICS[topic_idx % len(MEETING_TOPICS)]
+    speakers = SPEAKERS.copy()
+    rng.shuffle(speakers)
+
+    action_items = [
+        f"{speakers[0].split(' (')[0]} will prepare a detailed proposal for {topic_detail} by next Friday",
+        f"{speakers[1].split(' (')[0]} will schedule user research sessions with 5 enterprise customers",
+        f"{speakers[2].split(' (')[0]} will run a cost-benefit analysis comparing the three implementation approaches",
+        f"The team will reconvene in two weeks to review progress on {topic_name}",
+        f"{speakers[3].split(' (')[0]} will create mockups for the revised workflow by end of week",
+    ]
+
+    decisions = [
+        f"The team decided to prioritize {topic_detail} over other Q3 initiatives",
+        f"Budget of $150K approved for infrastructure upgrades related to {topic_name}",
+        "Timeline set: MVP by end of month 1, full release by end of month 3",
+    ]
+
+    # Build transcript header
+    lines = [
+        f"=== Meeting Transcript: {topic_name} ===",
+        "Date: 2026-06-02 | Duration: 90 minutes",
+        f"Participants: {', '.join(speakers)}",
+        "",
+        "--- BEGIN TRANSCRIPT ---",
+        "",
+    ]
+
+    # Generate discussion turns until we hit target length (rough estimate: 1.3 tokens/word)
+    target_words = int(target_tokens / 1.3)
+    current_words = sum(len(line.split()) for line in lines)
+
+    turn = 0
+    planted_decision_at = rng.sample(range(20, 80), len(decisions))
+    planted_action_at = rng.sample(range(60, 120), len(action_items))
+
+    while current_words < target_words:
+        speaker = speakers[turn % len(speakers)]
+        block_idx = rng.randint(0, len(DISCUSSION_BLOCKS) - 1)
+        text = DISCUSSION_BLOCKS[block_idx].format(topic_detail=topic_detail)
+
+        # Add some variation
+        follow_ups = [
+            " Additionally, I've been looking at how other teams handle this and there are some interesting patterns we could adopt.",
+            " I want to emphasize that timing is critical here — every week we delay costs us approximately $40K in opportunity cost.",
+            " One more thing: we should consider the internationalization angle. Our EMEA customers have slightly different requirements.",
+            " Before we move on, I think it's worth noting that the feedback from our beta testers was overwhelmingly positive on the direction we're heading.",
+            " I'd also like to highlight that this connects to the OKRs we set at the beginning of the quarter. We're currently tracking at 60% completion.",
+        ]
+        text += rng.choice(follow_ups)
+
+        # Plant decisions and action items at specific turns
+        for i, decision_turn in enumerate(planted_decision_at):
+            if turn == decision_turn:
+                text += f"\n\n{speakers[0].split(' (')[0]}: So to confirm, {decisions[i].lower()}. Everyone aligned? [All agree]"
+
+        for i, action_turn in enumerate(planted_action_at):
+            if turn == action_turn:
+                text += f"\n\n{speakers[0].split(' (')[0]}: Great. So the action item is: {action_items[i]}. Can you confirm? \n{speakers[i % len(speakers)].split(' (')[0]}: Yes, confirmed."
+
+        line = f"\n{speaker}: {text}\n"
+        lines.append(line)
+        current_words += len(line.split())
+        turn += 1
+
+    lines.append("\n--- END TRANSCRIPT ---")
+
+    transcript = "\n".join(lines)
+
+    summary = f"""## Meeting Summary: {topic_name}
+
+### Key Decisions
+{chr(10).join(f"- {d}" for d in decisions)}
+
+### Action Items
+{chr(10).join(f"- {a}" for a in action_items)}
+
+### Discussion Highlights
+The team discussed {topic_detail} in depth over a 90-minute session. Key themes included technical feasibility, customer impact, competitive pressure, and resource allocation. The consensus was to move forward aggressively while managing risk through phased delivery."""
+
+    return transcript, summary, action_items
+
+
+@app.function(
+    image=download_image,
+    volumes={DATA_DIR: data_volume},
+    timeout=3600,
+)
+def prepare_summary_dataset(
+    data_folder: str = "meeting_summaries",
+    num_examples: int = 5,
+    target_tokens: int = 60000,
+):
+    """Generate synthetic long-context meeting transcripts for SFT.
+
+    Each example has a ~60K token transcript as input and a structured
+    summary with decisions + action items as the target.
+    """
+    data_volume.reload()
+    output_dir = f"{DATA_DIR}/{data_folder}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_path = f"{output_dir}/training.jsonl"
+    with open(output_path, "w") as f:
+        for i in range(num_examples):
+            transcript, summary, _ = _generate_meeting_transcript(
+                topic_idx=i, target_tokens=target_tokens, seed=42 + i
+            )
+            example = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Below is a meeting transcript. Please provide a concise summary "
+                            "including: (1) key decisions made, (2) action items with owners, "
+                            "and (3) a brief overview of the main discussion points.\n\n"
+                            f"{transcript}"
+                        ),
+                    },
+                    {"role": "assistant", "content": summary},
+                ]
+            }
+            f.write(json.dumps(example) + "\n")
+
+    data_volume.commit()
+    print(f"Wrote {num_examples} long-context examples to {output_path}")
+    print(f"Target tokens per example: {target_tokens}")
+    return {"path": output_path, "count": num_examples}
+
+
+def _eval_summarization(
+    chat_fn,
+    num_examples: int = 3,
+    target_tokens: int = 60000,
+    max_gen_tokens: int = 1024,
+) -> dict:
+    """Evaluate summarization quality by checking if planted facts are recalled."""
+    results = []
+    for i in range(num_examples):
+        transcript, _gold_summary, action_items = _generate_meeting_transcript(
+            topic_idx=i, target_tokens=target_tokens, seed=42 + i
+        )
+        prompt = (
+            "Below is a meeting transcript. Please provide a concise summary "
+            "including: (1) key decisions made, (2) action items with owners, "
+            "and (3) a brief overview of the main discussion points.\n\n"
+            f"{transcript}"
+        )
+        response = chat_fn(prompt, max_tokens=max_gen_tokens)
+        print(f"\n  [Example {i + 1}] Response preview: {response[:300]}...")
+
+        # Check recall of planted action items (simple keyword matching)
+        recalled = 0
+        for item in action_items:
+            # Check if key parts of the action item appear in the response
+            key_words = [w for w in item.split() if len(w) > 4][:3]
+            if any(w.lower() in response.lower() for w in key_words):
+                recalled += 1
+
+        recall = recalled / len(action_items) if action_items else 0.0
+        results.append(
+            {
+                "example": i,
+                "recall": recall,
+                "recalled": recalled,
+                "total": len(action_items),
+            }
+        )
+        print(
+            f"  [Example {i + 1}] Action item recall: {recalled}/{len(action_items)} ({recall:.0%})"
+        )
+
+    avg_recall = sum(r["recall"] for r in results) / len(results) if results else 0.0
+    print(f"\n=== Summarization Recall: {avg_recall:.1%} ===")
+    return {"avg_recall": avg_recall, "results": results}
+
+
+@app.function(
+    image=vllm_image,
+    gpu="B200:8",
+    volumes={HF_CACHE: hf_cache_vol, CHECKPOINTS_DIR: checkpoints_volume},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=86400,
+    retries=1,
+    memory=1048576,
+    ephemeral_disk=2048000,
+)
+def eval_summarization(
+    model_path: str | None = None,
+    run_id: str | None = None,
+    max_model_len: int = 65536,
+    num_eval_examples: int = 3,
+    target_tokens: int = 60000,
+    label: str = "baseline",
+):
+    """Deploy a model with vLLM and evaluate on long-context summarization.
+
+    If model_path is None and run_id is None, uses the base HF model.
+    If run_id is provided, uses the merged checkpoint at /checkpoints/{run_id}/merged-hf.
+    """
+    import subprocess
+    import time
+    import traceback
+    import urllib.error
+    import urllib.request
+
+    from huggingface_hub import snapshot_download
+
+    hf_cache_vol.reload()
+    checkpoints_volume.reload()
+
+    if model_path is None and run_id is not None:
+        model_path = f"{CHECKPOINTS_DIR}/{run_id}/merged-hf"
+    elif model_path is None:
+        model_path = snapshot_download(
+            HF_MODEL, local_files_only=True, token=os.environ.get("HF_TOKEN")
+        )
+
+    config_path = f"{model_path}/config.json"
+    if not os.path.exists(config_path):
+        raise RuntimeError(f"Model not found at {model_path}")
+    _make_config_vllm_compatible(config_path)
+    checkpoints_volume.commit()
+
+    server_log_path = "/tmp/vllm-server.log"
+    server_log = open(server_log_path, "w")
+    server_proc = subprocess.Popen(
+        [
+            "python",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            model_path,
+            "--served-model-name",
+            "deepseek-v4-flash-sft",
+            "--tensor-parallel-size",
+            str(GPUS_PER_NODE),
+            "--max-model-len",
+            str(max_model_len),
+            "--gpu-memory-utilization",
+            "0.92",
+            "--dtype",
+            "bfloat16",
+            "--kv-cache-dtype",
+            "fp8",
+            "--moe-backend",
+            "triton",
+            "--safetensors-load-strategy",
+            "prefetch",
+            "--enforce-eager",
+            "--port",
+            "8000",
+            "--no-enable-log-requests",
+        ],
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    print(f"[{label}] Waiting for vLLM server (max_model_len={max_model_len})...")
+    for attempt in range(720):
+        try:
+            urllib.request.urlopen("http://localhost:8000/health", timeout=5)
+            print(f"[{label}] Server ready after ~{attempt * 5}s")
+            break
+        except Exception:
+            if server_proc.poll() is not None:
+                server_log.flush()
+                with open(server_log_path) as f:
+                    tail = f.read()[-20000:]
+                server_log.close()
+                raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
+            time.sleep(5)
+    else:
+        server_proc.kill()
+        server_proc.wait(timeout=30)
+        server_log.flush()
+        with open(server_log_path) as f:
+            tail = f.read()[-20000:]
+        server_log.close()
+        raise RuntimeError(f"vLLM server failed to start:\n{tail}")
+
+    try:
+
+        def _chat(prompt: str, max_tokens: int = 1024) -> str:
+            body = json.dumps(
+                {
+                    "model": "deepseek-v4-flash-sft",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                }
+            ).encode()
+            req = urllib.request.Request(
+                "http://localhost:8000/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=300)
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode(errors="replace")
+                print(f"[_chat] HTTP {exc.code}: {err_body[:2000]}")
+                raise RuntimeError(
+                    f"vLLM returned HTTP {exc.code}: {err_body[:500]}"
+                ) from None
+            return json.loads(resp.read())["choices"][0]["message"]["content"]
+
+        print(f"\n=== {label.upper()} Summarization Eval ===")
+        result = _eval_summarization(
+            _chat,
+            num_examples=num_eval_examples,
+            target_tokens=target_tokens,
+            max_gen_tokens=1024,
+        )
+        result["label"] = label
+        result["model_path"] = model_path
+        result["max_model_len"] = max_model_len
+        return result
+
+    except Exception:
+        traceback.print_exc()
+        print("\n=== vLLM server log (last 50000 chars) ===")
+        try:
+            server_log.flush()
+            with open(server_log.name) as _f:
+                log_text = _f.read()
+            print(log_text[-50000:])
+        except Exception as log_err:
+            print(f"Could not read server log: {log_err}")
+        raise
+    finally:
+        if server_proc.poll() is None:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+                server_proc.wait(timeout=30)
+        server_proc.wait(timeout=30)
+        server_log.close()
+
+
+@app.local_entrypoint()
+def long_context_loop(
+    run_id: str = "longctx-60k-summary",
+    data_folder: str = "meeting_summaries",
+    train_iters: int = 5,
+    save_interval: int = 5,
+    max_length: int = 65536,
+    num_eval_examples: int = 2,
+    target_tokens: int = 60000,
+    checkpoint_step: int = 5,
+    tp_size: int = TP_SIZE,
+    ep_size: int = EP_SIZE,
+    pp_size: int = PP_SIZE,
+    cp_size: int = CP_SIZE,
+):
+    """Full long-context loop: baseline eval → train → export → post-training eval."""
+    print("=" * 60)
+    print("LONG-CONTEXT SUMMARIZATION LOOP")
+    print(f"  run_id: {run_id}")
+    print(f"  target tokens: {target_tokens}")
+    print(f"  train iters: {train_iters}")
+    print("=" * 60)
+
+    # Step 1: Prepare dataset
+    print("\n[Step 1/5] Preparing long-context dataset...")
+    prepare_summary_dataset.remote(
+        data_folder=data_folder,
+        num_examples=max(5, train_iters),
+        target_tokens=target_tokens,
+    )
+
+    # Step 2: Baseline eval (base model)
+    print("\n[Step 2/5] Running BASELINE eval (pre-training)...")
+    baseline_result = eval_summarization.remote(
+        model_path=None,
+        run_id=None,
+        max_model_len=max_length,
+        num_eval_examples=num_eval_examples,
+        target_tokens=target_tokens,
+        label="baseline",
+    )
+    print(f"  Baseline recall: {baseline_result['avg_recall']:.1%}")
+
+    # Step 3: Train
+    print(f"\n[Step 3/5] Training for {train_iters} iters on {data_folder}...")
+    train_result = train_model.remote(
+        run_id=run_id,
+        data_folder=data_folder,
+        train_iters=train_iters,
+        save_interval=save_interval,
+        max_length=max_length,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        global_batch_size=1,
+        micro_batch_size=1,
+    )
+    print(f"  Training done: {train_result}")
+
+    # Step 4: Export
+    print(f"\n[Step 4/5] Exporting checkpoint (step {checkpoint_step})...")
+    export_checkpoint.remote(
+        run_id=run_id,
+        checkpoint_step=checkpoint_step,
+        tp_size=tp_size,
+        ep_size=ep_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+    )
+
+    # Step 5: Post-training eval
+    print("\n[Step 5/5] Running POST-TRAINING eval...")
+    posttrain_result = eval_summarization.remote(
+        model_path=None,
+        run_id=run_id,
+        max_model_len=max_length,
+        num_eval_examples=num_eval_examples,
+        target_tokens=target_tokens,
+        label="post-training",
+    )
+    print(f"  Post-training recall: {posttrain_result['avg_recall']:.1%}")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("RESULTS COMPARISON")
+    print(f"  Baseline recall:      {baseline_result['avg_recall']:.1%}")
+    print(f"  Post-training recall: {posttrain_result['avg_recall']:.1%}")
+    delta = posttrain_result["avg_recall"] - baseline_result["avg_recall"]
+    print(f"  Delta:                {delta:+.1%}")
+    print("=" * 60)
+
+    return {
+        "baseline": baseline_result,
+        "post_training": posttrain_result,
+        "delta": delta,
+    }
