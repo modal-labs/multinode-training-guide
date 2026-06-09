@@ -175,6 +175,7 @@ class CookbookSmokeRunner:
         )
         self.tokenizer = self.training_client.get_tokenizer()
         self.model_name = model_name
+        self.lora_rank = lora_rank
 
     def run_cross_entropy_step(self, datum: types.Datum, label: str) -> dict[str, float]:
         forward = resolve(
@@ -270,7 +271,7 @@ class CookbookSmokeRunner:
     def preference_rlhf(self) -> dict[str, float | str]:
         reward_client = self.service_client.create_lora_training_client(
             base_model=self.model_name,
-            rank=4,
+            rank=self.lora_rank,
         )
         reward_tokenizer = reward_client.get_tokenizer()
         reward_datum = completion_datum(
