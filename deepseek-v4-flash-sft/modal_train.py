@@ -277,34 +277,23 @@ from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py")
 text = path.read_text()
-old = (
-    "    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)\n"
-    "    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)\n"
-    "\n"
-    "    if inverse:\n"
-    "        sin_ = -sin_\n"
-    "\n"
-    "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n"
-)
-new = (
-    "    cos_ = (torch.cos(freqs) * mscale).to(t.dtype)\n"
-    "    sin_ = (torch.sin(freqs) * mscale).to(t.dtype)\n"
-    "\n"
-    "    if inverse:\n"
-    "        sin_ = -sin_\n"
-    "\n"
-    "    if cos_.size(0) != t.size(0):\n"
-    "        repeats = (t.size(0) + cos_.size(0) - 1) // cos_.size(0)\n"
-    "        repeat_shape = [1] * cos_.dim()\n"
-    "        repeat_shape[0] = repeats\n"
-    "        cos_ = cos_.repeat(*repeat_shape)[: t.size(0)]\n"
-    "        sin_ = sin_.repeat(*repeat_shape)[: t.size(0)]\n"
-    "\n"
-    "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n"
-)
-if old not in text:
-    raise RuntimeError("Megatron RoPE CP patch target not found")
-path.write_text(text.replace(old, new))
+if "if cos_.size(0) != t.size(0):" not in text:
+    lines = text.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if "t = (t * cos_)" in line:
+            lines[idx:idx] = [
+                "    if cos_.size(0) != t.size(0):\n",
+                "        repeats = (t.size(0) + cos_.size(0) - 1) // cos_.size(0)\n",
+                "        repeat_shape = [1] * cos_.dim()\n",
+                "        repeat_shape[0] = repeats\n",
+                "        cos_ = cos_.repeat(*repeat_shape)[: t.size(0)]\n",
+                "        sin_ = sin_.repeat(*repeat_shape)[: t.size(0)]\n",
+                "\n",
+            ]
+            break
+    else:
+        raise RuntimeError("Megatron RoPE CP patch target not found")
+    path.write_text("".join(lines))
 PY"""
 MCORE_DSV4_CP_ROPE_VERIFY = r"""python - <<'PY'
 from pathlib import Path
