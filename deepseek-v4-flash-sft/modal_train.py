@@ -470,8 +470,8 @@ new = '''    sq, b, np_, hn = query.size()
 
     kv_t = kv_full.permute(1, 0, 2)
     sink = attn_sink.view(1, np_, 1, 1).float()
-    output_chunks = []
-    seq_chunk = 16
+    output_full = torch.empty_like(query)
+    seq_chunk = 8
 
     for start in range(0, sq, seq_chunk):
         end = min(start + seq_chunk, sq)
@@ -498,10 +498,10 @@ new = '''    sq, b, np_, hn = query.size()
 
         output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_g)
         output = output.to(query.dtype)
-        output_chunks.append(output.permute(2, 0, 1, 3))
+        output_full[start:end] = output.permute(2, 0, 1, 3)
         del attn_weights, kv_gathered, kv_g, output, q, safe_indices, safe_indices_exp
 
-    return torch.cat(output_chunks, dim=0).reshape(sq, b, np_ * hn)
+    return output_full.reshape(sq, b, np_ * hn)
 '''
 if old not in text:
     raise RuntimeError("DeepSeek CSA unfused attention patch target not found")
@@ -511,8 +511,8 @@ MCORE_CSA_CHUNKED_UNFUSED_VERIFY = r"""python - <<'PY'
 from pathlib import Path
 
 text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/csa.py").read_text()
-assert "seq_chunk = 16" in text
-assert "output_chunks" in text
+assert "seq_chunk = 8" in text
+assert "torch.empty_like(query)" in text
 PY"""
 MCORE_DSV4_CP_ROPE_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -563,16 +563,15 @@ if "rope_chunk = 1024" not in text:
         if line == "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n":
             lines[idx : idx + 1] = [
                 "    if t.size(0) > 4096:\n",
-                "        output_chunks = []\n",
+                "        output = torch.empty_like(t)\n",
                 "        rope_chunk = 1024\n",
                 "        for start in range(0, t.size(0), rope_chunk):\n",
                 "            end = min(start + rope_chunk, t.size(0))\n",
                 "            t_chunk = t[start:end]\n",
-                "            output_chunks.append(\n",
+                "            output[start:end] = (\n",
                 "                (t_chunk * cos_[start:end])\n",
                 "                + (_rotate_half(t_chunk, rotary_interleaved) * sin_[start:end])\n",
                 "            )\n",
-                "        output = torch.cat(output_chunks, dim=0)\n",
                 "        if t_pass.numel() == 0:\n",
                 "            return output\n",
                 "        return torch.cat((output, t_pass), dim=-1)\n",
@@ -592,7 +591,7 @@ text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common
 assert "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" in text
 assert "if cos_.size(0) != t.size(0):" in text
 assert "rope_chunk = 1024" in text
-assert "output_chunks = []" in text
+assert "torch.empty_like(t)" in text
 PY"""
 
 download_image = (
