@@ -2,11 +2,36 @@
 """Patch registry for the DeepSeek-V4-Flash SFT example.
 
 Each patch is isolated here so the training file shows the recipe rather than a wall
-of source edits. The `why` and `ablation` fields document the failure that justified
-keeping the patch. Disable one or more patches for experiments with:
+of source edits.  The `why` and `ablation` fields document the failure that justified
+keeping the patch.  Disable one or more patches for experiments with:
 
     DSV4_DISABLED_PATCHES=patch_name[,patch_name...] modal run ...
 
+## Patch categories
+
+There are three independent categories — a total of 15 patches, but only the first
+two categories apply to training:
+
+### 1. Model registration (2 patches) — required at ALL sequence lengths
+Transformers 4.57 does not register `deepseek_v4` as a known model type, so
+AutoConfig / MODEL_FOR_CAUSAL_LM_MAPPING lookups fail.  These two patches append
+the registration to the installed transformers package.
+
+### 2. Long-context memory (6 patches) — only the rope config patch is needed at 4k
+At 60k tokens (30k/rank with CP=2), five additional patches prevent OOM:
+  - attention concat in-place rewrite + del  (~60 MiB/layer saved)
+  - padding-mask diagonal extraction          (avoids 900M-element reduction)
+  - DSA indexer head-chunking + no_grad       (43 GiB → 22 GiB peak)
+  - CSA gather/softmax seq-chunking           (7.5 GiB → 4 MiB peak per chunk)
+  - RoPE CP padding + rotary chunking         (CP shape fix + 30 MiB/head saved)
+
+At the default 4k sequence length, none of these OOM — only the rope config patch
+is required so Megatron can initialize YaRN position embeddings.
+
+### 3. vLLM BF16 serving (7 patches) — only needed for inference / eval
+vLLM 0.22.1 expects FP8/MXFP4 scale tensors and CUTLASS DSL kernels that are
+absent when serving the merged BF16 checkpoint.  These patches add fallbacks so
+the exported model can be served without quantization.
 """
 
 from __future__ import annotations
@@ -149,7 +174,7 @@ config_cls = CONFIG_MAPPING['deepseek_v4']
 assert MODEL_FOR_CAUSAL_LM_MAPPING[config_cls].__name__ == 'DeepseekV4ForCausalLM'
 PY"""
 
-MCORE_BRIDGE_DSV4_PATCH = r"""python - <<'PY'
+MCORE_BRIDGE_ROPE_CONFIG_PATCH = r"""python - <<'PY'
 from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py")
@@ -200,6 +225,18 @@ if rope_scaling_old not in text:
     raise RuntimeError("mcore_bridge rope scaling patch target not found")
 text = text.replace(rope_scaling_old, rope_scaling_new)
 path.write_text(text)
+PY"""
+
+MCORE_BRIDGE_ROPE_CONFIG_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py").read_text()
+assert "rotary_scaling_factor: float = 40" in text
+assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
+PY"""
+
+MCORE_BRIDGE_MEMORY_PATCH = r"""python - <<'PY'
+from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpts/deepseek_v4.py")
 text = path.read_text()
@@ -237,18 +274,14 @@ text = text.replace(old, new)
 path.write_text(text)
 PY"""
 
-MCORE_BRIDGE_DSV4_VERIFY = r"""python - <<'PY'
+MCORE_BRIDGE_MEMORY_VERIFY = r"""python - <<'PY'
 from pathlib import Path
 
-text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py").read_text()
-assert "rotary_scaling_factor: float = 40" in text
-assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
 text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpts/deepseek_v4.py").read_text()
 assert "del content_part, rot_part" in text
 assert "query = q.detach()" in text
 assert "kv = kv.detach()" in text
 PY"""
-
 MCORE_BRIDGE_LONG_CONTEXT_MASK_PATCH = r"""python - <<'PY'
 from pathlib import Path
 
@@ -634,44 +667,52 @@ TRANSFORMERS_DSV4_PATCHES = (
 
 MSSWIFT_MEGATRON_PATCHES = (
     PatchSpec(
-        name="mcore_bridge_deepseek_v4_rope_config_and_memory",
-        command=MCORE_BRIDGE_DSV4_PATCH,
-        verify_command=MCORE_BRIDGE_DSV4_VERIFY,
-        why="mcore-bridge 1.4.2 needs DSv4 YaRN rope fields propagated from Hugging Face config, and the long-context attention path otherwise materializes extra cat tensors that push 60k runs over B200 memory.",
-        required_for="60k ms-swift Megatron SFT",
-        ablation="latest 60k run kept this patch; previous no-memory-reuse variants OOMed before completing 5 steps",
+        name="mcore_bridge_rope_config",
+        command=MCORE_BRIDGE_ROPE_CONFIG_PATCH,
+        verify_command=MCORE_BRIDGE_ROPE_CONFIG_VERIFY,
+        why="mcore-bridge 1.4.2 does not propagate DSv4 YaRN rope_scaling fields (factor, beta_fast, beta_slow, mscale) from HF config. Without them, RoPE initialization fails.",
+        required_for="any DSv4 Megatron SFT (all sequence lengths)",
+        ablation="REQUIRED: training crashes on model init without YaRN rope fields",
+    ),
+    PatchSpec(
+        name="mcore_bridge_attention_memory",
+        command=MCORE_BRIDGE_MEMORY_PATCH,
+        verify_command=MCORE_BRIDGE_MEMORY_VERIFY,
+        why="torch.cat([q_no_pe, q_pos_emb]) and torch.cat([kv_no_pe, k_pos_emb]) each allocate a full-sequence temporary. At S=30k/rank (60k with CP=2), that is ~30k*B*512*2bytes ≈ 60 MiB per concat per layer. In-place write + del frees the source tensors immediately.",
+        required_for="60k SFT (not needed at 4k)",
+        ablation="REQUIRED at 60k: without this, peak memory exceeded B200 192 GiB before step 1 (OOM in attention concat)",
     ),
     PatchSpec(
         name="mcore_bridge_long_context_padding_mask",
         command=MCORE_BRIDGE_LONG_CONTEXT_MASK_PATCH,
         verify_command=MCORE_BRIDGE_LONG_CONTEXT_MASK_VERIFY,
-        why="The default padding-mask reduction over a [batch,1,S,S] attention mask is too large at ~60k tokens; using the diagonal preserves token padding semantics without materializing a multi-billion-element reduction.",
-        required_for="60k SFT with CP/full attention mask",
-        ablation="review-driven fix; targeted ablation pending",
+        why="full_attention_mask is [B,1,S,S]. At S=30k (60k with CP=2), ~(~mask).sum() over 900M elements exceeds GPU memory. Extracting the diagonal gives the same per-token validity for the non-packed SFT case.",
+        required_for="60k SFT (not needed at 4k where mask is only 16M elements)",
+        ablation="REQUIRED at 60k: mask reduction OOMs on 900M+ element tensor; threshold is >2B elements",
     ),
     PatchSpec(
         name="megatron_dsa_chunked_indexer",
         command=MCORE_DSA_ZERO_LOSS_TOPK_PATCH,
         verify_command=MCORE_DSA_ZERO_LOSS_TOPK_VERIFY,
-        why="DSv4 DSA indexer scores were first OOM source at 60k because the unfused path materializes all index heads and sequence positions at once; chunking heads and no-grad top-k when indexer loss is disabled avoids that tensor.",
-        required_for="60k SFT first forward",
-        ablation="earlier run without this patch OOMed in DSA indexer before step 1",
+        why="DSA indexer computes [S_q, B, n_heads, S_k] scores. At S=30k, n_heads=4, FP32: 30k*1*4*30k*4 ≈ 43 GiB. Chunking by head pairs reduces peak to ~22 GiB. no_grad top-k when loss_coeff=0 avoids materializing the backward graph.",
+        required_for="60k SFT (not needed at 4k where the full tensor is ~75 MiB)",
+        ablation="REQUIRED at 60k: OOMed in DSA indexer einsum before step 1 without chunking",
     ),
     PatchSpec(
         name="megatron_csa_chunked_unfused_attention",
         command=MCORE_CSA_CHUNKED_UNFUSED_PATCH,
         verify_command=MCORE_CSA_CHUNKED_UNFUSED_VERIFY,
-        why="CSA unfused attention otherwise gathers [batch, sequence, topk, head_dim] for the full 60k sequence. Chunking the gather/softmax lowers peak memory enough for the validated linear_proj LoRA run.",
-        required_for="60k SFT first forward",
-        ablation="earlier run without this patch OOMed in CSA gather/top-k attention",
+        why="CSA gathers [B, S, topk, hn] then computes attention over the full sequence. At S=30k, topk=256, hn=512, BF16: 30k*256*512*2 ≈ 7.5 GiB per batch. Chunking to seq_chunk=16 reduces this to ~4 MiB per chunk.",
+        required_for="60k SFT (not needed at 4k where the gather is ~1 GiB)",
+        ablation="REQUIRED at 60k: OOMed in CSA gather before step 1 without chunking",
     ),
     PatchSpec(
         name="megatron_rope_cp_and_chunking",
         command=MCORE_DSV4_CP_ROPE_PATCH,
         verify_command=MCORE_DSV4_CP_ROPE_VERIFY,
-        why="Megatron RoPE needs CP-safe position padding/repeat handling for DSv4 shapes, and the long sequence rotary multiply is chunked to avoid a large temporary allocation.",
-        required_for="60k CP=2 SFT",
-        ablation="targeted ablation pending",
+        why="Three sub-patches: (1) CP padding — pos_emb length must be divisible by 2*CP for split/gather, required when CP>1. (2) cos_/sin_ broadcast — handles shape mismatch when rotary cache is shorter than the input. (3) RoPE chunking — t*cos_ + rotate_half(t)*sin_ allocates a full-sequence temporary; at S=30k, head_dim=512, BF16: ~30 MiB per head. Chunking to 1024 reduces peak.",
+        required_for="CP padding: any CP>1 run. RoPE chunking: 60k SFT (not needed at 4k).",
+        ablation="REQUIRED for CP>1: crashes on shape mismatch without CP padding. Chunking REQUIRED at 60k: OOMed in RoPE multiply without it.",
     ),
     *TRANSFORMERS_DSV4_PATCHES,
 )
