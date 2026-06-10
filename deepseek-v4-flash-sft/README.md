@@ -82,6 +82,7 @@ By default this launches one 8×B200 node with:
 | PP | 1 | Increase this when scaling beyond the bring-up shape. |
 | CP | 1 | Increase only for longer-context runs. |
 | LoRA rank / alpha | 64 / 64 | Increase rank for quality once the run is stable. |
+| LoRA target modules | `linear_proj` | Attention output projection adapters keep long-context memory viable. |
 | Max length | 4096 | DeepSeek-V4 supports 1M context, but start small. |
 
 For a short smoke run that should save after five training steps:
@@ -109,6 +110,10 @@ The model-parallel product `TP × EP × PP × CP` must divide `N_NODES × 8`. Ke
 DeepSeek-V4-Flash until MLA tensor parallelism is supported for the DSv4 hybrid attention path.
 `modal_train.py` pins the Megatron-Core dev commit that provides the DSv4 hybrid attention module
 required by `mcore-bridge`.
+
+The long-context memory patches in this example are validated for the default `linear_proj` LoRA
+target. If you broaden `--target-modules`, re-check gradient flow and memory use before relying on
+the run for training quality.
 
 ## Optional W&B logging
 

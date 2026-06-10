@@ -22,7 +22,7 @@ DEFAULT_MAX_EPOCHS = 1
 DEFAULT_MAX_LENGTH = 4096
 DEFAULT_LORA_RANK = 64
 DEFAULT_LORA_ALPHA = 64
-DEFAULT_TARGET_MODULES = "all-linear"
+DEFAULT_TARGET_MODULES = "linear_proj"
 
 TP_SIZE = 1
 PP_SIZE = 1
@@ -284,7 +284,7 @@ if old not in text:
 text = text.replace(old, new)
 old = "            query = torch.cat([q_no_pe, q_pos_emb], dim=-1)\n"
 new = (
-    "            query = q.clone()\n"
+    "            query = q.detach()\n"
     "            query[..., q_no_pe.shape[-1] :] = q_pos_emb\n"
     "            del q_no_pe, q_pos_emb\n"
 )
@@ -293,7 +293,7 @@ if old not in text:
 text = text.replace(old, new)
 old = "            kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)\n"
 new = (
-    "            kv = kv.clone()\n"
+    "            kv = kv.detach()\n"
     "            kv[..., kv_no_pe.shape[-1] :] = k_pos_emb\n"
     "            del kv_no_pe, k_pos_emb\n"
     "            kv = kv.unsqueeze(-2)\n"
@@ -311,8 +311,8 @@ assert "rotary_scaling_factor: float = 40" in text
 assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
 text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpts/deepseek_v4.py").read_text()
 assert "del content_part, rot_part" in text
-assert "query = q.clone()" in text
-assert "kv = kv.clone()" in text
+assert "query = q.detach()" in text
+assert "kv = kv.detach()" in text
 PY"""
 MCORE_BRIDGE_LONG_CONTEXT_MASK_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -468,10 +468,10 @@ old = '''    sq, b, np_, hn = query.size()
 '''
 new = '''    sq, b, np_, hn = query.size()
 
-    kv_t = kv_full.permute(1, 0, 2)
+    kv_t = kv_full.detach().permute(1, 0, 2)
     sink = attn_sink.view(1, np_, 1, 1).float()
-    output_full = torch.empty_like(query)
-    seq_chunk = 8
+    output_full = query.detach()
+    seq_chunk = 16
 
     for start in range(0, sq, seq_chunk):
         end = min(start + seq_chunk, sq)
@@ -482,7 +482,7 @@ new = '''    sq, b, np_, hn = query.size()
             kv_t.unsqueeze(1).expand(-1, end - start, -1, -1), dim=2, index=safe_indices_exp
         )
 
-        q = query[start:end].permute(1, 2, 0, 3)
+        q = query[start:end].detach().permute(1, 2, 0, 3)
         kv_g = kv_gathered
         scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g).float() * softmax_scale
         invalid_mask = (topk_chunk < 0).unsqueeze(1)
@@ -511,8 +511,8 @@ MCORE_CSA_CHUNKED_UNFUSED_VERIFY = r"""python - <<'PY'
 from pathlib import Path
 
 text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/csa.py").read_text()
-assert "seq_chunk = 8" in text
-assert "torch.empty_like(query)" in text
+assert "seq_chunk = 16" in text
+assert "output_full" in text
 PY"""
 MCORE_DSV4_CP_ROPE_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -563,14 +563,13 @@ if "rope_chunk = 1024" not in text:
         if line == "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n":
             lines[idx : idx + 1] = [
                 "    if t.size(0) > 4096:\n",
-                "        output = torch.empty_like(t)\n",
+                "        output = t.detach()\n",
                 "        rope_chunk = 1024\n",
                 "        for start in range(0, t.size(0), rope_chunk):\n",
                 "            end = min(start + rope_chunk, t.size(0))\n",
-                "            t_chunk = t[start:end]\n",
-                "            output[start:end] = (\n",
-                "                (t_chunk * cos_[start:end])\n",
-                "                + (_rotate_half(t_chunk, rotary_interleaved) * sin_[start:end])\n",
+                "            t_chunk = t[start:end].detach()\n",
+                "            output[start:end] = (t_chunk * cos_[start:end]) + (\n",
+                "                _rotate_half(t_chunk, rotary_interleaved) * sin_[start:end]\n",
                 "            )\n",
                 "        if t_pass.numel() == 0:\n",
                 "            return output\n",
@@ -591,7 +590,7 @@ text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common
 assert "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" in text
 assert "if cos_.size(0) != t.size(0):" in text
 assert "rope_chunk = 1024" in text
-assert "torch.empty_like(t)" in text
+assert "output = t.detach()" in text
 PY"""
 
 download_image = (
