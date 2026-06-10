@@ -512,7 +512,9 @@ def _train_model_impl(
                 run_id,
             ]
         )
-    elif report_to != "none":
+    elif report_to == "none":
+        megatron_cmd.extend(["--report_to", "none"])
+    else:
         raise ValueError("report_to must be either 'none' or 'wandb'")
 
     if resuming:
