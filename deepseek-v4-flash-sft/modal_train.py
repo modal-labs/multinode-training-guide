@@ -22,6 +22,7 @@ DEFAULT_MAX_EPOCHS = 1
 DEFAULT_MAX_LENGTH = 4096
 DEFAULT_LORA_RANK = 64
 DEFAULT_LORA_ALPHA = 64
+DEFAULT_TARGET_MODULES = "all-linear"
 
 TP_SIZE = 1
 PP_SIZE = 1
@@ -70,6 +71,7 @@ def default_run_id(
     global_batch_size: int,
     micro_batch_size: int,
     lr: float,
+    target_modules: str,
 ) -> str:
     run_config = {
         "cp_size": cp_size,
@@ -86,6 +88,7 @@ def default_run_id(
         "pp_size": pp_size,
         "tp_size": tp_size,
         "train_iters": train_iters,
+        "target_modules": target_modules,
     }
     digest = hashlib.sha256(
         json.dumps(run_config, sort_keys=True).encode()
@@ -264,6 +267,41 @@ if rope_scaling_old not in text:
     raise RuntimeError("mcore_bridge rope scaling patch target not found")
 text = text.replace(rope_scaling_old, rope_scaling_new)
 path.write_text(text)
+
+path = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpts/deepseek_v4.py")
+text = path.read_text()
+old = (
+    "        core_attn_out = torch.cat([content_part, rot_part], dim=-1)\n"
+    "        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)\n"
+)
+new = (
+    "        core_attn_out = torch.cat([content_part, rot_part], dim=-1)\n"
+    "        del content_part, rot_part\n"
+    "        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)\n"
+)
+if old not in text:
+    raise RuntimeError("mcore_bridge DeepSeek V4 attention output memory patch target not found")
+text = text.replace(old, new)
+old = "            query = torch.cat([q_no_pe, q_pos_emb], dim=-1)\n"
+new = (
+    "            query = q.detach()\n"
+    "            query[..., q_no_pe.shape[-1] :] = q_pos_emb\n"
+    "            del q_no_pe, q_pos_emb\n"
+)
+if old not in text:
+    raise RuntimeError("mcore_bridge DeepSeek V4 query concat memory patch target not found")
+text = text.replace(old, new)
+old = "            kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)\n"
+new = (
+    "            kv = kv.detach()\n"
+    "            kv[..., kv_no_pe.shape[-1] :] = k_pos_emb\n"
+    "            del kv_no_pe, k_pos_emb\n"
+    "            kv = kv.unsqueeze(-2)\n"
+)
+if old not in text:
+    raise RuntimeError("mcore_bridge DeepSeek V4 kv concat memory patch target not found")
+text = text.replace(old, new)
+path.write_text(text)
 PY"""
 MCORE_BRIDGE_DSV4_VERIFY = r"""python - <<'PY'
 from pathlib import Path
@@ -271,12 +309,237 @@ from pathlib import Path
 text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/config/model_config.py").read_text()
 assert "rotary_scaling_factor: float = 40" in text
 assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
+text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpts/deepseek_v4.py").read_text()
+assert "del content_part, rot_part" in text
+assert "query = q.detach()" in text
+assert "kv = kv.detach()" in text
+PY"""
+MCORE_BRIDGE_LONG_CONTEXT_MASK_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpt_model.py")
+text = path.read_text()
+old = (
+    "        if mcore_016 and full_attention_mask is not None:\n"
+    "            assert packed_seq_params is None\n"
+    "            padding_mask = ~((~full_attention_mask).sum(dim=(1, 2)) > 0)\n"
+    "            if self.config.context_parallel_size > 1:\n"
+    "                padding_mask = split_cp_inputs(padding_mask, None, 1)\n"
+    "            tp_size = self.config.tensor_model_parallel_size\n"
+    "            if self.config.sequence_parallel and tp_size > 1:\n"
+    "                assert padding_mask.shape[1] % tp_size == 0, f'padding_mask.shape: {padding_mask.shape}'\n"
+    "                padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]\n"
+    "            extra_block_kwargs['padding_mask'] = padding_mask.contiguous()\n"
+)
+new = (
+    "        if mcore_016 and full_attention_mask is not None:\n"
+    "            assert packed_seq_params is None\n"
+    "            if full_attention_mask.numel() > 2_000_000_000:\n"
+    "                padding_mask = None\n"
+    "            else:\n"
+    "                padding_mask = ~((~full_attention_mask).sum(dim=(1, 2)) > 0)\n"
+    "                if self.config.context_parallel_size > 1:\n"
+    "                    padding_mask = split_cp_inputs(padding_mask, None, 1)\n"
+    "                tp_size = self.config.tensor_model_parallel_size\n"
+    "                if self.config.sequence_parallel and tp_size > 1:\n"
+    "                    assert padding_mask.shape[1] % tp_size == 0, f'padding_mask.shape: {padding_mask.shape}'\n"
+    "                    padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]\n"
+    "                extra_block_kwargs['padding_mask'] = padding_mask.contiguous()\n"
+)
+if old not in text:
+    raise RuntimeError("mcore_bridge long-context padding-mask patch target not found")
+path.write_text(text.replace(old, new))
+PY"""
+MCORE_BRIDGE_LONG_CONTEXT_MASK_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpt_model.py").read_text()
+assert "full_attention_mask.numel() > 2_000_000_000" in text
+PY"""
+MCORE_DSA_ZERO_LOSS_TOPK_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/dsa.py")
+text = path.read_text()
+old = '''    # Compute attention scores: q @ k^T
+    # [seqlen_q, batch, index_n_heads, index_head_dim] @ [seqlen_k, batch, index_head_dim]^T
+    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
+    index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+
+    # Apply ReLU activation.
+    index_scores = torch.relu(index_scores)
+
+    # Weight each head by attention weights.
+    # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
+    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
+    index_scores = index_scores * weights.unsqueeze(-1)
+
+    # Sum across attention heads.
+    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
+    index_scores = index_scores.sum(dim=2)
+
+    # Transpose to [batch, seqlen_q, seqlen_k].
+    index_scores = index_scores.transpose(0, 1)
+
+    return index_scores
+'''
+new = '''    index_scores = None
+    head_chunk = 2
+    for start in range(0, q.size(2), head_chunk):
+        end = min(start + head_chunk, q.size(2))
+        partial = torch.einsum('sbhd,tbd->sbht', q[:, :, start:end].float(), k.float())
+        partial = torch.relu(partial)
+        partial = partial * weights[:, :, start:end].unsqueeze(-1)
+        partial = partial.sum(dim=2)
+        index_scores = partial if index_scores is None else index_scores + partial
+
+    return index_scores.transpose(0, 1)
+'''
+if old not in text:
+    raise RuntimeError("DeepSeek DSA index-score patch target not found")
+text = text.replace(old, new)
+needle = '    ' + (chr(34) * 3) + 'Naive implementation of forward pass for indexer loss.' + (chr(34) * 3) + '\n'
+replacement = needle + '''    if loss_coeff == 0.0:
+        with torch.no_grad():
+            _, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
+        return topk_indices, q.new_zeros(())
+
+'''
+if needle not in text:
+    raise RuntimeError("DeepSeek DSA indexer-loss patch target not found")
+path.write_text(text.replace(needle, replacement, 1))
+PY"""
+MCORE_DSA_ZERO_LOSS_TOPK_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/dsa.py").read_text()
+assert "head_chunk = 2" in text
+assert "with torch.no_grad()" in text
+PY"""
+MCORE_CSA_CHUNKED_UNFUSED_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/csa.py")
+text = path.read_text()
+old = '''    sq, b, np_, hn = query.size()
+
+    # --- Gather KV at topk positions ---
+    # kv_full: [n_kv, b, hn] -> [b, n_kv, hn]
+    kv_t = kv_full.permute(1, 0, 2)
+
+    safe_indices = topk_indices.clamp(min=0).long()  # [b, sq, topk]
+    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, -1, hn)  # [b, sq, topk, hn]
+    # [b, n_kv, hn] -> [b, 1, n_kv, hn] -> gather -> [b, sq, topk, hn]
+    kv_gathered = torch.gather(
+        kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=safe_indices_exp
+    )
+
+    # --- Attention scores ---
+    # query: [sq, b, np, hn] -> [b, np, sq, hn]
+    q = query.permute(1, 2, 0, 3).float()
+    kv_g = kv_gathered.float()  # [b, sq, topk, hn]
+
+    # [b, np, sq, topk]
+    scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g) * softmax_scale
+
+    # Mask invalid
+    invalid_mask = (topk_indices < 0).unsqueeze(1)  # [b, 1, sq, topk]
+    scores = scores.masked_fill(invalid_mask, float("-inf"))
+
+    # --- Softmax with attention sink ---
+    sink = attn_sink.view(1, np_, 1, 1).float()
+    scores_max = scores.max(dim=-1, keepdim=True).values  # [b, np, sq, 1]
+    scores_max = torch.max(scores_max, sink)
+
+    exp_scores = torch.exp(scores - scores_max)  # [b, np, sq, topk]
+    exp_sink = torch.exp(sink - scores_max)  # [1, np, 1, 1]
+
+    sum_exp = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+    attn_weights = exp_scores / sum_exp  # [b, np, sq, topk]
+
+    # --- Weighted sum ---
+    output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_g)
+    output = output.to(query.dtype)
+
+    # [b, np, sq, hn] -> [sq, b, np, hn] -> [sq, b, np * hn]
+    output = output.permute(2, 0, 1, 3).contiguous()
+    output = output.reshape(sq, b, np_ * hn)
+    return output
+'''
+new = '''    sq, b, np_, hn = query.size()
+
+    kv_t = kv_full.detach().permute(1, 0, 2)
+    sink = attn_sink.view(1, np_, 1, 1).float()
+    output_full = query.detach()
+    seq_chunk = 16
+
+    for start in range(0, sq, seq_chunk):
+        end = min(start + seq_chunk, sq)
+        topk_chunk = topk_indices[:, start:end]
+        safe_indices = topk_chunk.clamp(min=0).long()
+        safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, -1, hn)
+        kv_gathered = torch.gather(
+            kv_t.unsqueeze(1).expand(-1, end - start, -1, -1), dim=2, index=safe_indices_exp
+        )
+
+        q = query[start:end].detach().permute(1, 2, 0, 3)
+        kv_g = kv_gathered
+        scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g).float() * softmax_scale
+        invalid_mask = (topk_chunk < 0).unsqueeze(1)
+        scores = scores.masked_fill(invalid_mask, float("-inf"))
+
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        scores_max = torch.max(scores_max, sink)
+        exp_scores = torch.exp(scores - scores_max)
+        exp_sink = torch.exp(sink - scores_max)
+        sum_exp = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+        attn_weights = (exp_scores / sum_exp).to(query.dtype)
+        del scores, scores_max, exp_scores, exp_sink, invalid_mask, sum_exp
+
+        output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_g)
+        output = output.to(query.dtype)
+        output_full[start:end] = output.permute(2, 0, 1, 3)
+        del attn_weights, kv_gathered, kv_g, output, q, safe_indices, safe_indices_exp
+
+    return output_full.reshape(sq, b, np_ * hn)
+'''
+if old not in text:
+    raise RuntimeError("DeepSeek CSA unfused attention patch target not found")
+path.write_text(text.replace(old, new))
+PY"""
+MCORE_CSA_CHUNKED_UNFUSED_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/csa.py").read_text()
+assert "seq_chunk = 16" in text
+assert "output_full" in text
 PY"""
 MCORE_DSV4_CP_ROPE_PATCH = r"""python - <<'PY'
 from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py")
 text = path.read_text()
+if "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" not in text:
+    lines = text.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if "    pos_emb = pos_emb.view(" in line:
+            lines[idx:idx] = [
+                "    padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)\n",
+                "    if padding:\n",
+                "        pad_shape = list(pos_emb.shape)\n",
+                "        pad_shape[seq_dim] = padding\n",
+                "        pos_emb = torch.cat(\n",
+                "            [\n",
+                "                pos_emb,\n",
+                "                pos_emb.narrow(seq_dim, pos_emb.size(seq_dim) - 1, 1).expand(*pad_shape),\n",
+                "            ],\n",
+                "            dim=seq_dim,\n",
+                "        )\n",
+            ]
+            break
+    else:
+        raise RuntimeError("Megatron RoPE CP view patch target not found")
+    text = "".join(lines)
 if "if cos_.size(0) != t.size(0):" not in text:
     lines = text.splitlines(keepends=True)
     for idx, line in enumerate(lines):
@@ -293,13 +556,40 @@ if "if cos_.size(0) != t.size(0):" not in text:
             break
     else:
         raise RuntimeError("Megatron RoPE CP patch target not found")
-    path.write_text("".join(lines))
+    text = "".join(lines)
+if "rope_chunk = 1024" not in text:
+    lines = text.splitlines(keepends=True)
+    for idx, line in enumerate(lines):
+        if line == "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n":
+            lines[idx : idx + 1] = [
+                "    if t.size(0) > 4096:\n",
+                "        output = t.detach()\n",
+                "        rope_chunk = 1024\n",
+                "        for start in range(0, t.size(0), rope_chunk):\n",
+                "            end = min(start + rope_chunk, t.size(0))\n",
+                "            t_chunk = t[start:end].detach()\n",
+                "            output[start:end] = (t_chunk * cos_[start:end]) + (\n",
+                "                _rotate_half(t_chunk, rotary_interleaved) * sin_[start:end]\n",
+                "            )\n",
+                "        if t_pass.numel() == 0:\n",
+                "            return output\n",
+                "        return torch.cat((output, t_pass), dim=-1)\n",
+                "\n",
+                "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n",
+            ]
+            break
+    else:
+        raise RuntimeError("Megatron RoPE chunk patch target not found")
+    text = "".join(lines)
+path.write_text(text)
 PY"""
 MCORE_DSV4_CP_ROPE_VERIFY = r"""python - <<'PY'
 from pathlib import Path
 
 text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py").read_text()
+assert "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" in text
 assert "if cos_.size(0) != t.size(0):" in text
+assert "rope_chunk = 1024" in text
 PY"""
 
 download_image = (
@@ -345,10 +635,16 @@ msswift_image = (
     .run_commands("pip install --no-deps mcore-bridge==1.4.2")
     .run_commands(MCORE_BRIDGE_DSV4_PATCH)
     .run_commands(MCORE_BRIDGE_DSV4_VERIFY)
+    .run_commands(MCORE_BRIDGE_LONG_CONTEXT_MASK_PATCH)
+    .run_commands(MCORE_BRIDGE_LONG_CONTEXT_MASK_VERIFY)
     .run_commands(
         "pip install --no-deps "
         f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
     )
+    .run_commands(MCORE_DSA_ZERO_LOSS_TOPK_PATCH)
+    .run_commands(MCORE_DSA_ZERO_LOSS_TOPK_VERIFY)
+    .run_commands(MCORE_CSA_CHUNKED_UNFUSED_PATCH)
+    .run_commands(MCORE_CSA_CHUNKED_UNFUSED_VERIFY)
     .run_commands(MCORE_DSV4_CP_ROPE_PATCH)
     .run_commands(MCORE_DSV4_CP_ROPE_VERIFY)
     .run_commands(DEEPSEEK_V4_CONFIG_PATCH)
@@ -381,6 +677,28 @@ vllm_image = (
         "if old not in text:\n"
         "    raise RuntimeError('DeepSeek V4 vLLM scale_fmt patch target not found')\n"
         "path.write_text(text.replace(old, new))\n"
+        "PY"
+    )
+    .run_commands(
+        "python - <<'PY'\n"
+        "from pathlib import Path\n"
+        "path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/model.py')\n"
+        "text = path.read_text()\n"
+        "old = '                param = params_dict[name]\\n                weight_loader = param.weight_loader\\n'\n"
+        "new = '                param = params_dict.get(name)\\n                if param is None:\\n                    if name.endswith(\"weight_scale_inv\"):\\n                        break\\n                    raise KeyError(name)\\n                weight_loader = param.weight_loader\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM missing BF16 scale patch target not found')\n"
+        "text = text.replace(old, new, 1)\n"
+        "old = '                    param = params_dict[name]\\n                    weight_loader = getattr(\\n'\n"
+        "new = '                    param = params_dict.get(name)\\n                    if param is None:\\n                        if name.endswith(\"weight_scale_inv\"):\\n                            continue\\n                        raise KeyError(name)\\n                    weight_loader = getattr(\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM default BF16 scale patch target not found')\n"
+        "text = text.replace(old, new, 1)\n"
+        "old = '                        param = params_dict[name_mapped]\\n                        # We should ask the weight loader to return success or not\\n'\n"
+        "new = '                        param = params_dict.get(name_mapped)\\n                        if param is None:\\n                            if \"weight_scale\" in name_mapped:\\n                                continue\\n                            raise KeyError(name_mapped)\\n                        # We should ask the weight loader to return success or not\\n'\n"
+        "if old not in text:\n"
+        "    raise RuntimeError('DeepSeek V4 vLLM expert BF16 scale patch target not found')\n"
+        "path.write_text(text.replace(old, new, 1))\n"
         "PY"
     )
     .run_commands(
@@ -576,6 +894,7 @@ def _train_model_impl(
     micro_batch_size: int = 1,
     lr: float = 1e-4,
     save_interval: int = 25,
+    target_modules: str = DEFAULT_TARGET_MODULES,
     report_to: str = "none",
 ):
     import subprocess
@@ -598,6 +917,7 @@ def _train_model_impl(
             global_batch_size=global_batch_size,
             micro_batch_size=micro_batch_size,
             lr=lr,
+            target_modules=target_modules,
         )
 
     node_rank = cluster_info.rank
@@ -669,7 +989,7 @@ def _train_model_impl(
         "--tuner_type",
         "lora",
         "--target_modules",
-        "all-linear",
+        target_modules,
         "--lora_rank",
         str(lora_rank),
         "--lora_alpha",
@@ -706,7 +1026,7 @@ def _train_model_impl(
         "--padding_free",
         "false",
         "--use_precision_aware_optimizer",
-        "true",
+        "false",
         "--lr",
         str(lr),
         "--lr_warmup_fraction",
@@ -820,6 +1140,7 @@ def train_model(
     micro_batch_size: int = 1,
     lr: float = 1e-4,
     save_interval: int = 25,
+    target_modules: str = DEFAULT_TARGET_MODULES,
 ):
     return _train_model_impl(
         run_id=run_id,
@@ -838,6 +1159,7 @@ def train_model(
         lr=lr,
         save_interval=save_interval,
         report_to="none",
+        target_modules=target_modules,
     )
 
 
@@ -872,6 +1194,7 @@ def train_model_wandb(
     micro_batch_size: int = 1,
     lr: float = 1e-4,
     save_interval: int = 25,
+    target_modules: str = DEFAULT_TARGET_MODULES,
 ):
     return _train_model_impl(
         run_id=run_id,
@@ -890,6 +1213,7 @@ def train_model_wandb(
         lr=lr,
         save_interval=save_interval,
         report_to="wandb",
+        target_modules=target_modules,
     )
 
 
@@ -930,6 +1254,7 @@ def _make_config_vllm_compatible(config_path: str) -> None:
         "q_lora_rank": 1024,
         "qk_rope_head_dim": 64,
         "mlp_bias": False,
+        "num_hash_layers": 3,
         "output_router_logits": False,
         "router_aux_loss_coef": 0.001,
         "router_jitter_noise": 0.0,
@@ -939,20 +1264,8 @@ def _make_config_vllm_compatible(config_path: str) -> None:
     }
     for key, value in vllm_defaults.items():
         config.setdefault(key, value)
-    if config.get("torch_dtype") == "bfloat16" or config.get("dtype") == "bfloat16":
-        config.pop("expert_dtype", None)
-        config.pop("quantization_config", None)
-    else:
-        config.setdefault(
-            "quantization_config",
-            {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "scale_fmt": "ue8m0",
-                "weight_block_size": [128, 128],
-            },
-        )
+    config.pop("expert_dtype", None)
+    config.pop("quantization_config", None)
     if isinstance(config.get("mlp_layer_types"), list):
         config["mlp_layer_types"] = [
             "moe" if layer_type == "hash_moe" else layer_type
@@ -1464,22 +1777,44 @@ The team discussed {topic_detail} in depth over a 90-minute session. Key themes 
 
 @app.function(
     image=download_image,
-    volumes={DATA_DIR: data_volume},
+    volumes={DATA_DIR: data_volume, HF_CACHE: hf_cache_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=3600,
 )
 def prepare_summary_dataset(
     data_folder: str = "meeting_summaries",
     num_examples: int = 5,
     target_tokens: int = 60000,
+    align_tokens_to: int = 16,
 ):
     """Generate synthetic long-context meeting transcripts for SFT.
 
     Each example has a ~60K token transcript as input and a structured
     summary with decisions + action items as the target.
     """
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
+
     data_volume.reload()
+    hf_cache_vol.reload()
     output_dir = f"{DATA_DIR}/{data_folder}"
     os.makedirs(output_dir, exist_ok=True)
+
+    model_dir = snapshot_download(
+        HF_MODEL,
+        local_files_only=True,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_dir,
+        token=os.environ.get("HF_TOKEN"),
+        trust_remote_code=True,
+        use_fast=True,
+    )
+
+    def token_count(messages: list[dict[str, str]]) -> int:
+        text = "\n".join(message["content"] for message in messages)
+        return len(tokenizer(text, add_special_tokens=True)["input_ids"])
 
     output_path = f"{output_dir}/training.jsonl"
     with open(output_path, "w") as f:
@@ -1501,11 +1836,22 @@ def prepare_summary_dataset(
                     {"role": "assistant", "content": summary},
                 ]
             }
+            base_content = example["messages"][0]["content"]
+            for pad_tokens in range(align_tokens_to * 8):
+                padding = (
+                    "\n" + " ".join(["alignment"] * pad_tokens) if pad_tokens else ""
+                )
+                example["messages"][0]["content"] = base_content + padding
+                if token_count(example["messages"]) % align_tokens_to == 0:
+                    break
+            else:
+                raise RuntimeError("Could not align long-context example token length")
             f.write(json.dumps(example) + "\n")
 
     data_volume.commit()
     print(f"Wrote {num_examples} long-context examples to {output_path}")
     print(f"Target tokens per example: {target_tokens}")
+    print(f"Aligned token lengths to multiples of {align_tokens_to}")
     return {"path": output_path, "count": num_examples}
 
 
