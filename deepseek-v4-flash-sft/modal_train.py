@@ -284,7 +284,7 @@ if old not in text:
 text = text.replace(old, new)
 old = "            query = torch.cat([q_no_pe, q_pos_emb], dim=-1)\n"
 new = (
-    "            query = q.detach()\n"
+    "            query = q.clone()\n"
     "            query[..., q_no_pe.shape[-1] :] = q_pos_emb\n"
     "            del q_no_pe, q_pos_emb\n"
 )
@@ -293,7 +293,7 @@ if old not in text:
 text = text.replace(old, new)
 old = "            kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)\n"
 new = (
-    "            kv = kv.detach()\n"
+    "            kv = kv.clone()\n"
     "            kv[..., kv_no_pe.shape[-1] :] = k_pos_emb\n"
     "            del kv_no_pe, k_pos_emb\n"
     "            kv = kv.unsqueeze(-2)\n"
@@ -311,8 +311,8 @@ assert "rotary_scaling_factor: float = 40" in text
 assert "if self.llm_model_type == 'deepseek_v4' and 'main' not in self.rope_scaling" in text
 text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpts/deepseek_v4.py").read_text()
 assert "del content_part, rot_part" in text
-assert "query = q.detach()" in text
-assert "kv = kv.detach()" in text
+assert "query = q.clone()" in text
+assert "kv = kv.clone()" in text
 PY"""
 MCORE_BRIDGE_LONG_CONTEXT_MASK_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -335,16 +335,16 @@ new = (
     "        if mcore_016 and full_attention_mask is not None:\n"
     "            assert packed_seq_params is None\n"
     "            if full_attention_mask.numel() > 2_000_000_000:\n"
-    "                padding_mask = None\n"
+    "                padding_mask = full_attention_mask.diagonal(dim1=2, dim2=3).squeeze(1)\n"
     "            else:\n"
     "                padding_mask = ~((~full_attention_mask).sum(dim=(1, 2)) > 0)\n"
-    "                if self.config.context_parallel_size > 1:\n"
-    "                    padding_mask = split_cp_inputs(padding_mask, None, 1)\n"
-    "                tp_size = self.config.tensor_model_parallel_size\n"
-    "                if self.config.sequence_parallel and tp_size > 1:\n"
-    "                    assert padding_mask.shape[1] % tp_size == 0, f'padding_mask.shape: {padding_mask.shape}'\n"
-    "                    padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]\n"
-    "                extra_block_kwargs['padding_mask'] = padding_mask.contiguous()\n"
+    "            if self.config.context_parallel_size > 1:\n"
+    "                padding_mask = split_cp_inputs(padding_mask, None, 1)\n"
+    "            tp_size = self.config.tensor_model_parallel_size\n"
+    "            if self.config.sequence_parallel and tp_size > 1:\n"
+    "                assert padding_mask.shape[1] % tp_size == 0, f'padding_mask.shape: {padding_mask.shape}'\n"
+    "                padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]\n"
+    "            extra_block_kwargs['padding_mask'] = padding_mask.contiguous()\n"
 )
 if old not in text:
     raise RuntimeError("mcore_bridge long-context padding-mask patch target not found")
@@ -354,7 +354,7 @@ MCORE_BRIDGE_LONG_CONTEXT_MASK_VERIFY = r"""python - <<'PY'
 from pathlib import Path
 
 text = Path("/usr/local/lib/python3.11/site-packages/mcore_bridge/model/gpt_model.py").read_text()
-assert "full_attention_mask.numel() > 2_000_000_000" in text
+assert "full_attention_mask.diagonal(dim1=2, dim2=3).squeeze(1)" in text
 PY"""
 MCORE_DSA_ZERO_LOSS_TOPK_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -468,9 +468,9 @@ old = '''    sq, b, np_, hn = query.size()
 '''
 new = '''    sq, b, np_, hn = query.size()
 
-    kv_t = kv_full.detach().permute(1, 0, 2)
+    kv_t = kv_full.permute(1, 0, 2)
     sink = attn_sink.view(1, np_, 1, 1).float()
-    output_full = query.detach()
+    output_chunks = []
     seq_chunk = 16
 
     for start in range(0, sq, seq_chunk):
@@ -482,7 +482,7 @@ new = '''    sq, b, np_, hn = query.size()
             kv_t.unsqueeze(1).expand(-1, end - start, -1, -1), dim=2, index=safe_indices_exp
         )
 
-        q = query[start:end].detach().permute(1, 2, 0, 3)
+        q = query[start:end].permute(1, 2, 0, 3)
         kv_g = kv_gathered
         scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g).float() * softmax_scale
         invalid_mask = (topk_chunk < 0).unsqueeze(1)
@@ -498,10 +498,10 @@ new = '''    sq, b, np_, hn = query.size()
 
         output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_g)
         output = output.to(query.dtype)
-        output_full[start:end] = output.permute(2, 0, 1, 3)
+        output_chunks.append(output.permute(2, 0, 1, 3))
         del attn_weights, kv_gathered, kv_g, output, q, safe_indices, safe_indices_exp
 
-    return output_full.reshape(sq, b, np_ * hn)
+    return torch.cat(output_chunks, dim=0).reshape(sq, b, np_ * hn)
 '''
 if old not in text:
     raise RuntimeError("DeepSeek CSA unfused attention patch target not found")
@@ -512,7 +512,7 @@ from pathlib import Path
 
 text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/transformer/experimental_attention_variant/csa.py").read_text()
 assert "seq_chunk = 16" in text
-assert "output_full" in text
+assert "output_chunks" in text
 PY"""
 MCORE_DSV4_CP_ROPE_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -563,14 +563,16 @@ if "rope_chunk = 1024" not in text:
         if line == "    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)\n":
             lines[idx : idx + 1] = [
                 "    if t.size(0) > 4096:\n",
-                "        output = t.detach()\n",
+                "        output_chunks = []\n",
                 "        rope_chunk = 1024\n",
                 "        for start in range(0, t.size(0), rope_chunk):\n",
                 "            end = min(start + rope_chunk, t.size(0))\n",
-                "            t_chunk = t[start:end].detach()\n",
-                "            output[start:end] = (t_chunk * cos_[start:end]) + (\n",
-                "                _rotate_half(t_chunk, rotary_interleaved) * sin_[start:end]\n",
+                "            t_chunk = t[start:end]\n",
+                "            output_chunks.append(\n",
+                "                (t_chunk * cos_[start:end])\n",
+                "                + (_rotate_half(t_chunk, rotary_interleaved) * sin_[start:end])\n",
                 "            )\n",
+                "        output = torch.cat(output_chunks, dim=0)\n",
                 "        if t_pass.numel() == 0:\n",
                 "            return output\n",
                 "        return torch.cat((output, t_pass), dim=-1)\n",
@@ -590,6 +592,7 @@ text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common
 assert "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" in text
 assert "if cos_.size(0) != t.size(0):" in text
 assert "rope_chunk = 1024" in text
+assert "output_chunks = []" in text
 PY"""
 
 download_image = (
