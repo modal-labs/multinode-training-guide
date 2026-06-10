@@ -120,17 +120,21 @@ def _pipeline_layout(model_dir: str, pp_size: int) -> str | None:
     return "|".join(stages)
 
 
-download_image = apply_image_patches(
-    modal.Image.debian_slim(python_version="3.11").pip_install(
-        "datasets==3.1.0",
-        "huggingface_hub[hf_xet]==0.36.0",
-        "safetensors==0.7.0",
-        "sentencepiece==0.2.1",
-        "torch==2.9.1",
-        "transformers==4.57.4",
-    ),
-    TRANSFORMERS_DSV4_PATCHES,
-).env({"HF_XET_HIGH_PERFORMANCE": "1"})
+download_image = (
+    apply_image_patches(
+        modal.Image.debian_slim(python_version="3.11").pip_install(
+            "datasets==3.1.0",
+            "huggingface_hub[hf_xet]==0.36.0",
+            "safetensors==0.7.0",
+            "sentencepiece==0.2.1",
+            "torch==2.9.1",
+            "transformers==4.57.4",
+        ),
+        TRANSFORMERS_DSV4_PATCHES,
+    )
+    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
+    .add_local_python_source("deepseek_patches")
+)
 
 msswift_image = (
     apply_image_patches(
@@ -175,6 +179,7 @@ msswift_image = (
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
     )
+    .add_local_python_source("deepseek_patches")
 )
 vllm_image = (
     apply_image_patches(
@@ -185,6 +190,7 @@ vllm_image = (
     )
     .entrypoint([])
     .env({"VLLM_USE_V1": "1"})
+    .add_local_python_source("deepseek_patches")
 )
 
 
@@ -513,7 +519,7 @@ def _train_model_impl(
             ]
         )
     elif report_to == "none":
-        megatron_cmd.extend(["--report_to", "none"])
+        pass
     else:
         raise ValueError("report_to must be either 'none' or 'wandb'")
 

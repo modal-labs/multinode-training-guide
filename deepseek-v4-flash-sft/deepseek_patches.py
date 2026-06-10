@@ -169,6 +169,12 @@ PY"""
 
 DEEPSEEK_V4_CONFIG_VERIFY = r"""python - <<'PY'
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+config_cls = CONFIG_MAPPING['deepseek_v4']
+assert config_cls.__name__ == 'DeepseekV4Config'
+PY"""
+
+DEEPSEEK_V4_MODELING_VERIFY = r"""python - <<'PY'
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 config_cls = CONFIG_MAPPING['deepseek_v4']
 assert MODEL_FOR_CAUSAL_LM_MAPPING[config_cls].__name__ == 'DeepseekV4ForCausalLM'
@@ -658,7 +664,7 @@ TRANSFORMERS_DSV4_PATCHES = (
     PatchSpec(
         name="transformers_deepseek_v4_meta_model",
         command=DEEPSEEK_V4_MODELING_PATCH,
-        verify_command=DEEPSEEK_V4_CONFIG_VERIFY,
+        verify_command=DEEPSEEK_V4_MODELING_VERIFY,
         why="ms-swift export needs a registered causal-LM class as a meta model even though inference uses vLLM, not this forward implementation.",
         required_for="Megatron-to-HF export",
         ablation="cheap smoke ablation: disabling this leaves CONFIG_MAPPING present but no MODEL_FOR_CAUSAL_LM_MAPPING entry",
@@ -672,7 +678,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_BRIDGE_ROPE_CONFIG_VERIFY,
         why="mcore-bridge 1.4.2 does not propagate DSv4 YaRN rope_scaling fields (factor, beta_fast, beta_slow, mscale) from HF config. Without them, RoPE initialization fails.",
         required_for="any DSv4 Megatron SFT (all sequence lengths)",
-        ablation="REQUIRED: training crashes on model init without YaRN rope fields",
+        ablation="REQUIRED: ap-6ymIMI7y1OqYCNceJ16EDk crashed during model init with missing ModelConfig.beta_fast when disabled.",
     ),
     PatchSpec(
         name="mcore_bridge_attention_memory",
@@ -680,7 +686,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_BRIDGE_MEMORY_VERIFY,
         why="torch.cat([q_no_pe, q_pos_emb]) and torch.cat([kv_no_pe, k_pos_emb]) each allocate a full-sequence temporary. At S=30k/rank (60k with CP=2), that is ~30k*B*512*2bytes ≈ 60 MiB per concat per layer. In-place write + del frees the source tensors immediately.",
         required_for="60k SFT (not needed at 4k)",
-        ablation="REQUIRED at 60k: without this, peak memory exceeded B200 192 GiB before step 1 (OOM in attention concat)",
+        ablation="REQUIRED at 60k: ap-AMfsULAu7KJSCiKURZfXDY OOMed before step 1 in qkv_up_proj_and_rope_apply torch.cat (1.76 GiB allocation with ~1.2 GiB free).",
     ),
     PatchSpec(
         name="mcore_bridge_long_context_padding_mask",
@@ -688,7 +694,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_BRIDGE_LONG_CONTEXT_MASK_VERIFY,
         why="full_attention_mask is [B,1,S,S]. At S=30k (60k with CP=2), ~(~mask).sum() over 900M elements exceeds GPU memory. Extracting the diagonal gives the same per-token validity for the non-packed SFT case.",
         required_for="60k SFT (not needed at 4k where mask is only 16M elements)",
-        ablation="REQUIRED at 60k: mask reduction OOMs on 900M+ element tensor; threshold is >2B elements",
+        ablation="REQUIRED at 60k: ap-QMtPKURLHmGqT4M9khuMtV OOMed before step 1 in the transformer forward when the full [B,1,S,S] padding mask path stayed enabled.",
     ),
     PatchSpec(
         name="megatron_dsa_chunked_indexer",
@@ -696,7 +702,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_DSA_ZERO_LOSS_TOPK_VERIFY,
         why="DSA indexer computes [S_q, B, n_heads, S_k] scores. At S=30k, n_heads=4, FP32: 30k*1*4*30k*4 ≈ 43 GiB. Chunking by head pairs reduces peak to ~22 GiB. no_grad top-k when loss_coeff=0 avoids materializing the backward graph.",
         required_for="60k SFT (not needed at 4k where the full tensor is ~75 MiB)",
-        ablation="REQUIRED at 60k: OOMed in DSA indexer einsum before step 1 without chunking",
+        ablation="REQUIRED at 60k: ap-Co5yS1dFD7S7dtySYtvK8f OOMed before step 1 in dsa.py _compute_index_scores, allocating ~50 GiB per rank.",
     ),
     PatchSpec(
         name="megatron_csa_chunked_unfused_attention",
@@ -704,7 +710,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_CSA_CHUNKED_UNFUSED_VERIFY,
         why="CSA gathers [B, S, topk, hn] then computes attention over the full sequence. At S=30k, topk=256, hn=512, BF16: 30k*256*512*2 ≈ 7.5 GiB per batch. Chunking to seq_chunk=16 reduces this to ~4 MiB per chunk.",
         required_for="60k SFT (not needed at 4k where the gather is ~1 GiB)",
-        ablation="REQUIRED at 60k: OOMed in CSA gather before step 1 without chunking",
+        ablation="REQUIRED at 60k: ap-ArVOGOeIyP6U8m3l71Ez0l OOMed before step 1 in csa.py when casting the gathered KV tensor (~19.5 GiB allocation).",
     ),
     PatchSpec(
         name="megatron_rope_cp_and_chunking",
@@ -712,7 +718,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_DSV4_CP_ROPE_VERIFY,
         why="Three sub-patches: (1) CP padding — pos_emb length must be divisible by 2*CP for split/gather, required when CP>1. (2) cos_/sin_ broadcast — handles shape mismatch when rotary cache is shorter than the input. (3) RoPE chunking — t*cos_ + rotate_half(t)*sin_ allocates a full-sequence temporary; at S=30k, head_dim=512, BF16: ~30 MiB per head. Chunking to 1024 reduces peak.",
         required_for="CP padding: any CP>1 run. RoPE chunking: 60k SFT (not needed at 4k).",
-        ablation="REQUIRED for CP>1: crashes on shape mismatch without CP padding. Chunking REQUIRED at 60k: OOMed in RoPE multiply without it.",
+        ablation="REQUIRED for CP>1: ap-Fa0fYF8r1VsKlR6gJZKEVZ crashed before step 1 with RoPE tensor length mismatches (e.g. 7216 vs 3608) when disabled.",
     ),
     *TRANSFORMERS_DSV4_PATCHES,
 )
