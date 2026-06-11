@@ -897,9 +897,8 @@ def inspect_lora_adapter(run_id: str, checkpoint_step: int = 5):
 
     LoRA ``lora_B`` is zero-initialized, so a nonzero ``lora_B`` norm after
     training proves that adapter received gradient. This is the gradient-safety
-    check for broad target modules: with the gradient-unsafe memory patches
-    disabled, qkv adapters should train (nonzero ``lora_B``); with them enabled,
-    qkv adapters stay exactly zero while only ``linear_proj`` trains.
+    check for broad DeepSeek MLA target modules: attention-input adapters such
+    as ``linear_q_up_proj`` and ``linear_kv_proj`` should train.
     """
     import collections
     import re
@@ -940,7 +939,7 @@ def inspect_lora_adapter(run_id: str, checkpoint_step: int = 5):
         if re.search(
             r"linear_qkv|linear_q_|linear_kv_|q_up_proj|kv_proj|q_down_proj", key
         ):
-            return "linear_qkv"
+            return "attention_input"
         return "other"
 
     def lora_side(key: str) -> str | None:
@@ -1629,6 +1628,7 @@ def long_context_loop(
     cp_size: int = LONG_CONTEXT_CP_SIZE,
     global_batch_size: int = 8,
     micro_batch_size: int = 1,
+    target_modules: str = DEFAULT_TARGET_MODULES,
 ):
     """Full long-context loop: baseline eval → train → export → post-training eval.
 
@@ -1676,6 +1676,7 @@ def long_context_loop(
         cp_size=cp_size,
         global_batch_size=global_batch_size,
         micro_batch_size=micro_batch_size,
+        target_modules=target_modules,
     )
     print(f"  Training done: {train_result}")
 

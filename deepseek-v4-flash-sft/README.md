@@ -82,7 +82,7 @@ By default this launches one 8×B200 node with:
 | PP | 1 | Increase this when scaling beyond the bring-up shape. |
 | CP | 1 | Increase only for longer-context runs. |
 | LoRA rank / alpha | 64 / 64 | Increase rank for quality once the run is stable. |
-| LoRA target modules | `linear_proj` | Attention output projection adapters keep long-context memory viable. |
+| LoRA target modules | `linear_proj` | Default smoke target; broader DeepSeek MLA targets are safe when using the CP=4 long-context path. |
 | Max length | 4096 | DeepSeek-V4 supports 1M context, but start small. |
 
 For a short smoke run that should save after five training steps:
@@ -111,10 +111,17 @@ DeepSeek-V4-Flash until MLA tensor parallelism is supported for the DSv4 hybrid 
 `modal_train.py` pins the Megatron-Core dev commit that provides the DSv4 hybrid attention module
 required by `mcore-bridge`.
 
-The long-context memory patches in this example are validated for the default `linear_proj` LoRA
-target. The training entrypoint rejects broader `--target-modules` while those patches are enabled;
-disable the gradient-unsafe memory patches and increase CP/PP before targeting qkv or all-linear
-LoRA.
+For 60k-context SFT, use context parallelism instead of the old detach-based memory patches:
+
+```bash
+N_NODES=4 modal run --detach modal_train.py::long_context_loop \
+  --target-modules linear_q_up_proj,linear_kv_proj,linear_proj
+```
+
+This runs baseline eval, prepares synthetic 60k summarization data, trains for five steps, exports the
+checkpoint, and re-runs eval. The committed long-context path runs at CP=4 on 4×8 B200 nodes. The
+earlier gradient-unsafe memory patches were removed, so broader DeepSeek MLA LoRA targets
+(`linear_q_up_proj`, `linear_kv_proj`, `linear_proj`) train with correct gradients.
 
 ## Optional W&B logging
 
