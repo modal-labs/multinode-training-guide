@@ -148,3 +148,74 @@ Re-run the existing pipeline on the CP-scaled config:
   mapping, and `wo_a` is consumed via direct `.weight` access).
 - Upstream NVIDIA Megatron-LM has no fused DSA kernels and no CSA
   implementation at all as of 2026-06; the pinned commit comes from a fork.
+
+## Validation results (executed 2026-06-11, Modal `peyton-agents`)
+
+All runs use the disabled set **`mcore_bridge_attention_memory,
+megatron_dsa_chunked_indexer, megatron_csa_chunked_unfused_attention,
+megatron_rope_seq_chunking`** (the 4 gradient-unsafe patches). The
+`mcore_bridge_long_context_padding_mask` patch was reclassified as gradient-safe
+on the base branch (commit `fbaae62`) and is kept enabled.
+
+**Module-name correction:** the plan's `linear_qkv` does not exist on
+DeepSeek-V4 (it uses MLA, not fused QKV). The real attention-input projections
+are `linear_q_up_proj` (RoPE query up-proj) and `linear_kv_proj` (KV latent).
+All "broad target" runs below use
+`--target-modules linear_q_up_proj,linear_kv_proj,linear_proj`. Targeting the
+nonexistent `linear_qkv` silently trains nothing there (peft matches 0 modules),
+which is itself a trap worth noting.
+
+A prerequisite bug was also fixed: `modal_train.py` passed `--target_modules` as
+a single argv token, so any multi-module value was never split and ms-swift
+looked for a module literally named `"a,b"`. Fixed by splitting on comma into
+separate tokens.
+
+Gradient flow is verified with the new `inspect_lora_adapter` Modal function,
+which reads the saved DCP checkpoint and reports per-module `lora_B` norms
+(`lora_B` is zero-initialized, so nonzero ⇒ that adapter received gradient).
+
+| Step | Config | Result | Peak/GPU |
+|---|---|---|---|
+| 1 — smoke | 4k, 1×8 B200, patches off, `linear_proj` | PASS: 5/5, loss 2.32→2.18, grad_norm 0.3–0.4 | 85.8 GiB |
+| 2 canary | 4k, 1×8 B200, patches **off**, broad MLA targets | PASS: 5/5, grad_norm 1.1–1.2; `lora_B` nonzero **86/86** q_up+kv, 43/43 proj | 86.5 GiB |
+| 2 control | 4k, 1×8 B200, patches **on**, broad MLA targets | PASS (proves the trap): grad_norm 0.12–0.17; `lora_B` nonzero **0/86** q_up+kv, 43/43 proj | 81.7 GiB |
+| 3 — 60k | **61440**, **CP=4, 4×8 B200 (32)**, patches off, broad MLA targets | PASS: 5/5, grad_norm 0.5–0.77, no NaN; `lora_B` nonzero **86/86** q_up+kv, 43/43 proj | **81.0 GiB** |
+| 4 — e2e | export CP=4 ckpt → merged HF → vLLM serve @ 60k → summarization eval | PASS: export OK, server ready ~520s, **100% action-item recall** (5/5 both examples) | — |
+
+### Key findings
+
+1. **The gradient bug is real and silent.** Step 2's A/B is decisive: with the 4
+   patches enabled, the attention-input adapters' `lora_B` stays *exactly* 0
+   (0/86) — they receive no gradient — while `linear_proj` trains normally. The
+   total grad_norm collapses from ~1.1 (correct) to ~0.15 (proj-only). No error
+   is raised. Disabling the patches restores 86/86 nonzero adapters.
+
+2. **CP=4 is more than enough; CP=8 is unnecessary.** At 60k with the patches
+   off, CP=4 peaks at **81 GiB/GPU** — less than half of B200's 180 GB, and
+   essentially the same peak as the 4k runs. The freed allocations the patches
+   used to avoid (DSA indexer, CSA gather, attention concat) are fully absorbed
+   by the per-rank sequence shrinking to 15k. There was never an OOM at any of
+   the named allocation sites.
+
+3. **End-to-end parity holds.** A checkpoint trained under the new regime
+   (patches off, CP=4, broad MLA LoRA) exports and serves cleanly through the
+   unchanged vLLM path and scores 100% action-item recall at 60k — matching the
+   original patched-run validation.
+
+### Recommendation for Step 5
+
+CP=4 works, so per the plan this enables deleting the four gradient-unsafe
+patches and the RoPE-chunking sub-patch, and flipping the example default to
+CP=4. The real tradeoff to weigh before doing so:
+
+- **Keep patches (current default), `linear_proj`-only LoRA:** 60k fits on
+  **2×8 B200 (CP=2)**, cheaper, but gradients are silently severed for any
+  target module other than `linear_proj`.
+- **Drop patches, CP=4:** needs **4×8 B200**, but gradients are correct for any
+  target module (`linear_q_up_proj`, `linear_kv_proj`, `all-linear`, …).
+
+Because dropping the patches removes the cheap 2-node path some users may rely
+on, this PR keeps both options available via the existing opt-in
+`DSV4_DISABLED_PATCHES` mechanism + the `target_modules`-vs-patches guard, rather
+than hard-deleting them. The validation above is the evidence for whichever
+default the maintainers choose.
