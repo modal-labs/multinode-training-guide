@@ -28,8 +28,8 @@ At 60k tokens (30k/rank with CP=2), five additional patches prevent OOM:
 At the default 4k sequence length, none of these OOM — only the rope config patch
 is required so Megatron can initialize YaRN position embeddings.
 
-The detach-based memory patches are validated only for `linear_proj` LoRA. The
-training entrypoint rejects broader target modules while those patches are enabled.
+The gradient-unsafe memory patches are validated only for `linear_proj` LoRA.
+The training entrypoint rejects broader target modules while those patches are enabled.
 
 ### 3. vLLM BF16 serving (7 patches) — only needed for inference / eval
 vLLM 0.22.1 expects FP8/MXFP4 scale tensors and CUTLASS DSL kernels that are
@@ -57,6 +57,7 @@ class PatchSpec:
 GRADIENT_UNSAFE_TRAINING_PATCHES = frozenset(
     {
         "mcore_bridge_attention_memory",
+        "megatron_dsa_chunked_indexer",
         "megatron_csa_chunked_unfused_attention",
         "megatron_rope_cp_and_chunking",
     }
