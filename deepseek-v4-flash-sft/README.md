@@ -112,8 +112,9 @@ DeepSeek-V4-Flash until MLA tensor parallelism is supported for the DSv4 hybrid 
 required by `mcore-bridge`.
 
 The long-context memory patches in this example are validated for the default `linear_proj` LoRA
-target. If you broaden `--target-modules`, re-check gradient flow and memory use before relying on
-the run for training quality.
+target. The training entrypoint rejects broader `--target-modules` while those patches are enabled;
+disable the gradient-unsafe memory patches and increase CP/PP before targeting qkv or all-linear
+LoRA.
 
 ## Optional W&B logging
 

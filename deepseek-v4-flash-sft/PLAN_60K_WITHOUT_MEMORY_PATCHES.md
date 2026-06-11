@@ -132,8 +132,8 @@ Re-run the existing pipeline on the CP-scaled config:
 - If CP=4 works: update the example defaults to CP=4 and delete the four
   dropped patches (and the RoPE-chunking sub-patch) from `deepseek_patches.py`.
 - If only CP=8 works: keep the patches available behind
-  `DSV4_DISABLED_PATCHES` inverted logic (opt-in rather than default), with a
-  hard assert that `target_modules == "linear_proj"` whenever they are enabled.
+  `DSV4_DISABLED_PATCHES` inverted logic (opt-in rather than default), and keep
+  the current `target_modules == "linear_proj"` guard whenever they are enabled.
 - Either way, document the cost tradeoff: 2×8 B200 with unsafe patches
   (linear_proj-only LoRA) vs 4–8×8 B200 with correct gradients on any module.
 

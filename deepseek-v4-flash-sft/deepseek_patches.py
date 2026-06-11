@@ -17,23 +17,31 @@ Transformers 4.57 does not register `deepseek_v4` as a known model type, so
 AutoConfig / MODEL_FOR_CAUSAL_LM_MAPPING lookups fail.  These two patches append
 the registration to the installed transformers package.
 
-### 2. Long-context memory (7 patches) — rope config + CP shape fix are gradient-safe
-At 60k tokens, several patches reduce peak memory. Five of them detach autograd
-and are only safe with linear_proj-only LoRA:
-  - attention concat in-place rewrite + del  (~60 MiB/layer saved)
-  - padding-mask diagonal extraction          (avoids 900M-element reduction)
-  - DSA indexer head-chunking + no_grad       (43 GiB → 22 GiB peak)
-  - CSA gather/softmax seq-chunking           (7.5 GiB → 4 MiB peak per chunk)
+### 2. Long-context memory (7 patches) — five reduce peak memory at 60k
+At 60k tokens, five patches reduce peak memory. Three of them sever autograd for
+any adapter upstream of attention, so they are only safe with linear_proj-only
+LoRA (these three are GRADIENT_UNSAFE_TRAINING_PATCHES):
+  - attention concat in-place rewrite + del          (~60 MiB/layer saved)
+  - CSA gather/softmax seq-chunking                  (7.5 GiB → 4 MiB peak per chunk)
   - RoPE rotary chunking (megatron_rope_seq_chunking)  (~30 MiB/head saved)
 
-The other two are gradient-safe at any target_modules and stay on:
+The other two reduce memory without touching adapter gradients (the mask is not
+differentiable; the indexer's no_grad path only fires when its aux loss is off),
+so they are gradient-safe at any target_modules:
+  - padding-mask diagonal extraction          (avoids 900M-element reduction)
+  - DSA indexer head-chunking + no_grad       (43 GiB → 22 GiB peak)
+
+Two more are gradient-safe and always stay on:
   - rope config (YaRN field propagation)      (required at ALL lengths)
   - RoPE CP shape fix (megatron_rope_cp_shape_fix)  (required for CP>1)
 
 At the default 4k sequence length, none of the memory patches OOM — only the rope
 config patch is required so Megatron can initialize YaRN position embeddings. To
 train adapters upstream of attention (e.g. linear_qkv / all-linear), disable the
-five detach-based patches and absorb their memory by raising context parallelism.
+three gradient-unsafe patches and absorb their memory by raising context parallelism.
+
+The three gradient-unsafe patches are validated only for `linear_proj` LoRA. The
+training entrypoint rejects broader target modules while those patches are enabled.
 
 ### 3. vLLM BF16 serving (7 patches) — only needed for inference / eval
 vLLM 0.22.1 expects FP8/MXFP4 scale tensors and CUTLASS DSL kernels that are
@@ -58,6 +66,15 @@ class PatchSpec:
     ablation: str = "not yet ablated"
 
 
+GRADIENT_UNSAFE_TRAINING_PATCHES = frozenset(
+    {
+        "mcore_bridge_attention_memory",
+        "megatron_csa_chunked_unfused_attention",
+        "megatron_rope_seq_chunking",
+    }
+)
+
+
 def disabled_patch_names() -> set[str]:
     return {
         name.strip()
@@ -68,15 +85,22 @@ def disabled_patch_names() -> set[str]:
 
 def apply_image_patches(image, patches: Iterable[PatchSpec]):
     disabled = disabled_patch_names()
+    applied: list[str] = []
     for patch in patches:
         if patch.name in disabled:
             image = image.run_commands(f"echo Skipping DeepSeek patch: {patch.name}")
             continue
         image = image.run_commands(f"echo Applying DeepSeek patch: {patch.name}")
         image = image.run_commands(patch.command)
+        applied.append(patch.name)
         if patch.verify_command is not None:
             image = image.run_commands(patch.verify_command)
-    return image
+    return image.env(
+        {
+            "DSV4_APPLIED_PATCHES": ",".join(applied),
+            "DSV4_DISABLED_PATCHES": ",".join(sorted(disabled)),
+        }
+    )
 
 
 DEEPSEEK_V4_CONFIG_PATCH = r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
@@ -718,7 +742,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_BRIDGE_ROPE_CONFIG_VERIFY,
         why="mcore-bridge 1.4.2 does not propagate DSv4 YaRN rope_scaling fields (factor, beta_fast, beta_slow, mscale) from HF config. Without them, RoPE initialization fails.",
         required_for="any DSv4 Megatron SFT (all sequence lengths)",
-        ablation="REQUIRED: ap-6ymIMI7y1OqYCNceJ16EDk crashed during model init with missing ModelConfig.beta_fast when disabled.",
+        ablation="REQUIRED: disabling it crashes during model init with missing ModelConfig.beta_fast.",
     ),
     PatchSpec(
         name="mcore_bridge_attention_memory",
@@ -726,7 +750,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_BRIDGE_MEMORY_VERIFY,
         why="torch.cat([q_no_pe, q_pos_emb]) and torch.cat([kv_no_pe, k_pos_emb]) each allocate a full-sequence temporary. At S=30k/rank (60k with CP=2), that is ~30k*B*512*2bytes ≈ 60 MiB per concat per layer. In-place write + del frees the source tensors immediately.",
         required_for="60k SFT (not needed at 4k)",
-        ablation="REQUIRED at 60k: ap-AMfsULAu7KJSCiKURZfXDY OOMed before step 1 in qkv_up_proj_and_rope_apply torch.cat (1.76 GiB allocation with ~1.2 GiB free).",
+        ablation="REQUIRED at 60k: disabling it OOMs before step 1 in qkv_up_proj_and_rope_apply torch.cat (1.76 GiB allocation with ~1.2 GiB free).",
     ),
     PatchSpec(
         name="mcore_bridge_long_context_padding_mask",
@@ -734,7 +758,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_BRIDGE_LONG_CONTEXT_MASK_VERIFY,
         why="full_attention_mask is [B,1,S,S]. At S=30k (60k with CP=2), ~(~mask).sum() over 900M elements exceeds GPU memory. Extracting the diagonal gives the same per-token validity for the non-packed SFT case.",
         required_for="60k SFT (not needed at 4k where mask is only 16M elements)",
-        ablation="REQUIRED at 60k: ap-QMtPKURLHmGqT4M9khuMtV OOMed before step 1 in the transformer forward when the full [B,1,S,S] padding mask path stayed enabled.",
+        ablation="REQUIRED at 60k: disabling it OOMs before step 1 in the transformer forward when the full [B,1,S,S] padding mask path stays enabled.",
     ),
     PatchSpec(
         name="megatron_dsa_chunked_indexer",
@@ -742,7 +766,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_DSA_ZERO_LOSS_TOPK_VERIFY,
         why="DSA indexer computes [S_q, B, n_heads, S_k] scores. At S=30k, n_heads=4, FP32: 30k*1*4*30k*4 ≈ 43 GiB. Chunking by head pairs reduces peak to ~22 GiB. no_grad top-k when loss_coeff=0 avoids materializing the backward graph.",
         required_for="60k SFT (not needed at 4k where the full tensor is ~75 MiB)",
-        ablation="REQUIRED at 60k: ap-Co5yS1dFD7S7dtySYtvK8f OOMed before step 1 in dsa.py _compute_index_scores, allocating ~50 GiB per rank.",
+        ablation="REQUIRED at 60k: disabling it OOMs before step 1 in dsa.py _compute_index_scores, allocating ~50 GiB per rank.",
     ),
     PatchSpec(
         name="megatron_csa_chunked_unfused_attention",
@@ -750,7 +774,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_CSA_CHUNKED_UNFUSED_VERIFY,
         why="CSA gathers [B, S, topk, hn] then computes attention over the full sequence. At S=30k, topk=256, hn=512, BF16: 30k*256*512*2 ≈ 7.5 GiB per batch. Chunking to seq_chunk=16 reduces this to ~4 MiB per chunk.",
         required_for="60k SFT (not needed at 4k where the gather is ~1 GiB)",
-        ablation="REQUIRED at 60k: ap-ArVOGOeIyP6U8m3l71Ez0l OOMed before step 1 in csa.py when casting the gathered KV tensor (~19.5 GiB allocation).",
+        ablation="REQUIRED at 60k: disabling it OOMs before step 1 in csa.py when casting the gathered KV tensor (~19.5 GiB allocation).",
     ),
     PatchSpec(
         name="megatron_rope_cp_shape_fix",
@@ -758,7 +782,7 @@ MSSWIFT_MEGATRON_PATCHES = (
         verify_command=MCORE_DSV4_ROPE_SHAPE_FIX_VERIFY,
         why="Two gradient-safe shape fixes: (1) CP padding — pos_emb length must be divisible by 2*CP for the context-parallel split/gather, required when CP>1. (2) cos_/sin_ length reconciliation — handles the shape mismatch when the rotary cache is shorter than the (CP-padded) input; warns loudly if it would ever cyclically repeat (repeats>1) and wrap positions. Neither edit detaches, so both are safe at any target_modules.",
         required_for="any CP>1 run (60k validation scales CP to 4-8).",
-        ablation="REQUIRED for CP>1: ap-Fa0fYF8r1VsKlR6gJZKEVZ crashed before step 1 with RoPE tensor length mismatches (e.g. 7216 vs 3608) when disabled.",
+        ablation="REQUIRED for CP>1: disabling it crashes before step 1 with RoPE tensor length mismatches (e.g. 7216 vs 3608).",
     ),
     PatchSpec(
         name="megatron_rope_seq_chunking",
