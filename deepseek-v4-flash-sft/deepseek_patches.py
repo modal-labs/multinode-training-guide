@@ -9,7 +9,7 @@ keeping the patch.  Disable one or more patches for experiments with:
 
 ## Patch categories
 
-There are three independent categories — a total of 15 patches, but only the first
+There are three independent categories — a total of 16 patches, but only the first
 two categories apply to training:
 
 ### 1. Model registration (2 patches) — required at ALL sequence lengths
@@ -17,16 +17,23 @@ Transformers 4.57 does not register `deepseek_v4` as a known model type, so
 AutoConfig / MODEL_FOR_CAUSAL_LM_MAPPING lookups fail.  These two patches append
 the registration to the installed transformers package.
 
-### 2. Long-context memory (6 patches) — only the rope config patch is needed at 4k
-At 60k tokens (30k/rank with CP=2), five additional patches prevent OOM:
+### 2. Long-context memory (7 patches) — rope config + CP shape fix are gradient-safe
+At 60k tokens, several patches reduce peak memory. Five of them detach autograd
+and are only safe with linear_proj-only LoRA:
   - attention concat in-place rewrite + del  (~60 MiB/layer saved)
   - padding-mask diagonal extraction          (avoids 900M-element reduction)
   - DSA indexer head-chunking + no_grad       (43 GiB → 22 GiB peak)
   - CSA gather/softmax seq-chunking           (7.5 GiB → 4 MiB peak per chunk)
-  - RoPE CP padding + rotary chunking         (CP shape fix + 30 MiB/head saved)
+  - RoPE rotary chunking (megatron_rope_seq_chunking)  (~30 MiB/head saved)
 
-At the default 4k sequence length, none of these OOM — only the rope config patch
-is required so Megatron can initialize YaRN position embeddings.
+The other two are gradient-safe at any target_modules and stay on:
+  - rope config (YaRN field propagation)      (required at ALL lengths)
+  - RoPE CP shape fix (megatron_rope_cp_shape_fix)  (required for CP>1)
+
+At the default 4k sequence length, none of the memory patches OOM — only the rope
+config patch is required so Megatron can initialize YaRN position embeddings. To
+train adapters upstream of attention (e.g. linear_qkv / all-linear), disable the
+five detach-based patches and absorb their memory by raising context parallelism.
 
 ### 3. vLLM BF16 serving (7 patches) — only needed for inference / eval
 vLLM 0.22.1 expects FP8/MXFP4 scale tensors and CUTLASS DSL kernels that are
@@ -494,7 +501,12 @@ assert "seq_chunk = 16" in text
 assert "output_full" in text
 PY"""
 
-MCORE_DSV4_CP_ROPE_PATCH = r"""python - <<'PY'
+# Shape fix only: CP padding + cos_/sin_ length reconciliation. These are
+# gradient-safe (no detach) and required whenever CP>1. The rotary-cache
+# repeat path corrupts positions if it ever cycles (repeats > 1), so it warns
+# loudly when that happens — under CP padding the mismatch should be absorbed
+# by a single tail slice, never a true cyclic repeat.
+MCORE_DSV4_ROPE_SHAPE_FIX_PATCH = r"""python - <<'PY'
 from pathlib import Path
 
 path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py")
@@ -527,6 +539,15 @@ if "if cos_.size(0) != t.size(0):" not in text:
             lines[idx:idx] = [
                 "    if cos_.size(0) != t.size(0):\n",
                 "        repeats = (t.size(0) + cos_.size(0) - 1) // cos_.size(0)\n",
+                "        if repeats > 1:\n",
+                "            import warnings\n",
+                "            warnings.warn(\n",
+                "                f'[DSV4] RoPE cos/sin cache ({cos_.size(0)}) shorter than input '\n",
+                "                f'({t.size(0)}); cyclic repeat x{repeats} will wrap positions and '\n",
+                "                'corrupt positional encodings. Expected only a single-tail CP-padding '\n",
+                "                'mismatch (repeats == 1).',\n",
+                "                stacklevel=2,\n",
+                "            )\n",
                 "        repeat_shape = [1] * cos_.dim()\n",
                 "        repeat_shape[0] = repeats\n",
                 "        cos_ = cos_.repeat(*repeat_shape)[: t.size(0)]\n",
@@ -537,6 +558,27 @@ if "if cos_.size(0) != t.size(0):" not in text:
     else:
         raise RuntimeError("Megatron RoPE CP patch target not found")
     text = "".join(lines)
+path.write_text(text)
+PY"""
+
+MCORE_DSV4_ROPE_SHAPE_FIX_VERIFY = r"""python - <<'PY'
+from pathlib import Path
+
+text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py").read_text()
+assert "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" in text
+assert "if cos_.size(0) != t.size(0):" in text
+assert "corrupt positional encodings" in text
+PY"""
+
+# Memory-only: chunked + detached RoPE application. This severs the autograd
+# graph through the rotary multiply (detach), which is only safe when no LoRA
+# adapter upstream of attention needs that gradient (i.e. target_modules is
+# linear_proj-only). Disable with megatron_rope_seq_chunking to keep gradients.
+MCORE_DSV4_ROPE_SEQ_CHUNKING_PATCH = r"""python - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py")
+text = path.read_text()
 if "rope_chunk = 1024" not in text:
     lines = text.splitlines(keepends=True)
     for idx, line in enumerate(lines):
@@ -564,12 +606,10 @@ if "rope_chunk = 1024" not in text:
 path.write_text(text)
 PY"""
 
-MCORE_DSV4_CP_ROPE_VERIFY = r"""python - <<'PY'
+MCORE_DSV4_ROPE_SEQ_CHUNKING_VERIFY = r"""python - <<'PY'
 from pathlib import Path
 
 text = Path("/usr/local/lib/python3.11/site-packages/megatron/core/models/common/embeddings/rope_utils.py").read_text()
-assert "padding = (-pos_emb.size(seq_dim)) % (2 * cp_size)" in text
-assert "if cos_.size(0) != t.size(0):" in text
 assert "rope_chunk = 1024" in text
 assert "output = t.detach()" in text
 PY"""
@@ -713,12 +753,20 @@ MSSWIFT_MEGATRON_PATCHES = (
         ablation="REQUIRED at 60k: ap-ArVOGOeIyP6U8m3l71Ez0l OOMed before step 1 in csa.py when casting the gathered KV tensor (~19.5 GiB allocation).",
     ),
     PatchSpec(
-        name="megatron_rope_cp_and_chunking",
-        command=MCORE_DSV4_CP_ROPE_PATCH,
-        verify_command=MCORE_DSV4_CP_ROPE_VERIFY,
-        why="Three sub-patches: (1) CP padding — pos_emb length must be divisible by 2*CP for split/gather, required when CP>1. (2) cos_/sin_ broadcast — handles shape mismatch when rotary cache is shorter than the input. (3) RoPE chunking — t*cos_ + rotate_half(t)*sin_ allocates a full-sequence temporary; at S=30k, head_dim=512, BF16: ~30 MiB per head. Chunking to 1024 reduces peak.",
-        required_for="CP padding: any CP>1 run. RoPE chunking: 60k SFT (not needed at 4k).",
+        name="megatron_rope_cp_shape_fix",
+        command=MCORE_DSV4_ROPE_SHAPE_FIX_PATCH,
+        verify_command=MCORE_DSV4_ROPE_SHAPE_FIX_VERIFY,
+        why="Two gradient-safe shape fixes: (1) CP padding — pos_emb length must be divisible by 2*CP for the context-parallel split/gather, required when CP>1. (2) cos_/sin_ length reconciliation — handles the shape mismatch when the rotary cache is shorter than the (CP-padded) input; warns loudly if it would ever cyclically repeat (repeats>1) and wrap positions. Neither edit detaches, so both are safe at any target_modules.",
+        required_for="any CP>1 run (60k validation scales CP to 4-8).",
         ablation="REQUIRED for CP>1: ap-Fa0fYF8r1VsKlR6gJZKEVZ crashed before step 1 with RoPE tensor length mismatches (e.g. 7216 vs 3608) when disabled.",
+    ),
+    PatchSpec(
+        name="megatron_rope_seq_chunking",
+        command=MCORE_DSV4_ROPE_SEQ_CHUNKING_PATCH,
+        verify_command=MCORE_DSV4_ROPE_SEQ_CHUNKING_VERIFY,
+        why="RoPE chunking — t*cos_ + rotate_half(t)*sin_ allocates a full-sequence temporary; at S=30k, head_dim=512, BF16: ~30 MiB per head. Chunking to 1024 reduces peak, but the chunked path detach()es, severing autograd through the rotary multiply. Safe only when no adapter upstream of attention needs that gradient (linear_proj-only LoRA). Disable it to train qkv/all-linear adapters; raise CP instead to recover the memory.",
+        required_for="60k SFT memory at low CP with linear_proj-only LoRA (not needed at 4k, and droppable at high CP).",
+        ablation="Memory-only: gradient-unsafe at target_modules other than linear_proj; the 60k-without-memory-patches plan disables this and absorbs the memory via CP=4-8.",
     ),
     *TRANSFORMERS_DSV4_PATCHES,
 )
