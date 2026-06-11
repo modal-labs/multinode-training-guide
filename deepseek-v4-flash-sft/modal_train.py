@@ -905,6 +905,102 @@ def export_checkpoint(
 
 
 @app.function(
+    image=msswift_image,
+    volumes={CHECKPOINTS_DIR: checkpoints_volume},
+    timeout=3600,
+    memory=131072,
+)
+def inspect_lora_adapter(run_id: str, checkpoint_step: int = 5):
+    """Report per-target-module LoRA norms from a saved Megatron checkpoint.
+
+    LoRA ``lora_B`` is zero-initialized, so a nonzero ``lora_B`` norm after
+    training proves that adapter received gradient. This is the gradient-safety
+    check for broad target modules: with the gradient-unsafe memory patches
+    disabled, qkv adapters should train (nonzero ``lora_B``); with them enabled,
+    qkv adapters stay exactly zero while only ``linear_proj`` trains.
+    """
+    import collections
+    import re
+
+    import torch
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    checkpoints_volume.reload()
+    ckpt_dir = f"{CHECKPOINTS_DIR}/{run_id}/checkpoint-{checkpoint_step}"
+    if not os.path.exists(ckpt_dir):
+        raise RuntimeError(f"Checkpoint not found at {ckpt_dir}")
+    iter_dirs = sorted(d for d in os.listdir(ckpt_dir) if d.startswith("iter_"))
+    if not iter_dirs:
+        raise RuntimeError(f"No iter_* dir under {ckpt_dir}: {os.listdir(ckpt_dir)}")
+    dcp_dir = os.path.join(ckpt_dir, iter_dirs[-1])
+
+    reader = FileSystemReader(dcp_dir)
+    metadata = reader.read_metadata()
+    all_keys = list(metadata.state_dict_metadata.keys())
+    lora_keys = [k for k in all_keys if "lora" in k.lower()]
+    print(f"[inspect] {len(all_keys)} tensors total, {len(lora_keys)} LoRA tensors")
+    if not lora_keys:
+        raise RuntimeError("No LoRA tensors found in checkpoint")
+
+    state_dict = {}
+    for key in lora_keys:
+        tmd = metadata.state_dict_metadata[key]
+        if not isinstance(tmd, TensorStorageMetadata):
+            continue
+        state_dict[key] = torch.empty(tuple(tmd.size), dtype=tmd.properties.dtype)
+    dcp.load(state_dict, storage_reader=reader)
+
+    def module_kind(key: str) -> str:
+        if "linear_proj" in key:
+            return "linear_proj"
+        if re.search(
+            r"linear_qkv|linear_q_|linear_kv_|q_up_proj|kv_proj|q_down_proj", key
+        ):
+            return "linear_qkv"
+        return "other"
+
+    def lora_side(key: str) -> str | None:
+        low = key.lower()
+        if "lora_b" in low:
+            return "B"
+        if "lora_a" in low:
+            return "A"
+        return None
+
+    agg = collections.defaultdict(
+        lambda: {
+            "A_nonzero": 0,
+            "A_total": 0,
+            "B_nonzero": 0,
+            "B_total": 0,
+            "B_maxnorm": 0.0,
+        }
+    )
+    for key, tensor in state_dict.items():
+        side = lora_side(key)
+        if side is None:
+            continue
+        norm = float(tensor.float().norm())
+        stats = agg[module_kind(key)]
+        stats[f"{side}_total"] += 1
+        if norm > 0:
+            stats[f"{side}_nonzero"] += 1
+        if side == "B":
+            stats["B_maxnorm"] = max(stats["B_maxnorm"], norm)
+
+    result = {kind: dict(stats) for kind, stats in agg.items()}
+    for kind, stats in sorted(result.items()):
+        print(
+            f"[inspect] {kind}: lora_B nonzero {stats['B_nonzero']}/{stats['B_total']} "
+            f"(max ||B||={stats['B_maxnorm']:.4e}), "
+            f"lora_A nonzero {stats['A_nonzero']}/{stats['A_total']}"
+        )
+    return result
+
+
+@app.function(
     image=vllm_image,
     gpu="B200:8",
     volumes={CHECKPOINTS_DIR: checkpoints_volume},
