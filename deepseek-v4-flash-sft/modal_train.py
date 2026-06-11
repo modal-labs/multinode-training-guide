@@ -453,7 +453,7 @@ def _train_model_impl(
         "--tuner_type",
         "lora",
         "--target_modules",
-        target_modules,
+        *[m.strip() for m in target_modules.split(",") if m.strip()],
         "--lora_rank",
         str(lora_rank),
         "--lora_alpha",
