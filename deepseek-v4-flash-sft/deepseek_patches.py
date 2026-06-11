@@ -18,18 +18,19 @@ AutoConfig / MODEL_FOR_CAUSAL_LM_MAPPING lookups fail.  These two patches append
 the registration to the installed transformers package.
 
 ### 2. Long-context memory (7 patches) — five reduce peak memory at 60k
-At 60k tokens, five patches reduce peak memory. Three of them sever autograd for
+At 60k tokens, five patches reduce peak memory. Four of them sever autograd for
 any adapter upstream of attention, so they are only safe with linear_proj-only
-LoRA (these three are GRADIENT_UNSAFE_TRAINING_PATCHES):
+LoRA (these four are GRADIENT_UNSAFE_TRAINING_PATCHES):
   - attention concat in-place rewrite + del          (~60 MiB/layer saved)
   - CSA gather/softmax seq-chunking                  (7.5 GiB → 4 MiB peak per chunk)
   - RoPE rotary chunking (megatron_rope_seq_chunking)  (~30 MiB/head saved)
-
-The other two reduce memory without touching adapter gradients (the mask is not
-differentiable; the indexer's no_grad path only fires when its aux loss is off),
-so they are gradient-safe at any target_modules:
-  - padding-mask diagonal extraction          (avoids 900M-element reduction)
   - DSA indexer head-chunking + no_grad       (43 GiB → 22 GiB peak)
+
+The indexer's index scores are computed from q/k, so the no_grad/chunked path
+severs gradient to any qkv adapter feeding them — hence gradient-unsafe. The one
+remaining memory patch does not touch adapter gradients (the mask is not
+differentiable), so it is gradient-safe at any target_modules:
+  - padding-mask diagonal extraction          (avoids 900M-element reduction)
 
 Two more are gradient-safe and always stay on:
   - rope config (YaRN field propagation)      (required at ALL lengths)
@@ -38,10 +39,10 @@ Two more are gradient-safe and always stay on:
 At the default 4k sequence length, none of the memory patches OOM — only the rope
 config patch is required so Megatron can initialize YaRN position embeddings. To
 train adapters upstream of attention (e.g. linear_qkv / all-linear), disable the
-three gradient-unsafe patches and absorb their memory by raising context parallelism.
+four gradient-unsafe patches and absorb their memory by raising context parallelism.
 
-The three gradient-unsafe patches are validated only for `linear_proj` LoRA. The
-training entrypoint rejects broader target modules while those patches are enabled.
+The gradient-unsafe memory patches are validated only for `linear_proj` LoRA.
+The training entrypoint rejects broader target modules while those patches are enabled.
 
 ### 3. vLLM BF16 serving (7 patches) — only needed for inference / eval
 vLLM 0.22.1 expects FP8/MXFP4 scale tensors and CUTLASS DSL kernels that are
@@ -69,6 +70,7 @@ class PatchSpec:
 GRADIENT_UNSAFE_TRAINING_PATCHES = frozenset(
     {
         "mcore_bridge_attention_memory",
+        "megatron_dsa_chunked_indexer",
         "megatron_csa_chunked_unfused_attention",
         "megatron_rope_seq_chunking",
     }
@@ -765,8 +767,8 @@ MSSWIFT_MEGATRON_PATCHES = (
         command=MCORE_DSA_ZERO_LOSS_TOPK_PATCH,
         verify_command=MCORE_DSA_ZERO_LOSS_TOPK_VERIFY,
         why="DSA indexer computes [S_q, B, n_heads, S_k] scores. At S=30k, n_heads=4, FP32: 30k*1*4*30k*4 ≈ 43 GiB. Chunking by head pairs reduces peak to ~22 GiB. no_grad top-k when loss_coeff=0 avoids materializing the backward graph.",
-        required_for="60k SFT (not needed at 4k where the full tensor is ~75 MiB)",
-        ablation="REQUIRED at 60k: disabling it OOMs before step 1 in dsa.py _compute_index_scores, allocating ~50 GiB per rank.",
+        required_for="60k SFT memory with linear_proj-only LoRA (not needed at 4k where the full tensor is ~75 MiB).",
+        ablation="Gradient-unsafe: the no_grad index-score path severs gradient to qkv adapters that feed the indexer, so it is only safe at target_modules=linear_proj. Memory-wise REQUIRED at 60k (disabling it OOMs in dsa.py _compute_index_scores, ~50 GiB/rank); the 60k-without-memory-patches plan disables it and absorbs the memory via CP=4-8.",
     ),
     PatchSpec(
         name="megatron_csa_chunked_unfused_attention",
