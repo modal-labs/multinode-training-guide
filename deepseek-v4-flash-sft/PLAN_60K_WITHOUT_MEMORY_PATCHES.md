@@ -65,10 +65,16 @@ were avoiding, so it is the committed default. CP=8 is not required.
 
 ## Running 60k SFT
 
-The defaults in `modal_train.py` are already CP=4. A 60k run needs a 4-node
-cluster (`N_NODES=4`, 32×B200) and broad LoRA targets are now safe:
+The `long_context_loop` entrypoint defaults to CP=4 (the general `train_model` /
+`export` path stays CP=1 so it runs on a single node). A 60k run needs a 4-node
+cluster (`N_NODES=4`, 32×B200) because `TP*EP*PP*CP = 1*8*1*4 = 32` must divide
+`N_NODES*8`. Broad LoRA targets are now safe:
 
 ```bash
+# full loop (eval → train → export → eval), CP=4 by default
+N_NODES=4 modal run -d modal_train.py::long_context_loop
+
+# or just a training run; train_model defaults to CP=1, so pass --cp-size 4
 N_NODES=4 modal run -d modal_train.py::train_model \
   --max-length 61440 --cp-size 4 \
   --target-modules linear_q_up_proj,linear_kv_proj,linear_proj

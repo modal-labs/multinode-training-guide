@@ -33,10 +33,14 @@ DEFAULT_TARGET_MODULES = "linear_proj"
 TP_SIZE = 1
 PP_SIZE = 1
 EP_SIZE = 8
-# CP=4 (4 nodes) is the validated default for 60k: it absorbs the long-context
-# activation memory without the detach-based memory patches, so LoRA gradients
-# stay correct for any target_modules. See PLAN_60K_WITHOUT_MEMORY_PATCHES.md.
-CP_SIZE = 4
+# CP=1 keeps the default 4k recipe (train_model / export) on a single 8-GPU node
+# (TP*EP*PP*CP must divide n_nodes*8).
+CP_SIZE = 1
+# The 60k long-context recipe runs at CP=4 on 4 nodes (32xB200). CP=4 absorbs the
+# long-context activation memory without the detach-based memory patches, so LoRA
+# gradients stay correct for any target_modules. See
+# PLAN_60K_WITHOUT_MEMORY_PATCHES.md. Launch long_context_loop with N_NODES=4.
+LONG_CONTEXT_CP_SIZE = 4
 GPUS_PER_NODE = 8
 
 MS_SWIFT_COMMIT = "5bbdfc5e5d458fda520b1b7cf4643dfa9e0bd348"
@@ -1622,11 +1626,15 @@ def long_context_loop(
     tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
     pp_size: int = PP_SIZE,
-    cp_size: int = CP_SIZE,
+    cp_size: int = LONG_CONTEXT_CP_SIZE,
     global_batch_size: int = 8,
     micro_batch_size: int = 1,
 ):
-    """Full long-context loop: baseline eval → train → export → post-training eval."""
+    """Full long-context loop: baseline eval → train → export → post-training eval.
+
+    The 60k recipe needs CP=4 on 4 nodes; launch with N_NODES=4 so the cluster has
+    32 GPUs (TP*EP*PP*CP = 1*8*1*4 = 32 must divide N_NODES*8).
+    """
     print("=" * 60)
     print("LONG-CONTEXT SUMMARIZATION LOOP")
     print(f"  run_id: {run_id}")
