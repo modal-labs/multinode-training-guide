@@ -14,7 +14,6 @@ import modal
 import modal.experimental
 
 from deepseek_patches import (
-    GRADIENT_UNSAFE_TRAINING_PATCHES,
     MSSWIFT_MEGATRON_PATCHES,
     TRANSFORMERS_DSV4_PATCHES,
     VLLM_PATCHES,
@@ -34,7 +33,14 @@ DEFAULT_TARGET_MODULES = "linear_proj"
 TP_SIZE = 1
 PP_SIZE = 1
 EP_SIZE = 8
+# CP=1 keeps the default 4k recipe (train_model / export) on a single 8-GPU node
+# (TP*EP*PP*CP must divide n_nodes*8).
 CP_SIZE = 1
+# The 60k long-context recipe runs at CP=4 on 4 nodes (32xB200). CP=4 absorbs the
+# long-context activation memory without the detach-based memory patches, so LoRA
+# gradients stay correct for any target_modules. See
+# PLAN_60K_WITHOUT_MEMORY_PATCHES.md. Launch long_context_loop with N_NODES=4.
+LONG_CONTEXT_CP_SIZE = 4
 GPUS_PER_NODE = 8
 
 MS_SWIFT_COMMIT = "5bbdfc5e5d458fda520b1b7cf4643dfa9e0bd348"
@@ -60,29 +66,6 @@ CHECKPOINTS_DIR = "/checkpoints"
 
 # Evaluated at decoration time by @modal.experimental.clustered.
 N_NODES = int(os.environ.get("N_NODES", "1"))
-
-
-def _comma_separated_names(value: str) -> set[str]:
-    return {name.strip() for name in value.split(",") if name.strip()}
-
-
-def _validate_target_modules_for_memory_patches(target_modules: str) -> None:
-    requested = _comma_separated_names(target_modules)
-    if requested == {DEFAULT_TARGET_MODULES}:
-        return
-
-    applied = _comma_separated_names(os.environ.get("DSV4_APPLIED_PATCHES", ""))
-    if not applied:
-        applied = set(GRADIENT_UNSAFE_TRAINING_PATCHES)
-    unsafe_enabled = sorted(GRADIENT_UNSAFE_TRAINING_PATCHES & applied)
-    if unsafe_enabled:
-        raise ValueError(
-            f"target_modules={target_modules!r} is only gradient-safe when these "
-            f"memory patches are disabled: {', '.join(unsafe_enabled)}. The "
-            f"default patched 60k recipe is validated only for "
-            f"target_modules={DEFAULT_TARGET_MODULES!r}; disable the listed "
-            "patches and increase CP/PP before targeting qkv or all-linear LoRA."
-        )
 
 
 def default_run_id(
@@ -397,7 +380,6 @@ def _train_model_impl(
         raise ValueError(
             f"TP×EP×PP×CP={model_parallel_size} must divide {total_gpus} total GPUs"
         )
-    _validate_target_modules_for_memory_patches(target_modules)
 
     hf_cache_vol.reload()
     data_volume.reload()
@@ -453,7 +435,7 @@ def _train_model_impl(
         "--tuner_type",
         "lora",
         "--target_modules",
-        target_modules,
+        *[m.strip() for m in target_modules.split(",") if m.strip()],
         "--lora_rank",
         str(lora_rank),
         "--lora_alpha",
@@ -902,6 +884,102 @@ def export_checkpoint(
         checkpoints_volume.commit()
     print(f"[export] Merged HF model saved to {merged_dir}")
     return {"merged_dir": merged_dir, "run_id": run_id}
+
+
+@app.function(
+    image=msswift_image,
+    volumes={CHECKPOINTS_DIR: checkpoints_volume},
+    timeout=3600,
+    memory=131072,
+)
+def inspect_lora_adapter(run_id: str, checkpoint_step: int = 5):
+    """Report per-target-module LoRA norms from a saved Megatron checkpoint.
+
+    LoRA ``lora_B`` is zero-initialized, so a nonzero ``lora_B`` norm after
+    training proves that adapter received gradient. This is the gradient-safety
+    check for broad target modules: with the gradient-unsafe memory patches
+    disabled, qkv adapters should train (nonzero ``lora_B``); with them enabled,
+    qkv adapters stay exactly zero while only ``linear_proj`` trains.
+    """
+    import collections
+    import re
+
+    import torch
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    checkpoints_volume.reload()
+    ckpt_dir = f"{CHECKPOINTS_DIR}/{run_id}/checkpoint-{checkpoint_step}"
+    if not os.path.exists(ckpt_dir):
+        raise RuntimeError(f"Checkpoint not found at {ckpt_dir}")
+    iter_dirs = sorted(d for d in os.listdir(ckpt_dir) if d.startswith("iter_"))
+    if not iter_dirs:
+        raise RuntimeError(f"No iter_* dir under {ckpt_dir}: {os.listdir(ckpt_dir)}")
+    dcp_dir = os.path.join(ckpt_dir, iter_dirs[-1])
+
+    reader = FileSystemReader(dcp_dir)
+    metadata = reader.read_metadata()
+    all_keys = list(metadata.state_dict_metadata.keys())
+    lora_keys = [k for k in all_keys if "lora" in k.lower()]
+    print(f"[inspect] {len(all_keys)} tensors total, {len(lora_keys)} LoRA tensors")
+    if not lora_keys:
+        raise RuntimeError("No LoRA tensors found in checkpoint")
+
+    state_dict = {}
+    for key in lora_keys:
+        tmd = metadata.state_dict_metadata[key]
+        if not isinstance(tmd, TensorStorageMetadata):
+            continue
+        state_dict[key] = torch.empty(tuple(tmd.size), dtype=tmd.properties.dtype)
+    dcp.load(state_dict, storage_reader=reader)
+
+    def module_kind(key: str) -> str:
+        if "linear_proj" in key:
+            return "linear_proj"
+        if re.search(
+            r"linear_qkv|linear_q_|linear_kv_|q_up_proj|kv_proj|q_down_proj", key
+        ):
+            return "linear_qkv"
+        return "other"
+
+    def lora_side(key: str) -> str | None:
+        low = key.lower()
+        if "lora_b" in low:
+            return "B"
+        if "lora_a" in low:
+            return "A"
+        return None
+
+    agg = collections.defaultdict(
+        lambda: {
+            "A_nonzero": 0,
+            "A_total": 0,
+            "B_nonzero": 0,
+            "B_total": 0,
+            "B_maxnorm": 0.0,
+        }
+    )
+    for key, tensor in state_dict.items():
+        side = lora_side(key)
+        if side is None:
+            continue
+        norm = float(tensor.float().norm())
+        stats = agg[module_kind(key)]
+        stats[f"{side}_total"] += 1
+        if norm > 0:
+            stats[f"{side}_nonzero"] += 1
+        if side == "B":
+            stats["B_maxnorm"] = max(stats["B_maxnorm"], norm)
+
+    result = {kind: dict(stats) for kind, stats in agg.items()}
+    for kind, stats in sorted(result.items()):
+        print(
+            f"[inspect] {kind}: lora_B nonzero {stats['B_nonzero']}/{stats['B_total']} "
+            f"(max ||B||={stats['B_maxnorm']:.4e}), "
+            f"lora_A nonzero {stats['A_nonzero']}/{stats['A_total']}"
+        )
+    return result
 
 
 @app.function(
@@ -1548,11 +1626,15 @@ def long_context_loop(
     tp_size: int = TP_SIZE,
     ep_size: int = EP_SIZE,
     pp_size: int = PP_SIZE,
-    cp_size: int = CP_SIZE,
+    cp_size: int = LONG_CONTEXT_CP_SIZE,
     global_batch_size: int = 8,
     micro_batch_size: int = 1,
 ):
-    """Full long-context loop: baseline eval → train → export → post-training eval."""
+    """Full long-context loop: baseline eval → train → export → post-training eval.
+
+    The 60k recipe needs CP=4 on 4 nodes; launch with N_NODES=4 so the cluster has
+    32 GPUs (TP*EP*PP*CP = 1*8*1*4 = 32 must divide N_NODES*8).
+    """
     print("=" * 60)
     print("LONG-CONTEXT SUMMARIZATION LOOP")
     print(f"  run_id: {run_id}")
