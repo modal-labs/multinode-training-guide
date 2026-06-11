@@ -14,7 +14,6 @@ import modal
 import modal.experimental
 
 from deepseek_patches import (
-    GRADIENT_UNSAFE_TRAINING_PATCHES,
     MSSWIFT_MEGATRON_PATCHES,
     TRANSFORMERS_DSV4_PATCHES,
     VLLM_PATCHES,
@@ -34,7 +33,10 @@ DEFAULT_TARGET_MODULES = "linear_proj"
 TP_SIZE = 1
 PP_SIZE = 1
 EP_SIZE = 8
-CP_SIZE = 1
+# CP=4 (4 nodes) is the validated default for 60k: it absorbs the long-context
+# activation memory without the detach-based memory patches, so LoRA gradients
+# stay correct for any target_modules. See PLAN_60K_WITHOUT_MEMORY_PATCHES.md.
+CP_SIZE = 4
 GPUS_PER_NODE = 8
 
 MS_SWIFT_COMMIT = "5bbdfc5e5d458fda520b1b7cf4643dfa9e0bd348"
@@ -60,29 +62,6 @@ CHECKPOINTS_DIR = "/checkpoints"
 
 # Evaluated at decoration time by @modal.experimental.clustered.
 N_NODES = int(os.environ.get("N_NODES", "1"))
-
-
-def _comma_separated_names(value: str) -> set[str]:
-    return {name.strip() for name in value.split(",") if name.strip()}
-
-
-def _validate_target_modules_for_memory_patches(target_modules: str) -> None:
-    requested = _comma_separated_names(target_modules)
-    if requested == {DEFAULT_TARGET_MODULES}:
-        return
-
-    applied = _comma_separated_names(os.environ.get("DSV4_APPLIED_PATCHES", ""))
-    if not applied:
-        applied = set(GRADIENT_UNSAFE_TRAINING_PATCHES)
-    unsafe_enabled = sorted(GRADIENT_UNSAFE_TRAINING_PATCHES & applied)
-    if unsafe_enabled:
-        raise ValueError(
-            f"target_modules={target_modules!r} is only gradient-safe when these "
-            f"memory patches are disabled: {', '.join(unsafe_enabled)}. The "
-            f"default patched 60k recipe is validated only for "
-            f"target_modules={DEFAULT_TARGET_MODULES!r}; disable the listed "
-            "patches and increase CP/PP before targeting qkv or all-linear LoRA."
-        )
 
 
 def default_run_id(
@@ -397,7 +376,6 @@ def _train_model_impl(
         raise ValueError(
             f"TP×EP×PP×CP={model_parallel_size} must divide {total_gpus} total GPUs"
         )
-    _validate_target_modules_for_memory_patches(target_modules)
 
     hf_cache_vol.reload()
     data_volume.reload()
