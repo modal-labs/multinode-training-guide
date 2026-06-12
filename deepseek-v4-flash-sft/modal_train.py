@@ -135,7 +135,6 @@ download_image = (
         "huggingface_hub[hf_xet]==0.36.0",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
-        "torch==2.9.1",
         "transformers==5.10.2",
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
@@ -195,7 +194,6 @@ vllm_image = (
         VLLM_PATCHES,
     )
     .entrypoint([])
-    .env({"VLLM_USE_V1": "1"})
     .add_local_python_source("deepseek_patches")
 )
 

@@ -2,10 +2,8 @@
 """Patch registry for the DeepSeek-V4-Flash SFT example.
 
 Each patch is isolated here so the training file shows the recipe rather than a wall
-of source edits.  The `why` and `ablation` fields document the failure that justified
-keeping the patch.  Disable one or more patches for experiments with:
-
-    DSV4_DISABLED_PATCHES=patch_name[,patch_name...] modal run ...
+of source edits.  The `why` field documents the failure that justified keeping the
+patch.
 
 ## Patch categories
 
@@ -35,7 +33,6 @@ exported model can be served without quantization.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -45,37 +42,15 @@ class PatchSpec:
     name: str
     command: str
     why: str
-    required_for: str
     verify_command: str | None = None
-    ablation: str = "not yet ablated"
-
-
-def disabled_patch_names() -> set[str]:
-    return {
-        name.strip()
-        for name in os.environ.get("DSV4_DISABLED_PATCHES", "").split(",")
-        if name.strip()
-    }
 
 
 def apply_image_patches(image, patches: Iterable[PatchSpec]):
-    disabled = disabled_patch_names()
-    applied: list[str] = []
     for patch in patches:
-        if patch.name in disabled:
-            image = image.run_commands(f"echo Skipping DeepSeek patch: {patch.name}")
-            continue
-        image = image.run_commands(f"echo Applying DeepSeek patch: {patch.name}")
         image = image.run_commands(patch.command)
-        applied.append(patch.name)
         if patch.verify_command is not None:
             image = image.run_commands(patch.verify_command)
-    return image.env(
-        {
-            "DSV4_APPLIED_PATCHES": ",".join(applied),
-            "DSV4_DISABLED_PATCHES": ",".join(sorted(disabled)),
-        }
-    )
+    return image
 
 
 MCORE_BRIDGE_ROPE_CONFIG_PATCH = r"""python - <<'PY'
@@ -270,16 +245,12 @@ MSSWIFT_MEGATRON_PATCHES = (
         command=MCORE_BRIDGE_ROPE_CONFIG_PATCH,
         verify_command=MCORE_BRIDGE_ROPE_CONFIG_VERIFY,
         why="mcore-bridge 1.4.2 does not propagate DSv4 YaRN rope_scaling fields (factor, beta_fast, beta_slow, mscale) from HF config. Without them, RoPE initialization fails.",
-        required_for="any DSv4 Megatron SFT (all sequence lengths)",
-        ablation="REQUIRED: disabling it crashes during model init with missing ModelConfig.beta_fast.",
     ),
     PatchSpec(
         name="megatron_rope_cp_shape_fix",
         command=MCORE_DSV4_ROPE_SHAPE_FIX_PATCH,
         verify_command=MCORE_DSV4_ROPE_SHAPE_FIX_VERIFY,
         why="Two gradient-safe shape fixes: (1) CP padding — pos_emb length must be divisible by 2*CP for the context-parallel split/gather, required when CP>1. (2) cos_/sin_ length reconciliation — handles the shape mismatch when the rotary cache is shorter than the (CP-padded) input; warns loudly if it would ever cyclically repeat (repeats>1) and wrap positions. Neither edit detaches, so both are safe at any target_modules.",
-        required_for="any CP>1 run (60k validation scales CP to 4-8).",
-        ablation="REQUIRED for CP>1: disabling it crashes before step 1 with RoPE tensor length mismatches (e.g. 7216 vs 3608).",
     ),
 )
 
@@ -288,35 +259,25 @@ VLLM_PATCHES = (
         name="vllm_scale_fmt_default",
         command=VLLM_SCALE_FMT_PATCH,
         why="vLLM expects quantization_config.scale_fmt for quantized DeepSeek-V4 checkpoints; the exported BF16 merged checkpoint has no quantization_config, so default to ue8m0 only where vLLM reads the field.",
-        required_for="vLLM startup for merged BF16 checkpoint",
-        ablation="post-SFT eval required this for server startup",
     ),
     PatchSpec(
         name="vllm_ignore_missing_bf16_scale_weights",
         command=VLLM_BF16_SCALE_WEIGHTS_PATCH,
         why="The merged BF16 safetensors do not contain FP8/MXFP4 scale tensors such as weight_scale_inv; vLLM loader must skip only those absent scale tensors while still erroring on real missing weights.",
-        required_for="vLLM weight loading for merged BF16 checkpoint",
-        ablation="post-SFT eval required this for loading exported safetensors",
     ),
     PatchSpec(
         name="vllm_bf16_attention_scale_fallback",
         command=VLLM_BF16_ATTENTION_PATCH,
         why="The BF16 attention module does not expose wo_a.weight_scale_inv, so vLLM must take the non-quantized fallback path rather than the quantized scale path.",
-        required_for="vLLM forward for merged BF16 checkpoint",
-        ablation="post-SFT eval required this for inference",
     ),
     PatchSpec(
         name="vllm_compressor_triton_fallback",
         command=VLLM_COMPRESSOR_FALLBACK_PATCH,
         why="The specialized head_dim=512 compressor branch failed for this image/checkpoint combination; the generic fallback served 60k eval successfully.",
-        required_for="vLLM 60k inference",
-        ablation="post-SFT eval required this for stable inference",
     ),
     PatchSpec(
         name="vllm_remove_cutlass_dsl_package",
         command=VLLM_UNINSTALL_CUTLASS_DSL,
         why="vLLM 0.22.1 gates the CUTLASS DSL indexer/cache kernels (which fail in this image) on has_cutedsl() == _has_module('cutlass'). Uninstalling nvidia-cutlass-dsl makes has_cutedsl() return False everywhere, which is the primary mechanism that forces the working non-CUTEDSL fallback paths.",
-        required_for="vLLM startup/inference stability",
-        ablation="post-SFT eval kept this enabled",
     ),
 )
