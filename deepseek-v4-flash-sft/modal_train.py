@@ -132,7 +132,7 @@ download_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "datasets==3.1.0",
-        "huggingface_hub[hf_xet]==0.36.0",
+        "huggingface_hub[hf_xet]==1.19.0",
         "safetensors==0.7.0",
         "sentencepiece==0.2.1",
         "transformers==5.10.2",
@@ -159,7 +159,7 @@ msswift_image = (
         .pip_install(
             "datasets==3.1.0",
             "einops==0.8.2",
-            "huggingface_hub[hf_xet]==0.36.0",
+            "huggingface_hub[hf_xet]==1.19.0",
             f"ms-swift @ git+https://github.com/modelscope/ms-swift.git@{MS_SWIFT_COMMIT}",
             "safetensors==0.7.0",
             "sentencepiece==0.2.1",
@@ -291,11 +291,13 @@ def smoke_test():
         use_fast=True,
     )
 
-    chat_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "Write a one-line Modal training smoke test."}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    # DeepSeek-V4-Flash ships a plain PreTrainedTokenizerFast with no chat
+    # template, and transformers no longer applies a default ChatML fallback, so
+    # validate raw tokenization here. The training template is supplied by
+    # ms-swift, and the serving template is exercised end-to-end in the eval path.
+    token_ids = tokenizer("Write a one-line Modal training smoke test.")["input_ids"]
+    if not token_ids:
+        raise RuntimeError("Tokenizer produced no tokens for the smoke prompt")
 
     megatron_path = shutil.which("megatron")
     if megatron_path is None:
@@ -305,7 +307,7 @@ def smoke_test():
     print(f"{MODEL_NAME}: model_type={config.model_type}")
     print(f"{MODEL_NAME}: layers={config.num_hidden_layers}")
     print(f"{MODEL_NAME}: experts={config.n_routed_experts}")
-    print(f"{MODEL_NAME}: chat template chars={len(chat_prompt)}")
+    print(f"{MODEL_NAME}: smoke prompt tokens={len(token_ids)}")
     return {
         "model_type": config.model_type,
         "num_hidden_layers": config.num_hidden_layers,
