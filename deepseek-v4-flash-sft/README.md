@@ -111,7 +111,9 @@ DeepSeek-V4-Flash until MLA tensor parallelism is supported for the DSv4 hybrid 
 `modal_train.py` pins the Megatron-Core dev commit that provides the DSv4 hybrid attention module
 required by `mcore-bridge`.
 
-For 60k-context SFT, use context parallelism instead of the old detach-based memory patches:
+## Long-context (60k) SFT
+
+For 60k-context SFT, use context parallelism instead of memory patches:
 
 ```bash
 N_NODES=4 modal run --detach modal_train.py::long_context_loop \
@@ -119,9 +121,43 @@ N_NODES=4 modal run --detach modal_train.py::long_context_loop \
 ```
 
 This runs baseline eval, prepares synthetic 60k summarization data, trains for five steps, exports the
-checkpoint, and re-runs eval. The committed long-context path runs at CP=4 on 4×8 B200 nodes. The
-earlier gradient-unsafe memory patches were removed, so broader DeepSeek MLA LoRA targets
-(`linear_q_up_proj`, `linear_kv_proj`, `linear_proj`) train with correct gradients.
+checkpoint, and re-runs eval. The committed long-context path runs at CP=4 on 4×8 B200 nodes
+(`TP*EP*PP*CP = 1*8*1*4 = 32` must divide `N_NODES*8`, so launch with `N_NODES=4`).
+
+### Context parallelism instead of memory patches
+
+An earlier revision fit 60k context on 2 nodes with detach-based memory patches that rewrote DSv4
+attention to reduce peak memory. Those rewrites severed autograd through attention, so LoRA gradients
+were only correct when targeting `linear_proj` (the attention *output* projection). Targeting any
+module upstream of attention silently produced **zero gradients** on those adapters — no error raised.
+
+Those patches were removed in favor of raising context parallelism. The allocations they guarded all
+scale with the per-rank sequence length `S_rank` (the DSA indexer quadratically), so raising CP shrinks
+`S_rank` and absorbs the same memory while keeping gradients correct for **any** `target_modules`:
+
+| CP | `S_rank` @60k | DSA indexer peak (∝ `S_rank²`) | CSA gather peak (∝ `S_rank`) |
+| ---: | ---: | ---: | ---: |
+| 2 | 30k | ~43 GiB | ~19.5 GiB |
+| 4 (default) | 15k | ~11 GiB | ~10 GiB |
+| 8 | 7.5k | ~2.7 GiB | ~5 GiB |
+
+On B200 (180 GB), CP=4 comfortably absorbs every allocation the dropped patches were avoiding (the
+validated 60k run peaks at ~81 GiB/GPU), so it is the committed default; CP=8 is not required. With the
+memory patches gone, broader DeepSeek MLA LoRA targets (`linear_q_up_proj`, `linear_kv_proj`,
+`linear_proj`) train with correct gradients.
+
+> **Module names:** DeepSeek-V4 uses MLA, not fused QKV, so there is no `linear_qkv` module. The
+> attention-input projections are `linear_q_up_proj` (RoPE query up-proj) and `linear_kv_proj` (KV
+> latent); the output projection is `linear_proj`. Targeting a nonexistent module silently trains
+> nothing there (peft matches 0 modules).
+
+### Known limits
+
+This does not change throughput: the unfused DSA/CSA reference kernels are slow regardless of memory.
+The better long-term path for production long-context DSv4-Flash training is fused TileLang kernels with
+real backward passes, but DSv4 attention LoRA is not wired up there today. Upstream NVIDIA Megatron-LM
+has no fused DSA kernels and no CSA implementation at all as of 2026-06; the pinned Megatron-Core commit
+comes from a fork.
 
 ## Optional W&B logging
 

@@ -22,7 +22,7 @@ revision used to fit 60k on 2 nodes. Those patches severed autograd through
 attention, so they were only correct with `linear_proj`-only LoRA. They were
 removed in favor of raising context parallelism (the default is now CP=4 / 4
 nodes), which absorbs the same memory while keeping gradients correct for any
-target module. See PLAN_60K_WITHOUT_MEMORY_PATCHES.md for the validation.
+target module. See the "Long-context (60k) SFT" section of README.md.
 
 ### 2. vLLM BF16 serving (5 patches) — only needed for inference / eval
 vLLM 0.22.1 expects FP8/MXFP4 scale tensors that are absent when serving the
