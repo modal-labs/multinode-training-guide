@@ -36,7 +36,7 @@ modal run modal_train.py::smoke_test
 ```
 
 This does not download the model weights. It builds the ms-swift image, verifies that Transformers
-can load the DeepSeek-V4-Flash config/tokenizer, checks the chat template, and confirms that
+can load the DeepSeek-V4-Flash config/tokenizer, tokenizes a sample prompt, and confirms that
 `megatron sft --help` is available.
 
 ### 2. Download the model
