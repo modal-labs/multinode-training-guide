@@ -9,7 +9,7 @@ keeping the patch.  Disable one or more patches for experiments with:
 
 ## Patch categories
 
-There are three independent categories — a total of 11 patches, but only the first
+There are three independent categories — a total of 9 patches, but only the first
 two categories apply to training:
 
 ### 1. Model registration (2 patches) — required at ALL sequence lengths
@@ -30,10 +30,11 @@ removed in favor of raising context parallelism (the default is now CP=4 / 4
 nodes), which absorbs the same memory while keeping gradients correct for any
 target module. See PLAN_60K_WITHOUT_MEMORY_PATCHES.md for the validation.
 
-### 3. vLLM BF16 serving (7 patches) — only needed for inference / eval
-vLLM 0.22.1 expects FP8/MXFP4 scale tensors and CUTLASS DSL kernels that are
-absent when serving the merged BF16 checkpoint.  These patches add fallbacks so
-the exported model can be served without quantization.
+### 3. vLLM BF16 serving (5 patches) — only needed for inference / eval
+vLLM 0.22.1 expects FP8/MXFP4 scale tensors that are absent when serving the
+merged BF16 checkpoint, and ships CUTLASS DSL kernels that fail in this image.
+These patches add scale fallbacks and uninstall the CUTLASS DSL package so the
+exported model can be served without quantization.
 """
 
 from __future__ import annotations
@@ -362,28 +363,6 @@ if old not in text:
 path.write_text(text.replace(old, new, 1))
 PY"""
 
-VLLM_DISABLE_CUTEDSL_INDEXER_PATCH = r"""python - <<'PY'
-from pathlib import Path
-path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py')
-text = path.read_text()
-old = 'from vllm.utils.import_utils import has_cutedsl\n'
-new = 'def has_cutedsl():\n    return False\n'
-if old not in text:
-    raise RuntimeError('DeepSeek V4 vLLM CUTLASS DSL fallback patch target not found')
-path.write_text(text.replace(old, new, 1))
-PY"""
-
-VLLM_DISABLE_CUTEDSL_CACHE_PATCH = r"""python - <<'PY'
-from pathlib import Path
-path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/common/ops/cache_utils.py')
-text = path.read_text()
-old = 'from vllm.utils.import_utils import has_cutedsl\n'
-new = 'def has_cutedsl():\n    return False\n'
-if old not in text:
-    raise RuntimeError('DeepSeek V4 vLLM cache CUTLASS DSL fallback patch target not found')
-path.write_text(text.replace(old, new, 1))
-PY"""
-
 VLLM_COMPRESSOR_FALLBACK_PATCH = r"""python - <<'PY'
 from pathlib import Path
 path = Path('/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/compressor.py')
@@ -459,20 +438,6 @@ VLLM_PATCHES = (
         ablation="post-SFT eval required this for inference",
     ),
     PatchSpec(
-        name="vllm_disable_cutedsl_indexer",
-        command=VLLM_DISABLE_CUTEDSL_INDEXER_PATCH,
-        why="The CUTLASS DSL fused indexer path failed in this image; forcing the non-CUTEDSL path keeps inference on the working implementation.",
-        required_for="vLLM DSv4 indexer inference",
-        ablation="post-SFT eval required this for stable inference",
-    ),
-    PatchSpec(
-        name="vllm_disable_cutedsl_cache",
-        command=VLLM_DISABLE_CUTEDSL_CACHE_PATCH,
-        why="The CUTLASS DSL cache utility path failed in this image; forcing the fallback matches the working indexer path.",
-        required_for="vLLM DSv4 cache/indexer inference",
-        ablation="post-SFT eval required this for stable inference",
-    ),
-    PatchSpec(
         name="vllm_compressor_triton_fallback",
         command=VLLM_COMPRESSOR_FALLBACK_PATCH,
         why="The specialized head_dim=512 compressor branch failed for this image/checkpoint combination; the generic fallback served 60k eval successfully.",
@@ -482,7 +447,7 @@ VLLM_PATCHES = (
     PatchSpec(
         name="vllm_remove_cutlass_dsl_package",
         command=VLLM_UNINSTALL_CUTLASS_DSL,
-        why="Uninstalling nvidia-cutlass-dsl prevents import-time selection of broken CUTEDSL kernels after the source-level fallbacks are applied.",
+        why="vLLM 0.22.1 gates the CUTLASS DSL indexer/cache kernels (which fail in this image) on has_cutedsl() == _has_module('cutlass'). Uninstalling nvidia-cutlass-dsl makes has_cutedsl() return False everywhere, which is the primary mechanism that forces the working non-CUTEDSL fallback paths.",
         required_for="vLLM startup/inference stability",
         ablation="post-SFT eval kept this enabled",
     ),
