@@ -111,7 +111,7 @@ DeepSeek-V4-Flash until MLA tensor parallelism is supported for the DSv4 hybrid 
 `modal_train.py` pins the Megatron-Core dev commit that provides the DSv4 hybrid attention module
 required by `mcore-bridge`.
 
-For 60k-context SFT, use context parallelism instead of the old detach-based memory patches:
+For 60k-context SFT, use context parallelism to shrink the per-rank sequence length:
 
 ```bash
 N_NODES=4 modal run --detach modal_train.py::long_context_loop \
@@ -120,8 +120,26 @@ N_NODES=4 modal run --detach modal_train.py::long_context_loop \
 
 This runs baseline eval, prepares synthetic 60k summarization data, trains for five steps, exports the
 checkpoint, and re-runs eval. The committed long-context path runs at CP=4 on 4×8 B200 nodes. The
-earlier gradient-unsafe memory patches were removed, so broader DeepSeek MLA LoRA targets
-(`linear_q_up_proj`, `linear_kv_proj`, `linear_proj`) train with correct gradients.
+per-rank memory tradeoff at 60k tokens is:
+
+| CP | Tokens per rank | DSA indexer peak | CSA gather peak |
+| ---: | ---: | ---: | ---: |
+| 2 | 30k | ~43 GiB | ~19.5 GiB |
+| 4 | 15k | ~11 GiB | ~10 GiB |
+| 8 | 7.5k | ~2.7 GiB | ~5 GiB |
+
+CP=4 is the default for `long_context_loop`: it keeps the large per-rank DSA/CSA allocations
+comfortable on B200 without needing CP=8. Broader DeepSeek MLA LoRA targets
+(`linear_q_up_proj`, `linear_kv_proj`, `linear_proj`) are safe in this path.
+
+DeepSeek-V4 uses MLA, not fused QKV, so there is no `linear_qkv` module. The attention-input
+projections are `linear_q_up_proj` and `linear_kv_proj`; the output projection is `linear_proj`.
+Passing a nonexistent target module can silently match zero modules.
+
+The current long-context training path still uses unfused DSA/CSA reference kernels, so CP fixes peak
+memory but not throughput. Upstream Megatron-LM has no fused DSA kernel and no CSA implementation as
+of 2026-06, so production-grade throughput will likely require fused kernels with backward support for
+the DeepSeek MLA module names.
 
 ## Optional W&B logging
 

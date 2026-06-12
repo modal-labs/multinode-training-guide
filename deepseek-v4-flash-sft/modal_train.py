@@ -38,8 +38,8 @@ EP_SIZE = 8
 CP_SIZE = 1
 # The 60k long-context recipe runs at CP=4 on 4 nodes (32xB200). CP=4 absorbs the
 # long-context activation memory without the detach-based memory patches, so LoRA
-# gradients stay correct for any target_modules. See
-# PLAN_60K_WITHOUT_MEMORY_PATCHES.md. Launch long_context_loop with N_NODES=4.
+# gradients stay correct for any target_modules. Launch long_context_loop with
+# N_NODES=4.
 LONG_CONTEXT_CP_SIZE = 4
 GPUS_PER_NODE = 8
 
