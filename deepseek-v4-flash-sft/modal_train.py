@@ -15,7 +15,6 @@ import modal.experimental
 
 from deepseek_patches import (
     MSSWIFT_MEGATRON_PATCHES,
-    TRANSFORMERS_DSV4_PATCHES,
     VLLM_PATCHES,
     apply_image_patches,
 )
@@ -128,16 +127,14 @@ def _pipeline_layout(model_dir: str, pp_size: int) -> str | None:
 
 
 download_image = (
-    apply_image_patches(
-        modal.Image.debian_slim(python_version="3.11").pip_install(
-            "datasets==3.1.0",
-            "huggingface_hub[hf_xet]==0.36.0",
-            "safetensors==0.7.0",
-            "sentencepiece==0.2.1",
-            "torch==2.9.1",
-            "transformers==4.57.4",
-        ),
-        TRANSFORMERS_DSV4_PATCHES,
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "datasets==3.1.0",
+        "huggingface_hub[hf_xet]==0.36.0",
+        "safetensors==0.7.0",
+        "sentencepiece==0.2.1",
+        "torch==2.9.1",
+        "transformers==5.10.2",
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
     .add_local_python_source("deepseek_patches")
@@ -165,7 +162,7 @@ msswift_image = (
             f"ms-swift @ git+https://github.com/modelscope/ms-swift.git@{MS_SWIFT_COMMIT}",
             "safetensors==0.7.0",
             "sentencepiece==0.2.1",
-            "transformers==4.57.4",
+            "transformers==5.10.2",
             "wandb==0.19.1",
         )
         .run_commands("pip install --no-deps mcore-bridge==1.4.2")

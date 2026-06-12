@@ -9,15 +9,11 @@ keeping the patch.  Disable one or more patches for experiments with:
 
 ## Patch categories
 
-There are three independent categories — a total of 9 patches, but only the first
-two categories apply to training:
+There are two independent categories — a total of 7 patches. `deepseek_v4` is
+registered natively in transformers 5.8.0+ (the images pin 5.10.2), so no model
+registration patches are needed; only the first category applies to training:
 
-### 1. Model registration (2 patches) — required at ALL sequence lengths
-Transformers 4.57 does not register `deepseek_v4` as a known model type, so
-AutoConfig / MODEL_FOR_CAUSAL_LM_MAPPING lookups fail.  These two patches append
-the registration to the installed transformers package.
-
-### 2. Megatron correctness (2 patches) — gradient-safe, no memory hacks
+### 1. Megatron correctness (2 patches) — gradient-safe, no memory hacks
 Both edit mcore-bridge / Megatron source to make DSv4 init and CP work; neither
 detaches, so both are safe at any `target_modules` (linear_proj, qkv, all-linear):
   - rope config (YaRN field propagation)            (required at ALL lengths)
@@ -30,7 +26,7 @@ removed in favor of raising context parallelism (the default is now CP=4 / 4
 nodes), which absorbs the same memory while keeping gradients correct for any
 target module. See PLAN_60K_WITHOUT_MEMORY_PATCHES.md for the validation.
 
-### 3. vLLM BF16 serving (5 patches) — only needed for inference / eval
+### 2. vLLM BF16 serving (5 patches) — only needed for inference / eval
 vLLM 0.22.1 expects FP8/MXFP4 scale tensors that are absent when serving the
 merged BF16 checkpoint, and ships CUTLASS DSL kernels that fail in this image.
 These patches add scale fallbacks and uninstall the CUTLASS DSL package so the
@@ -81,114 +77,6 @@ def apply_image_patches(image, patches: Iterable[PatchSpec]):
         }
     )
 
-
-DEEPSEEK_V4_CONFIG_PATCH = r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py <<'PY'
-try:
-    try:
-        from ...configuration_utils import PreTrainedConfig as _BaseConfig
-    except ImportError:
-        from ...configuration_utils import PretrainedConfig as _BaseConfig
-
-    class DeepseekV4Config(_BaseConfig):
-        model_type = "deepseek_v4"
-        has_no_defaults_at_init = True
-        keys_to_ignore_at_inference = ["past_key_values"]
-        attribute_map = {
-            "intermediate_size": "moe_intermediate_size",
-            "num_local_experts": "n_routed_experts",
-        }
-        default_compress_rates = {
-            "compressed_sparse_attention": 4,
-            "heavily_compressed_attention": 128,
-        }
-        default_num_hash_layers = 3
-        default_partial_rotary_factor = 64 / 512
-
-        def __init__(self, **kwargs):
-            compress_ratios = kwargs.pop("compress_ratios", None)
-            compress_rate_csa = kwargs.pop("compress_rate_csa", None)
-            compress_rate_hca = kwargs.pop("compress_rate_hca", None)
-            num_hash_layers = kwargs.pop("num_hash_layers", None)
-            qk_rope_head_dim = kwargs.pop("qk_rope_head_dim", None)
-            super().__init__(**kwargs)
-
-            n_layers = getattr(self, "num_hidden_layers", 0)
-            if getattr(self, "compress_rates", None) is None:
-                self.compress_rates = dict(self.default_compress_rates)
-            if compress_rate_csa is not None:
-                self.compress_rates["compressed_sparse_attention"] = compress_rate_csa
-            if compress_rate_hca is not None:
-                self.compress_rates["heavily_compressed_attention"] = compress_rate_hca
-
-            if getattr(self, "layer_types", None) is None and compress_ratios is not None:
-                ratio_to_layer_type = {
-                    0: "sliding_attention",
-                    4: "compressed_sparse_attention",
-                    128: "heavily_compressed_attention",
-                }
-                self.layer_types = [ratio_to_layer_type[r] for r in compress_ratios]
-            if getattr(self, "layer_types", None) is None:
-                interleave = [
-                    "compressed_sparse_attention" if i % 2 else "heavily_compressed_attention"
-                    for i in range(max(n_layers - 2, 0))
-                ]
-                self.layer_types = ["heavily_compressed_attention"] * min(n_layers, 2) + interleave
-            self.layer_types = list(self.layer_types[:n_layers])
-
-            if getattr(self, "mlp_layer_types", None) is None:
-                n_hash = num_hash_layers if num_hash_layers is not None else self.default_num_hash_layers
-                self.mlp_layer_types = ["hash_moe"] * min(n_layers, n_hash) + ["moe"] * max(
-                    0, n_layers - n_hash
-                )
-            self.mlp_layer_types = list(self.mlp_layer_types[:n_layers])
-
-            if getattr(self, "partial_rotary_factor", None) is None:
-                self.partial_rotary_factor = (
-                    qk_rope_head_dim / getattr(self, "head_dim", 1)
-                    if qk_rope_head_dim is not None
-                    else self.default_partial_rotary_factor
-                )
-            self.qk_rope_head_dim = int(getattr(self, "head_dim", 1) * self.partial_rotary_factor)
-
-    if "deepseek_v4" not in CONFIG_MAPPING:
-        CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
-except Exception:
-    pass
-PY"""
-
-DEEPSEEK_V4_MODELING_PATCH = r"""cat >>/usr/local/lib/python3.11/site-packages/transformers/models/auto/modeling_auto.py <<'PY'
-try:
-    from ...modeling_utils import PreTrainedModel as _PreTrainedModel
-    from ...models.auto.configuration_auto import CONFIG_MAPPING
-
-    class DeepseekV4ForCausalLM(_PreTrainedModel):
-        config_class = CONFIG_MAPPING["deepseek_v4"]
-        base_model_prefix = "model"
-        _no_split_modules = []
-
-        def __init__(self, config):
-            super().__init__(config)
-
-        def forward(self, *args, **kwargs):
-            raise NotImplementedError("DeepSeek-V4 export only uses this as a meta model")
-
-    MODEL_FOR_CAUSAL_LM_MAPPING.register(CONFIG_MAPPING["deepseek_v4"], DeepseekV4ForCausalLM)
-except Exception:
-    pass
-PY"""
-
-DEEPSEEK_V4_CONFIG_VERIFY = r"""python - <<'PY'
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-config_cls = CONFIG_MAPPING['deepseek_v4']
-assert config_cls.__name__ == 'DeepseekV4Config'
-PY"""
-
-DEEPSEEK_V4_MODELING_VERIFY = r"""python - <<'PY'
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
-config_cls = CONFIG_MAPPING['deepseek_v4']
-assert MODEL_FOR_CAUSAL_LM_MAPPING[config_cls].__name__ == 'DeepseekV4ForCausalLM'
-PY"""
 
 MCORE_BRIDGE_ROPE_CONFIG_PATCH = r"""python - <<'PY'
 from pathlib import Path
@@ -376,25 +264,6 @@ PY"""
 
 VLLM_UNINSTALL_CUTLASS_DSL = r"""python -m pip uninstall -y nvidia-cutlass-dsl"""
 
-TRANSFORMERS_DSV4_PATCHES = (
-    PatchSpec(
-        name="transformers_deepseek_v4_config",
-        command=DEEPSEEK_V4_CONFIG_PATCH,
-        verify_command=DEEPSEEK_V4_CONFIG_VERIFY,
-        why="Transformers 4.57.4 does not register deepseek_v4 in CONFIG_MAPPING/MODEL_FOR_CAUSAL_LM_MAPPING in this image, but ms-swift export and tokenizer/config loading use AutoConfig/AutoModel mappings.",
-        required_for="model download smoke tests, ms-swift export, and vLLM-compatible HF views",
-        ablation="cheap smoke ablation: disabling this prevents AutoConfig/MODEL_FOR_CAUSAL_LM mapping for deepseek_v4",
-    ),
-    PatchSpec(
-        name="transformers_deepseek_v4_meta_model",
-        command=DEEPSEEK_V4_MODELING_PATCH,
-        verify_command=DEEPSEEK_V4_MODELING_VERIFY,
-        why="ms-swift export needs a registered causal-LM class as a meta model even though inference uses vLLM, not this forward implementation.",
-        required_for="Megatron-to-HF export",
-        ablation="cheap smoke ablation: disabling this leaves CONFIG_MAPPING present but no MODEL_FOR_CAUSAL_LM_MAPPING entry",
-    ),
-)
-
 MSSWIFT_MEGATRON_PATCHES = (
     PatchSpec(
         name="mcore_bridge_rope_config",
@@ -412,7 +281,6 @@ MSSWIFT_MEGATRON_PATCHES = (
         required_for="any CP>1 run (60k validation scales CP to 4-8).",
         ablation="REQUIRED for CP>1: disabling it crashes before step 1 with RoPE tensor length mismatches (e.g. 7216 vs 3608).",
     ),
-    *TRANSFORMERS_DSV4_PATCHES,
 )
 
 VLLM_PATCHES = (

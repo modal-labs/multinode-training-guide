@@ -41,11 +41,13 @@ The patches kept on the training side are gradient-safe at any `target_modules`:
 
 | Kept patch | Why |
 |---|---|
-| `transformers_deepseek_v4_config` | `deepseek_v4` not registered in transformers 4.57 |
-| `transformers_deepseek_v4_meta_model` | needed for Megatron→HF export |
 | `mcore_bridge_rope_config` | YaRN rope fields missing from mcore-bridge 1.4.2; model init fails without it |
 | `megatron_rope_cp_shape_fix` | CP>1 is structurally broken without the CP-padding + cos/sin shape fix |
-| All 7 vLLM patches | inference-only; no training gradients involved |
+| All 5 vLLM patches | inference-only; no training gradients involved |
+
+(`deepseek_v4` is registered natively in transformers 5.8.0+, so the former
+`transformers_deepseek_v4_config` / `transformers_deepseek_v4_meta_model`
+registration patches were dropped when the images moved to `transformers==5.10.2`.)
 
 ## Strategy: replace code patches with context parallelism
 
