@@ -719,6 +719,28 @@ def _make_config_vllm_compatible(config_path: str) -> None:
         config.setdefault(key, value)
     config.pop("expert_dtype", None)
     config.pop("quantization_config", None)
+    # transformers 5.x rewrites the flat HF ``rope_scaling`` into the nested
+    # ``rope_parameters`` schema (``{"main": {...}, "compress": {...}}``) when it
+    # re-saves the merged checkpoint. vLLM v0.22.1 builds a hashable cache key
+    # from the rope config in ``get_rope`` and raises ``TypeError: unhashable
+    # type: 'dict'`` on the nested form. Restore the flat ``rope_scaling`` the
+    # model originally shipped (the YaRN long-context params live in the
+    # ``compress`` entry), which is what vLLM v0.22.1 consumes.
+    rope_parameters = config.pop("rope_parameters", None)
+    if rope_parameters and not config.get("rope_scaling"):
+        yarn = rope_parameters.get("compress") or rope_parameters.get("main") or {}
+        flat = {"type": yarn.get("rope_type") or yarn.get("type") or "yarn"}
+        for field in (
+            "factor",
+            "beta_fast",
+            "beta_slow",
+            "original_max_position_embeddings",
+            "mscale",
+            "mscale_all_dim",
+        ):
+            if field in yarn:
+                flat[field] = yarn[field]
+        config["rope_scaling"] = flat
     if isinstance(config.get("mlp_layer_types"), list):
         config["mlp_layer_types"] = [
             "moe" if layer_type == "hash_moe" else layer_type
@@ -790,57 +812,77 @@ def _vllm_server(
         with open(server_log_path) as f:
             return f.read()[-limit:]
 
-    server_proc = subprocess.Popen(
-        [
-            "python",
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--model",
-            serve_dir,
-            "--served-model-name",
-            "deepseek-v4-flash-sft",
-            "--tensor-parallel-size",
-            str(GPUS_PER_NODE),
-            "--max-model-len",
-            str(max_model_len),
-            "--gpu-memory-utilization",
-            str(gpu_memory_utilization),
-            "--dtype",
-            "bfloat16",
-            "--kv-cache-dtype",
-            "fp8",
-            "--moe-backend",
-            "triton",
-            "--safetensors-load-strategy",
-            "prefetch",
-            "--enforce-eager",
-            "--port",
-            "8000",
-            "--no-enable-log-requests",
-        ],
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    server_cmd = [
+        "python",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        serve_dir,
+        "--served-model-name",
+        "deepseek-v4-flash-sft",
+        "--tensor-parallel-size",
+        str(GPUS_PER_NODE),
+        "--max-model-len",
+        str(max_model_len),
+        "--gpu-memory-utilization",
+        str(gpu_memory_utilization),
+        "--dtype",
+        "bfloat16",
+        "--kv-cache-dtype",
+        "fp8",
+        "--moe-backend",
+        "triton",
+        "--safetensors-load-strategy",
+        "prefetch",
+        "--enforce-eager",
+        "--port",
+        "8000",
+        "--no-enable-log-requests",
+    ]
 
-    print(f"[{label}] Waiting for vLLM server (max_model_len={max_model_len})...")
-    for attempt in range(720):
-        try:
-            urllib.request.urlopen("http://localhost:8000/health", timeout=5)
-            print(f"[{label}] Server ready after ~{attempt * 5}s")
+    # Freshly cold-started B200 (NVSwitch) containers occasionally report CUDA
+    # error 802 ("system not yet initialized") when vLLM's tensor-parallel
+    # workers touch the device before the NVLink fabric manager finishes coming
+    # up. It clears within seconds, so relaunch the server subprocess a few
+    # times on that specific transient before giving up.
+    max_starts = 4
+    server_proc: subprocess.Popen | None = None
+    for start_attempt in range(1, max_starts + 1):
+        server_proc = subprocess.Popen(
+            server_cmd, stdout=server_log, stderr=subprocess.STDOUT, text=True
+        )
+        print(
+            f"[{label}] Waiting for vLLM server (max_model_len={max_model_len}, "
+            f"start {start_attempt}/{max_starts})..."
+        )
+        ready = False
+        for attempt in range(720):
+            try:
+                urllib.request.urlopen("http://localhost:8000/health", timeout=5)
+                print(f"[{label}] Server ready after ~{attempt * 5}s")
+                ready = True
+                break
+            except Exception:
+                if server_proc.poll() is not None:
+                    break
+                time.sleep(5)
+        if ready:
             break
-        except Exception:
-            if server_proc.poll() is not None:
-                tail = _tail(20000)
-                server_log.close()
-                raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
-            time.sleep(5)
-    else:
-        server_proc.kill()
-        server_proc.wait(timeout=30)
         tail = _tail(20000)
+        if server_proc.poll() is None:
+            server_proc.kill()
+            server_proc.wait(timeout=30)
+        transient = "system not yet initialized" in tail or "Error 802" in tail
+        if transient and start_attempt < max_starts:
+            print(
+                f"[{label}] vLLM hit a transient CUDA init error on start "
+                f"{start_attempt}/{max_starts}; relaunching in 15s..."
+            )
+            time.sleep(15)
+            continue
         server_log.close()
-        raise RuntimeError(f"vLLM server failed to start:\n{tail}")
+        raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
+    assert server_proc is not None
 
     def chat(prompt: str, max_tokens: int = 512, timeout: float = 120) -> str:
         body = json.dumps(
