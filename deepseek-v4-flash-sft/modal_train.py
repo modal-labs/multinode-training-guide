@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+from collections.abc import Callable, Iterator
 from pathlib import PurePosixPath
 from typing import cast
 
@@ -750,6 +752,136 @@ def _make_vllm_model_view(model_path: str) -> str:
     return view_dir
 
 
+@contextlib.contextmanager
+def _vllm_server(
+    model_dir: str,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    label: str = "deploy",
+) -> Iterator[Callable[..., str]]:
+    """Serve a merged BF16 checkpoint with vLLM and yield a ``chat`` callable.
+
+    Owns the vLLM-compatible model view, server startup wait, error-log dumping
+    on failure, and teardown. The yielded ``chat(prompt, max_tokens, timeout)``
+    posts to the local OpenAI-compatible chat endpoint and returns the assistant
+    message. This is the single launch path for both the GSM8K eval
+    (``deploy_and_eval_merged``) and the long-context summarization eval
+    (``eval_summarization``); they differ only in ``gpu_memory_utilization`` and
+    the per-request ``timeout``.
+    """
+    import subprocess
+    import time
+    import traceback
+    import urllib.error
+    import urllib.request
+
+    serve_dir = _make_vllm_model_view(model_dir)
+    server_log_path = "/tmp/vllm-server.log"
+    server_log = open(server_log_path, "w")
+
+    def _tail(limit: int) -> str:
+        server_log.flush()
+        with open(server_log_path) as f:
+            return f.read()[-limit:]
+
+    server_proc = subprocess.Popen(
+        [
+            "python",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            serve_dir,
+            "--served-model-name",
+            "deepseek-v4-flash-sft",
+            "--tensor-parallel-size",
+            str(GPUS_PER_NODE),
+            "--max-model-len",
+            str(max_model_len),
+            "--gpu-memory-utilization",
+            str(gpu_memory_utilization),
+            "--dtype",
+            "bfloat16",
+            "--kv-cache-dtype",
+            "fp8",
+            "--moe-backend",
+            "triton",
+            "--safetensors-load-strategy",
+            "prefetch",
+            "--enforce-eager",
+            "--port",
+            "8000",
+            "--no-enable-log-requests",
+        ],
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    print(f"[{label}] Waiting for vLLM server (max_model_len={max_model_len})...")
+    for attempt in range(720):
+        try:
+            urllib.request.urlopen("http://localhost:8000/health", timeout=5)
+            print(f"[{label}] Server ready after ~{attempt * 5}s")
+            break
+        except Exception:
+            if server_proc.poll() is not None:
+                tail = _tail(20000)
+                server_log.close()
+                raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
+            time.sleep(5)
+    else:
+        server_proc.kill()
+        server_proc.wait(timeout=30)
+        tail = _tail(20000)
+        server_log.close()
+        raise RuntimeError(f"vLLM server failed to start:\n{tail}")
+
+    def chat(prompt: str, max_tokens: int = 512, timeout: float = 120) -> str:
+        body = json.dumps(
+            {
+                "model": "deepseek-v4-flash-sft",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+            }
+        ).encode()
+        req = urllib.request.Request(
+            "http://localhost:8000/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode(errors="replace")
+            print(f"[_chat] HTTP {exc.code}: {err_body[:2000]}")
+            raise RuntimeError(
+                f"vLLM returned HTTP {exc.code}: {err_body[:500]}"
+            ) from None
+        return json.loads(resp.read())["choices"][0]["message"]["content"]
+
+    try:
+        yield chat
+    except Exception:
+        traceback.print_exc()
+        print("\n=== vLLM server log (last 50000 chars) ===")
+        try:
+            print(_tail(50000))
+        except Exception as log_err:
+            print(f"Could not read server log: {log_err}")
+        raise
+    finally:
+        if server_proc.poll() is None:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+                server_proc.wait(timeout=30)
+        server_proc.wait(timeout=30)
+        server_log.close()
+
+
 @app.function(
     image=msswift_image,
     gpu="B200:8",
@@ -993,12 +1125,6 @@ def deploy_and_eval_merged(
     max_model_len: int = 4096,
 ):
     """Deploy the exported model with vLLM, run smoke inference, and eval GSM8K."""
-    import subprocess
-    import time
-    import traceback
-    import urllib.error
-    import urllib.request
-
     from datasets import load_dataset
 
     checkpoints_volume.reload()
@@ -1006,92 +1132,12 @@ def deploy_and_eval_merged(
     config_path = f"{merged_dir}/config.json"
     if not os.path.exists(config_path):
         raise RuntimeError(f"Merged HF model not found at {merged_dir}")
-    serve_dir = _make_vllm_model_view(merged_dir)
 
-    server_log_path = "/tmp/vllm-server.log"
-    server_log = open(server_log_path, "w")
-    server_proc = subprocess.Popen(
-        [
-            "python",
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--model",
-            serve_dir,
-            "--served-model-name",
-            "deepseek-v4-flash-sft",
-            "--tensor-parallel-size",
-            str(GPUS_PER_NODE),
-            "--max-model-len",
-            str(max_model_len),
-            "--gpu-memory-utilization",
-            "0.9",
-            "--dtype",
-            "bfloat16",
-            "--kv-cache-dtype",
-            "fp8",
-            "--moe-backend",
-            "triton",
-            "--safetensors-load-strategy",
-            "prefetch",
-            "--enforce-eager",
-            "--port",
-            "8000",
-            "--no-enable-log-requests",
-        ],
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    print("[deploy] Waiting for vLLM server...")
-    for attempt in range(720):
-        try:
-            urllib.request.urlopen("http://localhost:8000/health", timeout=5)
-            print(f"[deploy] Server ready after ~{attempt * 5}s")
-            break
-        except Exception:
-            if server_proc.poll() is not None:
-                server_log.flush()
-                with open(server_log_path) as f:
-                    tail = f.read()[-20000:]
-                server_log.close()
-                raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
-            time.sleep(5)
-    else:
-        server_proc.kill()
-        server_proc.wait(timeout=30)
-        server_log.flush()
-        with open(server_log_path) as f:
-            tail = f.read()[-20000:]
-        server_log.close()
-        raise RuntimeError(f"vLLM server failed to start:\n{tail}")
-
-    try:
-
-        def _chat(prompt: str, max_tokens: int = 512) -> str:
-            body = json.dumps(
-                {
-                    "model": "deepseek-v4-flash-sft",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0,
-                }
-            ).encode()
-            req = urllib.request.Request(
-                "http://localhost:8000/v1/chat/completions",
-                data=body,
-                headers={"Content-Type": "application/json"},
-            )
-            try:
-                resp = urllib.request.urlopen(req, timeout=120)
-            except urllib.error.HTTPError as exc:
-                err_body = exc.read().decode(errors="replace")
-                print(f"[_chat] HTTP {exc.code}: {err_body[:2000]}")
-                raise RuntimeError(
-                    f"vLLM returned HTTP {exc.code}: {err_body[:500]}"
-                ) from None
-            return json.loads(resp.read())["choices"][0]["message"]["content"]
-
+    with _vllm_server(
+        merged_dir,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=0.9,
+    ) as chat:
         smoke_prompts = [
             "What is 2+2? Give just the number.",
             "If a train travels 60 mph for 2.5 hours, how far does it go?",
@@ -1099,7 +1145,7 @@ def deploy_and_eval_merged(
         ]
         print("\n=== Smoke Inference ===")
         for prompt in smoke_prompts:
-            ans = _chat(prompt, max_tokens=256)
+            ans = chat(prompt, max_tokens=256)
             print(f"Q: {prompt}\nA: {ans[:400]}\n")
 
         print(f"\n=== GSM8K Evaluation (limit={eval_limit}) ===")
@@ -1113,7 +1159,7 @@ def deploy_and_eval_merged(
             gold = _extract_gsm8k_answer(row["answer"])
             if gold is None:
                 continue
-            response = _chat(row["question"], max_tokens=512)
+            response = chat(row["question"], max_tokens=512)
             pred = _extract_gsm8k_answer(response)
             hit = pred is not None and _numeric_eq(pred, gold)
             correct += hit
@@ -1130,27 +1176,6 @@ def deploy_and_eval_merged(
             "correct": correct,
             "total": total,
         }
-    except Exception:
-        traceback.print_exc()
-        print("\n=== vLLM server log (last 50000 chars) ===")
-        try:
-            server_log.flush()
-            with open(server_log.name) as _f:
-                log_text = _f.read()
-            print(log_text[-50000:])
-        except Exception as log_err:
-            print(f"Could not read server log: {log_err}")
-        raise
-    finally:
-        if server_proc.poll() is None:
-            server_proc.terminate()
-            try:
-                server_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
-                server_proc.wait(timeout=30)
-        server_proc.wait(timeout=30)
-        server_log.close()
 
 
 @app.local_entrypoint()
@@ -1465,12 +1490,6 @@ def eval_summarization(
     If model_path is None and run_id is None, uses the base HF model.
     If run_id is provided, uses the merged checkpoint at /checkpoints/{run_id}/merged-hf.
     """
-    import subprocess
-    import time
-    import traceback
-    import urllib.error
-    import urllib.request
-
     from huggingface_hub import snapshot_download
 
     hf_cache_vol.reload()
@@ -1486,126 +1505,24 @@ def eval_summarization(
     config_path = f"{model_path}/config.json"
     if not os.path.exists(config_path):
         raise RuntimeError(f"Model not found at {model_path}")
-    served_model_path = _make_vllm_model_view(cast(str, model_path))
 
-    server_log_path = "/tmp/vllm-server.log"
-    server_log = open(server_log_path, "w")
-    server_proc = subprocess.Popen(
-        [
-            "python",
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--model",
-            served_model_path,
-            "--served-model-name",
-            "deepseek-v4-flash-sft",
-            "--tensor-parallel-size",
-            str(GPUS_PER_NODE),
-            "--max-model-len",
-            str(max_model_len),
-            "--gpu-memory-utilization",
-            "0.92",
-            "--dtype",
-            "bfloat16",
-            "--kv-cache-dtype",
-            "fp8",
-            "--moe-backend",
-            "triton",
-            "--safetensors-load-strategy",
-            "prefetch",
-            "--enforce-eager",
-            "--port",
-            "8000",
-            "--no-enable-log-requests",
-        ],
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    print(f"[{label}] Waiting for vLLM server (max_model_len={max_model_len})...")
-    for attempt in range(720):
-        try:
-            urllib.request.urlopen("http://localhost:8000/health", timeout=5)
-            print(f"[{label}] Server ready after ~{attempt * 5}s")
-            break
-        except Exception:
-            if server_proc.poll() is not None:
-                server_log.flush()
-                with open(server_log_path) as f:
-                    tail = f.read()[-20000:]
-                server_log.close()
-                raise RuntimeError(f"vLLM server exited during startup:\n{tail}")
-            time.sleep(5)
-    else:
-        server_proc.kill()
-        server_proc.wait(timeout=30)
-        server_log.flush()
-        with open(server_log_path) as f:
-            tail = f.read()[-20000:]
-        server_log.close()
-        raise RuntimeError(f"vLLM server failed to start:\n{tail}")
-
-    try:
-
-        def _chat(prompt: str, max_tokens: int = 1024) -> str:
-            body = json.dumps(
-                {
-                    "model": "deepseek-v4-flash-sft",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0,
-                }
-            ).encode()
-            req = urllib.request.Request(
-                "http://localhost:8000/v1/chat/completions",
-                data=body,
-                headers={"Content-Type": "application/json"},
-            )
-            try:
-                resp = urllib.request.urlopen(req, timeout=300)
-            except urllib.error.HTTPError as exc:
-                err_body = exc.read().decode(errors="replace")
-                print(f"[_chat] HTTP {exc.code}: {err_body[:2000]}")
-                raise RuntimeError(
-                    f"vLLM returned HTTP {exc.code}: {err_body[:500]}"
-                ) from None
-            return json.loads(resp.read())["choices"][0]["message"]["content"]
-
+    with _vllm_server(
+        cast(str, model_path),
+        max_model_len=max_model_len,
+        gpu_memory_utilization=0.92,
+        label=label,
+    ) as chat:
         print(f"\n=== {label.upper()} Summarization Eval ===")
         result = _eval_summarization(
-            _chat,
+            lambda prompt, max_tokens=1024: chat(prompt, max_tokens, timeout=300),
             num_examples=num_eval_examples,
             target_tokens=target_tokens,
             max_gen_tokens=1024,
         )
         result["label"] = label
         result["model_path"] = model_path
-        result["served_model_path"] = served_model_path
         result["max_model_len"] = max_model_len
         return result
-
-    except Exception:
-        traceback.print_exc()
-        print("\n=== vLLM server log (last 50000 chars) ===")
-        try:
-            server_log.flush()
-            with open(server_log.name) as _f:
-                log_text = _f.read()
-            print(log_text[-50000:])
-        except Exception as log_err:
-            print(f"Could not read server log: {log_err}")
-        raise
-    finally:
-        if server_proc.poll() is None:
-            server_proc.terminate()
-            try:
-                server_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
-                server_proc.wait(timeout=30)
-        server_proc.wait(timeout=30)
-        server_log.close()
 
 
 @app.local_entrypoint()
