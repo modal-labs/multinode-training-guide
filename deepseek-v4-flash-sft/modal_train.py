@@ -162,9 +162,11 @@ msswift_image = (
             "huggingface_hub[hf_xet]==1.19.0",
             f"ms-swift @ git+https://github.com/modelscope/ms-swift.git@{MS_SWIFT_COMMIT}",
             # transformers 5.x dropped the top-level HybridCache symbol; the
-            # base image's older peft imports it unconditionally, so pin a peft
-            # that loads under transformers 5.10.2 (ms-swift requires peft<0.20).
-            "peft==0.19.1",
+            # base image's older peft imports it unconditionally. peft 0.18.0
+            # loads under transformers 5.10.2 and still accepts the base image's
+            # torchao 0.9.0 (its torchao floor is 0.4.0, whereas peft >=0.19
+            # raised that floor to 0.16.0). ms-swift requires peft<0.20.
+            "peft==0.18.0",
             "safetensors==0.7.0",
             "sentencepiece==0.2.1",
             "transformers==5.10.2",
