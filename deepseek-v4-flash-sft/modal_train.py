@@ -37,10 +37,12 @@ EP_SIZE = 8
 # CP=1 keeps the default 4k recipe (train_model / export) on a single 8-GPU node
 # (TP*EP*PP*CP must divide n_nodes*8).
 CP_SIZE = 1
-# The 60k long-context recipe runs at CP=4 on 4 nodes (32xB200). CP=4 absorbs the
-# long-context activation memory without the detach-based memory patches, so LoRA
-# gradients stay correct for any target_modules. See the "Long-context (60k) SFT"
-# section of README.md. Launch long_context_loop with N_NODES=4.
+# The 60k long-context recipe runs at CP=4 on 4 nodes (32xB200). Dropping the
+# detach-based memory patches keeps LoRA gradients correct for any target_modules,
+# but the patches-removed 60k path is NOT yet validated: CP=4 currently OOMs at the
+# first forward step (CP=8 closes most of the gap but still OOMs and exposes a
+# RoPE-CP correctness bug). See the "Long-context (60k) SFT" section of README.md
+# and PR #84 for the open decision. Launch long_context_loop with N_NODES=4.
 LONG_CONTEXT_CP_SIZE = 4
 GPUS_PER_NODE = 8
 
@@ -1594,8 +1596,10 @@ def long_context_loop(
 ):
     """Full long-context loop: baseline eval → train → export → post-training eval.
 
-    The 60k recipe needs CP=4 on 4 nodes; launch with N_NODES=4 so the cluster has
-    32 GPUs (TP*EP*PP*CP = 1*8*1*4 = 32 must divide N_NODES*8).
+    The 60k recipe runs at CP=4 on 4 nodes; launch with N_NODES=4 so the cluster has
+    32 GPUs (TP*EP*PP*CP = 1*8*1*4 = 32 must divide N_NODES*8). Note: with the memory
+    patches removed this path is not yet validated and currently OOMs at step 0 — see
+    the README "Long-context (60k) SFT" section and PR #84.
     """
     print("=" * 60)
     print("LONG-CONTEXT SUMMARIZATION LOOP")

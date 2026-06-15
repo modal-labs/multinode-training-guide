@@ -132,8 +132,9 @@ were only correct when targeting `linear_proj` (the attention *output* projectio
 module upstream of attention silently produced **zero gradients** on those adapters — no error raised.
 
 Those patches were removed in favor of raising context parallelism. The allocations they guarded all
-scale with the per-rank sequence length `S_rank` (the DSA indexer quadratically), so raising CP shrinks
-`S_rank` and absorbs the same memory while keeping gradients correct for **any** `target_modules`:
+scale with the per-rank sequence length `S_rank` (the DSA indexer quadratically), so *in principle*
+raising CP shrinks `S_rank` and absorbs the same memory while keeping gradients correct for **any**
+`target_modules`:
 
 | CP | `S_rank` @60k | DSA indexer peak (∝ `S_rank²`) | CSA gather peak (∝ `S_rank`) |
 | ---: | ---: | ---: | ---: |
@@ -141,10 +142,21 @@ scale with the per-rank sequence length `S_rank` (the DSA indexer quadratically)
 | 4 (default) | 15k | ~11 GiB | ~10 GiB |
 | 8 | 7.5k | ~2.7 GiB | ~5 GiB |
 
-On B200 (180 GB), CP=4 comfortably absorbs every allocation the dropped patches were avoiding (the
-validated 60k run peaks at ~81 GiB/GPU), so it is the committed default; CP=8 is not required. With the
-memory patches gone, broader DeepSeek MLA LoRA targets (`linear_q_up_proj`, `linear_kv_proj`,
+With the memory patches gone, broader DeepSeek MLA LoRA targets (`linear_q_up_proj`, `linear_kv_proj`,
 `linear_proj`) train with correct gradients.
+
+> **Status — the patches-removed 60k path is not yet validated (open).** The ~81 GiB/GPU figure quoted
+> in earlier revisions came from a run that still had the memory patches. With the patches removed,
+> measured runs OOM on the first forward step: CP=4 on 4×8 B200 is ~17.7 GiB/GPU short, and CP=8 on
+> 8×8 B200 closes most of the gap (~0.5 GiB/GPU short) but still OOMs — at CP=8 the per-rank cost is
+> dominated by the EP-sharded frozen base weights, which CP does not reduce. CP=8 also exposes a RoPE
+> correctness bug: the `megatron_rope_cp_shape_fix` patch only handles the single-tail CP-padding case
+> (`repeats == 1`) and cyclically repeats the rotary cache at CP>4, corrupting positional encodings.
+> This is a pre-existing property of the patches-removed design, independent of the `transformers`
+> upgrade — an A/B at `transformers` 4.57.4 and 5.10.2 OOMs identically. See PR #84 for the full data
+> and the open decision on how to make 60k fit (e.g. EP=16 on 16 nodes plus a DSv4 RoPE-CP fix, or
+> restoring the gradient-safe memory patches with `linear_proj`-only LoRA). The validated path today is
+> the 4k recipe (`train_model` / export).
 
 > **Module names:** DeepSeek-V4 uses MLA, not fused QKV, so there is no `linear_qkv` module. The
 > attention-input projections are `linear_q_up_proj` (RoPE query up-proj) and `linear_kv_proj` (KV
