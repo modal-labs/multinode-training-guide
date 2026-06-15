@@ -30,6 +30,9 @@ DEFAULT_MAX_LENGTH = 4096
 DEFAULT_LORA_RANK = 64
 DEFAULT_LORA_ALPHA = 64
 DEFAULT_TARGET_MODULES = "linear_proj"
+DEFAULT_PACKING = False
+DEFAULT_PADDING_FREE = False
+DEFAULT_USE_DSA_KERNEL_FUSION = False
 
 TP_SIZE = 1
 PP_SIZE = 1
@@ -37,18 +40,31 @@ EP_SIZE = 8
 # CP=1 keeps the default 4k recipe (train_model / export) on a single 8-GPU node
 # (TP*EP*PP*CP must divide n_nodes*8).
 CP_SIZE = 1
-# The 60k long-context recipe runs at CP=4 on 4 nodes (32xB200). Dropping the
-# detach-based memory patches keeps LoRA gradients correct for any target_modules,
-# but the patches-removed 60k path is NOT yet validated: CP=4 currently OOMs at the
-# first forward step (CP=8 closes most of the gap but still OOMs and exposes a
-# RoPE-CP correctness bug). See the "Long-context (60k) SFT" section of README.md
-# and PR #84 for the open decision. Launch long_context_loop with N_NODES=4.
-LONG_CONTEXT_CP_SIZE = 4
+# The 60k long-context recipe uses extra model partitioning instead of
+# detach-based memory patches, keeping LoRA gradients correct for any
+# target_modules. It relies on Megatron-LM#5087's DSv4 THD CP support plus the
+# Bridge compatibility shims in deepseek_patches.py; see the README status notes.
+LONG_CONTEXT_EP_SIZE = 16
+LONG_CONTEXT_CP_SIZE = 8
 GPUS_PER_NODE = 8
 
 MS_SWIFT_COMMIT = "5bbdfc5e5d458fda520b1b7cf4643dfa9e0bd348"
 FAST_HADAMARD_TRANSFORM_COMMIT = "e7706faf8d1c3b9f241e36860640ad1dac644ede"
-MEGATRON_CORE_COMMIT = "cefc2520158c7ceba3f9adbe4b547a6f7a118da1"
+MCORE_BRIDGE_VERSION = "1.5.2"
+# Open DSv4 THD context-parallel support from NVIDIA/Megatron-LM#5087.
+# This is intentionally a PR-head pin until the support lands in a released branch.
+MEGATRON_CORE_COMMIT = "867d4c80458a249ccbb9626cf4efb50c8e06c38d"
+CUTEDSL_PACKAGES = (
+    "nvidia-cudnn-frontend[cutedsl]==1.24.0",
+    "nvidia-cutlass-dsl==4.5.0",
+    "nvidia-cutlass-dsl-libs-cu13==4.5.0",
+    "cuda-python==13.3.1",
+    "cuda-bindings==13.3.1",
+    "cuda-core==1.0.0",
+    "cuda-pathfinder==1.1.0",
+    "apache-tvm-ffi==0.1.12",
+    "torch-c-dlpack-ext==0.1.5",
+)
 
 app = modal.App("example-deepseek-v4-flash-sft")
 
@@ -87,6 +103,9 @@ def default_run_id(
     micro_batch_size: int,
     lr: float,
     target_modules: str,
+    packing: bool,
+    padding_free: bool,
+    use_dsa_kernel_fusion: bool,
 ) -> str:
     run_config = {
         "cp_size": cp_size,
@@ -104,6 +123,9 @@ def default_run_id(
         "tp_size": tp_size,
         "train_iters": train_iters,
         "target_modules": target_modules,
+        "packing": packing,
+        "padding_free": padding_free,
+        "use_dsa_kernel_fusion": use_dsa_kernel_fusion,
     }
     digest = hashlib.sha256(
         json.dumps(run_config, sort_keys=True).encode()
@@ -174,7 +196,54 @@ msswift_image = (
             "transformers==5.10.2",
             "wandb==0.19.1",
         )
-        .run_commands("pip install --no-deps mcore-bridge==1.4.2")
+        .run_commands(f"pip install --no-deps mcore-bridge=={MCORE_BRIDGE_VERSION}")
+        .run_commands(
+            "pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base "
+            "nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 "
+            "2>/dev/null; true"
+        )
+        .run_commands(
+            "python - <<'PY'\n"
+            "from pathlib import Path\n"
+            "import shutil\n"
+            "import site\n"
+            "\n"
+            "for site_dir in map(Path, site.getsitepackages()):\n"
+            "    shutil.rmtree(site_dir / 'cutlass', ignore_errors=True)\n"
+            "    shutil.rmtree(site_dir / 'nvidia_cutlass_dsl', ignore_errors=True)\n"
+            "    for pth in site_dir.glob('*cutlass*dsl*.pth'):\n"
+            "        pth.unlink()\n"
+            "PY"
+        )
+        .run_commands(
+            "pip install --force-reinstall --no-deps " + " ".join(CUTEDSL_PACKAGES)
+        )
+        .run_commands(
+            "python - <<'PY'\n"
+            "from pathlib import Path\n"
+            "import site\n"
+            "\n"
+            "for site_dir in map(Path, site.getsitepackages()):\n"
+            "    cutlass_python = site_dir / 'nvidia_cutlass_dsl' / 'python_packages'\n"
+            "    if (cutlass_python / 'cutlass').exists():\n"
+            "        (site_dir / 'zz_nvidia_cutlass_dsl_absolute.pth').write_text(\n"
+            "            f'{cutlass_python}\\n'\n"
+            "        )\n"
+            "        break\n"
+            "else:\n"
+            "    raise RuntimeError('nvidia_cutlass_dsl python packages not found')\n"
+            "PY"
+        )
+        .run_commands(
+            "python - <<'PY'\n"
+            "import cutlass\n"
+            "import cutlass.cute\n"
+            "from cutlass.cute.runtime import from_dlpack, make_fake_stream\n"
+            "\n"
+            "print('CuTeDSL:', cutlass.__file__, cutlass.cute.__file__)\n"
+            "print('CuTeDSL runtime:', from_dlpack.__name__, make_fake_stream.__name__)\n"
+            "PY"
+        )
         .run_commands(
             "pip install --no-deps "
             f"'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@{MEGATRON_CORE_COMMIT}'"
@@ -285,6 +354,7 @@ def prepare_dataset(
     timeout=1800,
 )
 def smoke_test():
+    import inspect
     import shutil
     import subprocess
 
@@ -311,16 +381,70 @@ def smoke_test():
     if megatron_path is None:
         raise RuntimeError("ms-swift Megatron CLI was not installed")
 
+    try:
+        import cuda.bindings.driver as _cuda_driver
+        import cutlass as _cutlass
+        import cutlass.cute as _cute
+        from cutlass.cute.runtime import from_dlpack as _from_dlpack
+        from cutlass.cute.runtime import make_fake_stream as _make_fake_stream
+    except ImportError as exc:
+        raise RuntimeError(f"DSv4 CP CuTeDSL dependency import failed: {exc}") from exc
+
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa_cp_layout_kernels,
+        csa_cp_utils as _csa_cp_utils,
+    )
+    from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+        FusedIndexerSparseAttnFromTopkFunc as _fused_indexer_sparse_attn,
+        dsa_sparse_attn as _dsa_sparse_attn,
+    )
+    from mcore_bridge.model.gpts.deepseek_v4 import DSv4HybridSelfAttention
+
+    try:
+        from flash_mla import flash_mla_sparse_fwd as _flash_mla_sparse_fwd
+    except ImportError as exc:
+        flash_mla_available = False
+        flash_mla_status = f"missing ({exc})"
+    else:
+        flash_mla_available = True
+        flash_mla_status = _flash_mla_sparse_fwd.__name__
+
+    if not getattr(csa_cp_layout_kernels, "_CUTE_AVAILABLE", False):
+        raise RuntimeError(
+            "DSv4 CP CuTeDSL kernels are not importable after dependency import"
+        )
+    bridge_qkv_sig = inspect.signature(
+        DSv4HybridSelfAttention.get_query_key_value_tensors
+    )
+    if "boundary_hidden" not in bridge_qkv_sig.parameters:
+        raise RuntimeError("mcore-bridge DSv4 THD CP boundary patch was not applied")
+
     subprocess.run(["megatron", "sft", "--help"], check=True)
     print(f"{MODEL_NAME}: model_type={config.model_type}")
     print(f"{MODEL_NAME}: layers={config.num_hidden_layers}")
     print(f"{MODEL_NAME}: experts={config.n_routed_experts}")
     print(f"{MODEL_NAME}: smoke prompt tokens={len(token_ids)}")
+    print(
+        f"{MODEL_NAME}: CuTeDSL imports="
+        f"{_cuda_driver.__name__},{_cutlass.__name__},{_cute.__name__},"
+        f"{_from_dlpack.__name__},{_make_fake_stream.__name__}"
+    )
+    print(f"{MODEL_NAME}: DSv4 CP utils={_csa_cp_utils.__name__}")
+    print(
+        f"{MODEL_NAME}: DSA kernels="
+        f"{_dsa_sparse_attn.__name__},{_fused_indexer_sparse_attn.__name__}"
+    )
+    print(f"{MODEL_NAME}: FlashMLA sparse prefill={flash_mla_status}")
     return {
         "model_type": config.model_type,
         "num_hidden_layers": config.num_hidden_layers,
         "n_routed_experts": config.n_routed_experts,
         "megatron": megatron_path,
+        "megatron_core_commit": MEGATRON_CORE_COMMIT,
+        "dsv4_cp_cutedsl": True,
+        "dsv4_dsa_kernels": True,
+        "dsv4_flash_mla": flash_mla_available,
+        "dsv4_bridge_cp_boundary": True,
     }
 
 
@@ -349,6 +473,9 @@ def _train_model_impl(
     save_interval: int = 25,
     target_modules: str = DEFAULT_TARGET_MODULES,
     report_to: str = "none",
+    packing: bool = DEFAULT_PACKING,
+    padding_free: bool = DEFAULT_PADDING_FREE,
+    use_dsa_kernel_fusion: bool = DEFAULT_USE_DSA_KERNEL_FUSION,
 ):
     import subprocess
 
@@ -371,6 +498,9 @@ def _train_model_impl(
             micro_batch_size=micro_batch_size,
             lr=lr,
             target_modules=target_modules,
+            packing=packing,
+            padding_free=padding_free,
+            use_dsa_kernel_fusion=use_dsa_kernel_fusion,
         )
 
     node_rank = cluster_info.rank
@@ -430,6 +560,27 @@ def _train_model_impl(
         with open(args_json_path, "w") as f:
             json.dump({"run_id": run_id}, f)
 
+    megatron_extra_kwargs: dict[str, object] = {"moe_router_score_function": "sigmoid"}
+    if use_dsa_kernel_fusion:
+        if not (cp_size > 1 and packing and padding_free):
+            raise ValueError(
+                "use_dsa_kernel_fusion requires CP>1 with packing=true and "
+                "padding_free=true"
+            )
+        try:
+            from flash_mla import flash_mla_sparse_fwd as _flash_mla_sparse_fwd
+        except ImportError as exc:
+            raise RuntimeError(
+                "DSv4 fused sparse attention requires FlashMLA. Install "
+                "DeepSeek FlashMLA from the nv_dev branch in an image with "
+                "NVCC 12.9+ for B200/SM100, then pass "
+                "use_dsa_kernel_fusion=true."
+            ) from exc
+        print(f"Using FlashMLA sparse attention: {_flash_mla_sparse_fwd.__name__}")
+        megatron_extra_kwargs["apply_dsa_kernel_fusion"] = True
+    elif cp_size > 1 and packing and padding_free:
+        print("DSA kernel fusion disabled; using unfused DSv4 sparse attention")
+
     megatron_cmd = [
         "megatron",
         "sft",
@@ -469,15 +620,15 @@ def _train_model_impl(
         "--recompute_modules",
         "mhc",
         "--megatron_extra_kwargs",
-        json.dumps({"moe_router_score_function": "sigmoid"}),
+        json.dumps(megatron_extra_kwargs),
         "--global_batch_size",
         str(global_batch_size),
         "--micro_batch_size",
         str(micro_batch_size),
         "--packing",
-        "false",
+        str(packing).lower(),
         "--padding_free",
-        "false",
+        str(padding_free).lower(),
         "--use_precision_aware_optimizer",
         "false",
         "--lr",
@@ -596,6 +747,9 @@ def train_model(
     lr: float = 1e-4,
     save_interval: int = 25,
     target_modules: str = DEFAULT_TARGET_MODULES,
+    packing: bool = DEFAULT_PACKING,
+    padding_free: bool = DEFAULT_PADDING_FREE,
+    use_dsa_kernel_fusion: bool = DEFAULT_USE_DSA_KERNEL_FUSION,
 ):
     return _train_model_impl(
         run_id=run_id,
@@ -615,6 +769,9 @@ def train_model(
         save_interval=save_interval,
         report_to="none",
         target_modules=target_modules,
+        packing=packing,
+        padding_free=padding_free,
+        use_dsa_kernel_fusion=use_dsa_kernel_fusion,
     )
 
 
@@ -650,6 +807,9 @@ def train_model_wandb(
     lr: float = 1e-4,
     save_interval: int = 25,
     target_modules: str = DEFAULT_TARGET_MODULES,
+    packing: bool = DEFAULT_PACKING,
+    padding_free: bool = DEFAULT_PADDING_FREE,
+    use_dsa_kernel_fusion: bool = DEFAULT_USE_DSA_KERNEL_FUSION,
 ):
     return _train_model_impl(
         run_id=run_id,
@@ -669,6 +829,9 @@ def train_model_wandb(
         save_interval=save_interval,
         report_to="wandb",
         target_modules=target_modules,
+        packing=packing,
+        padding_free=padding_free,
+        use_dsa_kernel_fusion=use_dsa_kernel_fusion,
     )
 
 
@@ -1582,24 +1745,29 @@ def long_context_loop(
     num_train_examples: int = 64,
     train_iters: int = 5,
     save_interval: int = 5,
-    max_length: int = 65536,
+    max_length: int = 60000,
     num_eval_examples: int = 2,
     target_tokens: int = 60000,
     checkpoint_step: int = 5,
     tp_size: int = TP_SIZE,
-    ep_size: int = EP_SIZE,
+    ep_size: int = LONG_CONTEXT_EP_SIZE,
     pp_size: int = PP_SIZE,
     cp_size: int = LONG_CONTEXT_CP_SIZE,
     global_batch_size: int = 8,
     micro_batch_size: int = 1,
     target_modules: str = DEFAULT_TARGET_MODULES,
+    packing: bool = True,
+    padding_free: bool = True,
+    use_dsa_kernel_fusion: bool = DEFAULT_USE_DSA_KERNEL_FUSION,
 ):
     """Full long-context loop: baseline eval → train → export → post-training eval.
 
-    The 60k recipe runs at CP=4 on 4 nodes; launch with N_NODES=4 so the cluster has
-    32 GPUs (TP*EP*PP*CP = 1*8*1*4 = 32 must divide N_NODES*8). Note: with the memory
-    patches removed this path is not yet validated and currently OOMs at step 0 — see
-    the README "Long-context (60k) SFT" section and PR #84.
+    The 60k recipe attempts CP=8/EP=16 on 16 nodes; launch with N_NODES=16 so the
+    cluster has 128 GPUs (TP*EP*PP*CP = 1*16*1*8 = 128 must divide N_NODES*8).
+    This keeps the old detach-based memory patches out of the training path. The
+    Bridge shim wires the DSv4 THD CP boundary tensors, but the unfused sparse
+    attention allocation still OOMs at this shape. See the README
+    "Experimental Megatron/ms-swift 60k path" section.
     """
     print("=" * 60)
     print("LONG-CONTEXT SUMMARIZATION LOOP")
@@ -1643,6 +1811,9 @@ def long_context_loop(
         global_batch_size=global_batch_size,
         micro_batch_size=micro_batch_size,
         target_modules=target_modules,
+        packing=packing,
+        padding_free=padding_free,
+        use_dsa_kernel_fusion=use_dsa_kernel_fusion,
     )
     print(f"  Training done: {train_result}")
 

@@ -1,0 +1,86 @@
+diff --git a/nemo_automodel/_transformers/auto_model.py b/nemo_automodel/_transformers/auto_model.py
+index cbc6bad617..6e9e6b9932 100644
+--- a/nemo_automodel/_transformers/auto_model.py
++++ b/nemo_automodel/_transformers/auto_model.py
+@@ -416,6 +416,7 @@ class _BaseNeMoAutoModelClass:
+         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
+         freeze_config = kwargs.pop("freeze_config", None)
+         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
++        dequantize_base_checkpoint = kwargs.pop("dequantize_base_checkpoint", None)
+ 
+         def _retry(**override):
+             """Re-enter ``_build_model`` with overridden parameters."""
+@@ -426,6 +427,7 @@ class _BaseNeMoAutoModelClass:
+                 "has_packed_sequence": has_packed_sequence,
+                 "freeze_config": freeze_config,
+                 "cache_dir": cache_dir,
++                "dequantize_base_checkpoint": dequantize_base_checkpoint,
+             }
+             return cls._build_model(
+                 pretrained_model_name_or_path_or_config,
+@@ -629,6 +631,7 @@ class _BaseNeMoAutoModelClass:
+             compile_config=compile_config,
+             load_base_model=load_base_model,
+             cache_dir=cache_dir,
++            dequantize_base_checkpoint=dequantize_base_checkpoint,
+             freeze_config=freeze_config,
+             weights_already_loaded=weights_already_loaded,
+             inject_te_attention=inject_te_attention,
+diff --git a/nemo_automodel/_transformers/infrastructure.py b/nemo_automodel/_transformers/infrastructure.py
+index 8f2d1f693d..889d197b75 100644
+--- a/nemo_automodel/_transformers/infrastructure.py
++++ b/nemo_automodel/_transformers/infrastructure.py
+@@ -395,6 +395,7 @@ def apply_model_infrastructure(
+     parallelize_fn=None,
+     compile_config=None,
+     load_base_model=False,
++    dequantize_base_checkpoint: bool | None = None,
+     cache_dir=None,
+     pretrained_model_name_or_path="",
+     weights_already_loaded=False,
+@@ -427,6 +428,8 @@ def apply_model_infrastructure(
+         compile_config: Compilation configuration. Default: None
+         pretrained_model_name_or_path: Model name or path for checkpoint loading. Default: ""
+         load_base_model: Whether to load base model weights (True for from_pretrained). Default: False
++        dequantize_base_checkpoint: Whether the state-dict adapter should construct
++            quantized checkpoint placeholders before dequantizing loaded weights.
+         cache_dir: Cache directory for model weights. Default: None
+         weights_already_loaded: Whether pretrained weights were already loaded during
+             model init (e.g., by HF's from_pretrained on a real device, which also
+@@ -455,6 +458,7 @@ def apply_model_infrastructure(
+         model_repo_id=pretrained_model_name_or_path,
+         save_consolidated=False,
+         is_peft=peft_config is not None,
++        dequantize_base_checkpoint=dequantize_base_checkpoint,
+     )
+     checkpointer = Checkpointer(
+         ckpt_config,
+diff --git a/nemo_automodel/recipes/llm/train_ft.py b/nemo_automodel/recipes/llm/train_ft.py
+index fa3cdba275..f89ed92b45 100644
+--- a/nemo_automodel/recipes/llm/train_ft.py
++++ b/nemo_automodel/recipes/llm/train_ft.py
+@@ -207,6 +207,7 @@ def build_model(
+     unfreeze_modules: list[str] | None = None,
+     sdpa_method: list[str] | None = None,
+     device_mesh=None,
++    dequantize_base_checkpoint: bool | None = None,
+ ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+     """Build and initialize a model.
+ 
+@@ -236,6 +237,8 @@ def build_model(
+             kwargs["distributed_setup"] = distributed_setup
+         elif device_mesh is not None:
+             kwargs["device_mesh"] = device_mesh
++        if dequantize_base_checkpoint is not None:
++            kwargs["dequantize_base_checkpoint"] = dequantize_base_checkpoint
+ 
+         if cfg_qat is not None and cfg_qat.get("enabled", False):
+             if cfg_peft is not None:
+@@ -593,6 +596,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
+             distributed_setup=self.distributed_setup,
+             cfg_qat=self.cfg.get("qat", None),
+             sdpa_method=self.cfg.get("sdpa_method", None),
++            dequantize_base_checkpoint=checkpoint_config.dequantize_base_checkpoint,
+         )
+         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
