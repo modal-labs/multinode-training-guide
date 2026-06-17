@@ -119,7 +119,7 @@ class _Slime(SlimeConfig):
 
     sglang_enable_dp_attention = False
     # sglang_dp_size = 8
-    sglang_ep_size = 8
+    # sglang_ep_size = 8
 
     sglang_disable_custom_all_reduce = True
 

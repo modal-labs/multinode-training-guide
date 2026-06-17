@@ -23,13 +23,17 @@ class _Slime(_base._Slime):
     actor_num_nodes = 2
     actor_num_gpus_per_node = 8
     # 16 GPUs / 8-per-engine -> 2 TP8 engines (sgl-router load-balanced).
-    rollout_num_gpus_per_engine = 8
+    rollout_num_gpus_per_engine = 4
 
     sglang_mem_fraction_static = 0.65
 
     # Test
-    sglang_speculative_algorithm = None
-    num_rollout = 2
+    sglang_speculative_algorithm = "EAGLE"
+    num_rollout = 500
+    sglang_enable_dp_attention = True
+    sglang_dp_size = 4
+    sglang_ep_size = 4
+    sglang_enable_dp_lm_head = True
 
     # ── WandB ────────────────────────────────────────────────────────────────
     wandb_group = _RUN_TAG
