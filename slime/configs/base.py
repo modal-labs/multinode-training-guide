@@ -14,6 +14,8 @@ megatron_conversion_hf_checkpoint.
 
 import json
 import math
+import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,6 +24,21 @@ from typing import Any, Literal
 HF_CACHE_PATH = Path("/root/.cache/huggingface")
 DATA_PATH = Path("/data")
 CHECKPOINTS_PATH = Path("/checkpoints")
+
+# ── Run tag ───────────────────────────────────────────────────────────────────
+
+
+def run_tag(name: str) -> str:
+    """Per-launch run tag: ``<W&B run name>-<launch timestamp>``.
+
+    Each experiment passes its W&B run name (``WANDB_GROUP`` overrides it). The
+    W&B group/name and the rollout-dump dir both derive from this tag, so every
+    launch writes its dumps to a fresh dir whose name matches the W&B run.
+    Resolved once, at config import on the launching (rank-0) process, then
+    frozen into the CLI args handed to every node.
+    """
+    base = os.environ.get("WANDB_GROUP") or name
+    return f"{base}-{datetime.now():%Y%m%d-%H%M%S}"
 
 # ── Types ─────────────────────────────────────────────────────────────────────
 

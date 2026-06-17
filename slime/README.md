@@ -80,13 +80,15 @@ a specific SLIME image tag.
 
 Launcher-only fields are not passed to SLIME:
 
-| Field | Purpose |
-| --- | --- |
-| `environment` | Ray job environment variables |
-| `async_mode` | Selects `train_async.py` instead of `train.py` |
-| `slime_model_script` | Shell script sourced for `MODEL_ARGS` |
-| `source_hf_checkpoint` | Upstream repo/path used for download or config-specific conversion |
+
+| Field                               | Purpose                                                             |
+| ----------------------------------- | ------------------------------------------------------------------- |
+| `environment`                       | Ray job environment variables                                       |
+| `async_mode`                        | Selects `train_async.py` instead of `train.py`                      |
+| `slime_model_script`                | Shell script sourced for `MODEL_ARGS`                               |
+| `source_hf_checkpoint`              | Upstream repo/path used for download or config-specific conversion  |
 | `megatron_conversion_hf_checkpoint` | Optional raw Megatron conversion input; defaults to `hf_checkpoint` |
+
 
 ## Hooks
 
@@ -94,12 +96,14 @@ Every config should make `download_model` and `download_data` usable.
 `download_model` has a default implementation; `download_data` must be
 implemented by the config.
 
-| Hook | Resource | Expected use |
-| --- | --- | --- |
-| `download_model()` | CPU | Download source model files into the HF cache |
-| `download_data()` | CPU | Download or prepare training data under `/data` |
-| `post_process_model()` | GPU | Optional model conversion or derived model artifacts |
-| `post_process_data()` | GPU | Optional data processing that needs GPU |
+
+| Hook                   | Resource | Expected use                                         |
+| ---------------------- | -------- | ---------------------------------------------------- |
+| `download_model()`     | CPU      | Download source model files into the HF cache        |
+| `download_data()`      | CPU      | Download or prepare training data under `/data`      |
+| `post_process_model()` | GPU      | Optional model conversion or derived model artifacts |
+| `post_process_data()`  | GPU      | Optional data processing that needs GPU              |
+
 
 The default `post_process_model()` and `post_process_data()` are no-ops. Run
 their Modal entrypoints only when the config documents a reason.
@@ -118,11 +122,13 @@ All three fields may be Hugging Face repo IDs or absolute mounted paths.
 
 ## Volumes
 
-| Volume | Mount path | Purpose |
-| --- | --- | --- |
-| `huggingface-cache` | `/root/.cache/huggingface` | HF snapshots |
-| `slime-data` | `/data` | Training and eval data |
-| `slime-checkpoints` | `/checkpoints` | Derived checkpoints |
+
+| Volume              | Mount path                 | Purpose                |
+| ------------------- | -------------------------- | ---------------------- |
+| `huggingface-cache` | `/root/.cache/huggingface` | HF snapshots           |
+| `slime-data`        | `/data`                    | Training and eval data |
+| `slime-checkpoints` | `/checkpoints`             | Derived checkpoints    |
+
 
 ## Add A Config
 
