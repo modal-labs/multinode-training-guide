@@ -24,13 +24,30 @@ class _Slime(_base._Slime):
     colocate = False
     actor_num_nodes = 1
     actor_num_gpus_per_node = 8
+
+    # ── Rollout sizing ────────────────────────────────────────────────────────
+    rollout_max_response_len = 8192
+    rollout_temperature = 1.0
+    n_samples_per_prompt = 8
+    num_steps_per_rollout = 1
+    global_batch_size = 256  # rollout_batch_size * n_samples_per_prompt // steps
+    micro_batch_size = 1
+    rollout_max_context_len = 32768 * 2
+    sglang_reasoning_parser = "qwen3"  # strip <think> blocks
+    sglang_tool_call_parser = "qwen3_coder"
+    rollout_num_gpus_per_engine = 8
     rollout_num_gpus = 8
 
-    sglang_mem_fraction_static = 0.65
+    # ── Engine sizing under colocation ────────────────────────────────────────
+    sglang_mem_fraction_static = 0.7
+    sglang_speculative_algorithm = "EAGLE"
 
-    # Test
-    sglang_speculative_algorithm = None
-    num_rollout = 2
+    sglang_enable_dp_attention = True
+    sglang_dp_size = 8
+    sglang_ep_size = 8
+    sglang_enable_dp_lm_head = True
+    sglang_disable_custom_all_reduce = False
+
 
     # ── WandB ────────────────────────────────────────────────────────────────
     wandb_group = _RUN_TAG
