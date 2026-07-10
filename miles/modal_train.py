@@ -78,13 +78,39 @@ RAY_DASHBOARD_PORT = 8265
 
 
 def run_config_hook(experiment: str, hook_name: str, mounted_volumes) -> None:
-    """Reload mounted volumes, run a MilesConfig hook, then commit them."""
+    """Reload mounted volumes, run a MilesConfig hook, then commit them.
+
+    Commits the mounted volumes every 2 min *while* the hook runs, not just at the
+    end, so a long HF pull persists completed shards as it goes. If the container dies
+    mid-download (network stall, disconnect), a re-run reloads the last commit and
+    snapshot_download skips the already-present files — resuming near where it stopped
+    instead of restarting from zero.
+    """
+    import threading
+
     miles_cfg = get_module(experiment).miles
     for volume in mounted_volumes:
         volume.reload()
-    getattr(miles_cfg, hook_name)()
-    for volume in mounted_volumes:
-        volume.commit()
+
+    stop = threading.Event()
+
+    def _periodic_commit() -> None:
+        while not stop.wait(120):
+            for volume in mounted_volumes:
+                try:
+                    volume.commit()
+                except Exception as e:  # best-effort; never kill the download
+                    print(f"[modal] periodic volume commit failed: {e}", flush=True)
+
+    committer = threading.Thread(target=_periodic_commit, daemon=True)
+    committer.start()
+    try:
+        getattr(miles_cfg, hook_name)()
+    finally:
+        stop.set()
+        committer.join(timeout=10)
+        for volume in mounted_volumes:
+            volume.commit()
 
 
 @app.local_entrypoint()
@@ -290,11 +316,8 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     start_ray_head(my_ip, n_nodes)
     prepare_miles_config(miles_cfg, tempfile.mkdtemp())
 
-    if (wandb_key := os.environ.get("WANDB_API_KEY", "")) and getattr(
-        miles_cfg, "use_wandb", False
-    ):
-        miles_cfg.wandb_key = wandb_key
-
+    # W&B reads WANDB_API_KEY from the inherited Modal secret. Do not copy it
+    # into miles_cfg: CLI args are retained verbatim in Ray and Modal logs.
     cmd = build_train_cmd(miles_cfg, MILES_ROOT)
     runtime_env = {
         "env_vars": {
