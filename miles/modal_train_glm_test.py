@@ -17,7 +17,12 @@ import modal
 from configs import get_module
 from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH
 
-EXPERIMENT = "glm5_2_744b_a40b_lora_5layer"
+_ALLOWED_EXPERIMENTS = {
+    "glm5_2_744b_a40b_lora_5layer",
+}
+EXPERIMENT = os.environ.get("EXPERIMENT_CONFIG", "glm5_2_744b_a40b_lora_5layer")
+if EXPERIMENT not in _ALLOWED_EXPERIMENTS:
+    raise ValueError(f"This launcher only supports 5-layer GLM diagnostics; got {EXPERIMENT!r}")
 
 exp_mod = get_module(EXPERIMENT)
 modal_cfg = exp_mod.modal
@@ -31,6 +36,10 @@ image = (
     .add_local_python_source("configs", copy=True)
     .add_local_python_source("modal_helpers", copy=True)
 )
+for patch in modal_cfg.patch_files:
+    image = image.add_local_file(
+        patch, f"/tmp/{os.path.basename(patch)}", copy=True
+    )
 if modal_cfg.image_run_commands:
     image = image.run_commands(*modal_cfg.image_run_commands)
 if modal_cfg.image_env:
@@ -59,8 +68,8 @@ app = modal.App(f"{EXPERIMENT}-test")
 RAY_DASHBOARD_PORT = 8265
 
 
-def run_config_hook(hook_name: str, mounted_volumes) -> None:
-    cfg = get_module(EXPERIMENT).miles
+def run_config_hook(experiment: str, hook_name: str, mounted_volumes) -> None:
+    cfg = get_module(experiment).miles
     for volume in mounted_volumes:
         volume.reload()
     getattr(cfg, hook_name)()
@@ -74,8 +83,8 @@ def run_config_hook(hook_name: str, mounted_volumes) -> None:
     timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def download_model():
-    run_config_hook("download_model", (hf_cache_volume,))
+def download_model(experiment: str = EXPERIMENT):
+    run_config_hook(experiment, "download_model", (hf_cache_volume,))
 
 
 @app.function(
@@ -84,8 +93,8 @@ def download_model():
     timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def download_data():
-    run_config_hook("download_data", (data_volume,))
+def download_data(experiment: str = EXPERIMENT):
+    run_config_hook(experiment, "download_data", (data_volume,))
 
 
 @app.function(
@@ -98,13 +107,14 @@ def download_data():
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,
 )
-async def train():
+async def train(experiment: str = EXPERIMENT):
     await asyncio.gather(
         hf_cache_volume.reload.aio(),
         data_volume.reload.aio(),
         checkpoints_volume.reload.aio(),
     )
-    cfg = get_module(EXPERIMENT).miles
+    exp_mod = get_module(experiment)
+    cfg = exp_mod.miles
     my_ip = "127.0.0.1"
     os.environ["MILES_HOST_IP"] = my_ip
     os.environ["SGLANG_HOST_IP"] = my_ip
@@ -125,7 +135,7 @@ async def train():
     client = JobSubmissionClient("http://127.0.0.1:8265")
     job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
     print(f"Job submitted: {job_id}")
-    print(f"Training {EXPERIMENT} on 1 node x {modal_cfg.gpu}:{cfg.actor_num_gpus_per_node}")
+    print(f"Training {experiment} on 1 node x {exp_mod.modal.gpu}:{cfg.actor_num_gpus_per_node}")
     print(f"Command: {cmd}")
 
     async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
