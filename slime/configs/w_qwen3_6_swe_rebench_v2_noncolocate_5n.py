@@ -1,30 +1,26 @@
-"""Qwen3.6-35B-A3B SWE agentic RL — colocated, single node (1× H200:8).
+"""Qwen3.6-35B-A3B SWE-rebench-V2 (Python) agentic RL — noncolocate, five nodes.
 
-Port of ``w_qwen3_swe_colocate_1n`` to Qwen3.6-35B-A3B, self-contained so it can
-be tuned independently. Qwen3.6 uses the qwen3.5 architecture (hybrid
-gated-deltanet + full-attention, gated attention output, 248k vocab) via
-``scripts/models/qwen3.5-35B-A3B.sh`` + ``slime_plugins.models.qwen3_5``.
-Colocated sync: each step runs rollout, then the engine offloads and Megatron
-trains.
+Scale-out sibling of ``w_qwen3_6_swe_rebench_v2_noncolocate_3n``: same data
+(SWE-rebench-V2 Python subset), model, algorithm, and optimizer; the **topology**
+grows the rollout fleet (2 → 4 rollout nodes, 8 → 16 engines) and this config
+layers on an experimental SGLang serving recipe (dp-attention + HiCache) plus TIS.
 
-Model-driven deltas vs the 30B-A3B version:
-  - TP 4 -> 2: full-attention layers have num_query_groups=2 (Megatron needs
-    num_query_groups % TP == 0).
-  - mamba scheduler "extra_buffer" for the deltanet state pool; also
-    radix-caches mamba states (critical for multi-turn re-prefill).
-  - EAGLE speculative decoding off the MTP head (latency win on decode-bound
-    rollout; qwen3_5 bridge keeps the draft head fresh across weight updates).
-  - MoE dispatch: flex + DeepEP (config flags come after the model script's
-    alltoall MODEL_ARGS, so they win).
-  - New torch_dist conversion required (one-time):
-        EXPERIMENT_CONFIG=w_qwen3_6_swe_colocate_1n \
-        modal run slime/modal_train.py::convert_hf_to_megatron_checkpoint
+Self-contained: inherits only ``SlimeConfig`` and spells every arg out inline (no
+inheritance from another experiment config), so this recipe can be tuned in
+isolation.
 
-Verify on the first run: tool-call/reasoning parsers (suspect first if the agent
-format-errors in a loop on turn 1); max_tokens_per_gpu >= context_len/CP (raise
-CP to 4 if training OOMs); mem_fraction_static=0.7 (drop toward 0.5 if startup
-OOMs during cuda-graph capture). Training rows are the harbor build of
-SWE-Gym-Lite (``env/harbor.py``).
+Topology: 1 training node (8 GPU, Megatron) + 4 rollout nodes (32 GPU, 16× TP2
+SGLang engines behind sgl-router) = 5 nodes / 40 GPU. Sync noncolocate
+(``async_mode=False``), matching the rebench lineage — set ``async_mode=True`` for
+rollout/train overlap (the SWE-noncolocate base default).
+
+Data: FULL harbor build of ``nebius/SWE-rebench-V2`` (Python subset, ~7.2k tasks,
+no in-distribution holdout), published by
+``agentic_rl.environment.convert2slime.swerebench``; eval is a transfer slice on
+the published ``swegym_lite`` + ``swebench_verified`` held-out sets.
+
+    EXPERIMENT_CONFIG=w_qwen3_6_swe_rebench_v2_noncolocate_5n \
+        uv run --no-dev modal run -d slime/modal_train.py::train
 """
 
 import os
@@ -40,13 +36,13 @@ from configs.base import (
 from configs.datasets import eval_datasets, pull, subsample, train_path
 
 # W&B run name; run_tag() appends a launch timestamp so dumps don't collide.
-_RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-gym-lite-colocate-1n")
+_RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-rebench-v2-noncolocate-5n")
 
-
-# Datasets (one HF repo each; see configs/datasets.py). Train on swegym_lite;
-# eval the full in-distribution held-out slice (30) + USACO transfer (50).
-_TRAIN = "swegym_lite"
-_EVAL = [("swegym_lite", None), ("usaco", 50)]
+# Datasets (one HF repo each; see configs/datasets.py). ALL swe_rebench_v2 Python
+# tasks are training (no in-distribution holdout), so eval is a transfer slice on
+# the published swegym_lite + swebench_verified held-out sets.
+_TRAIN = "swe_rebench_v2"
+_EVAL = [("swegym_lite", None), ("swebench_verified", None)]  # transfer/generalization eval; [] to disable
 
 _WANDB_IMAGE_ENV = {
     k: v for k in ("WANDB_PROJECT", "WANDB_GROUP") if (v := os.environ.get(k)) is not None
@@ -61,7 +57,6 @@ modal = ModalConfig(
         "uv pip install --system modal mini-swe-agent datasets",
     ],
     image_env={"MSWEA_SILENT_STARTUP": "1", **_WANDB_IMAGE_ENV},  # no mini-swe banner in rollout logs
-    
 )
 
 
@@ -73,13 +68,17 @@ class _Slime(SlimeConfig):
     # ── Model ─────────────────────────────────────────────────────────────────
     hf_checkpoint = "Qwen/Qwen3.6-35B-A3B"
     ref_load = f"{CHECKPOINTS_PATH}/Qwen3.6-35B-A3B_torch_dist"
+    # ref_load = f"{CHECKPOINTS_PATH}/Qwen3.6-35B-A3B_torch_dist_tp1"
 
-    # ── Colocate / sync ───────────────────────────────────────────────────────
+    # ── Noncolocate, sync (rollout & training on separate nodes) ───────────────
+    # async_mode=False = sync (rollout step, then a train step; no overlap), as in
+    # the rebench lineage. Flip to True for fully-overlapped async on these GPUs.
     async_mode = False
-    colocate = True
-    actor_num_nodes = 1
+    colocate = False
+    actor_num_nodes = 1            # 1 training node (8 GPU, Megatron)
     actor_num_gpus_per_node = 8
-    update_weights_interval = 1  # sync: fresh weights every step
+    rollout_num_gpus = 32          # 4 rollout nodes → 32 // 2 = 16 TP2 engines
+    update_weights_interval = 2    # resync weights every 2 rollout steps
     update_weight_buffer_size = 2147483648  # bucket the update like upstream CI
 
     # ── Custom agentic rollout (reward computed inline; no rm_type) ──────────
@@ -89,10 +88,12 @@ class _Slime(SlimeConfig):
     custom_config_path = {
         "agentic_max_steps": 75,
         "agentic_episode_timeout": 1800,
-        "agentic_eval_timeout": 600,
+        "agentic_eval_timeout": 300,
+        "agentic_exec_timeout": 120,  # per-command sandbox exec
+        "router_policy": "consistent_hashing",
     }
     metadata_key = "metadata"
-    # Harbor build of SWE-Gym-Lite, pulled per-dataset from HF into /data/swe_gym_lite/.
+    # Harbor build of SWE-rebench-V2, pulled from HF into /data/swe_rebench_v2/.
     prompt_data = train_path(_TRAIN)
     input_key = "prompt"
     label_key = "label"
@@ -103,27 +104,28 @@ class _Slime(SlimeConfig):
 
     # ── Rollout sizing ────────────────────────────────────────────────────────
     num_rollout = 500
-    rollout_batch_size = 32
+    rollout_batch_size = 64
     rollout_max_response_len = 8192
     rollout_temperature = 1.0
-    n_samples_per_prompt = 8
+    n_samples_per_prompt = 16
     num_steps_per_rollout = 1
-    global_batch_size = 256  # rollout_batch_size * n_samples_per_prompt // steps
+    global_batch_size = 1024  # rollout_batch_size * n_samples_per_prompt // steps
     micro_batch_size = 1
-    rollout_max_context_len = 32768  # multi-turn prompt+response budget
+    rollout_max_context_len = 32768 * 2  # 64k multi-turn prompt+response budget
     sglang_reasoning_parser = "qwen3"  # strip <think> blocks
     # mini-swe-agent v2 needs the model-matched parser for native tool-calls.
     sglang_tool_call_parser = "qwen3_coder"
-    rollout_num_gpus_per_engine = 8
 
-    # ── Engine sizing under colocation ────────────────────────────────────────
-    # Megatron residuals share the 141GB, so the static pool shrinks vs a
-    # dedicated rollout node. See docstring for the OOM playbook.
-    sglang_mem_fraction_static = 0.7
+    # ── Rollout engines: 4 rollout nodes, 16× TP2 behind sgl-router ───────────
+    rollout_num_gpus_per_engine = 2   # TP2 → 32 // 2 = 16 engines (sgl-router load-balanced)
+    sglang_mem_fraction_static = 0.85
     sglang_cuda_graph_bs = [1, 2, 4, 8, 16] + list(range(24, 257, 8))
+    sglang_cuda_graph_max_bs = 64
+    sglang_max_running_requests = 512
+    use_fault_tolerance = True
 
     # Required for gated-deltanet; extra_buffer also radix-caches mamba states
-    # across turns (prefix-cache health is the colocate bottleneck).
+    # across turns (prefix-cache health is the multi-turn bottleneck).
     sglang_mamba_scheduler_strategy = "extra_buffer"
 
     # EAGLE speculative decoding off the MTP head (decode-latency win); disable
@@ -133,16 +135,27 @@ class _Slime(SlimeConfig):
     sglang_speculative_eagle_topk = 1
     sglang_speculative_num_draft_tokens = 4
 
-    sglang_enable_dp_attention = False
-    # sglang_dp_size = 8
-    # sglang_ep_size = 8
+    # ── HiCache: host-memory extension of the radix prefix cache ──────────────
+    sglang_enable_hierarchical_cache = True
+    sglang_hicache_ratio = 1.0
+    sglang_hicache_write_policy = "write_through"
+    sglang_page_size = 64  # HiCache transfers are page-granular
 
-    sglang_disable_custom_all_reduce = True
+    # ── dp-attention ON (experimental) ─────────────────────────────────────────
+    # NB: this REVERSES the rollout-perf study's recommendation (see
+    # swe_sglang_rollout_perf_profile / distilled.md F4–F9, where dp-attention OFF
+    # was the single biggest latency lever). Kept as the 5n experiment; set
+    # sglang_enable_dp_attention=False and drop the dp_size / dp_lm_head /
+    # moe_dense_tp flags to return to the profiled pure-TP2 recipe.
+    sglang_enable_dp_attention = True
+    sglang_disable_custom_all_reduce = False
+    sglang_dp_size = 1
+    sglang_enable_dp_lm_head = True
+    sglang_moe_dense_tp_size = 1
 
     # ── Eval ──────────────────────────────────────────────────────────────────
-    # Subsets built with `python -m agentic_rl.evalset`. Each pass blocks
-    # the train loop on the shared engines, so keep subsets small (full sweeps:
-    # w_qwen3_swe_eval). Only eval_interval=None is "off".
+    # Each pass blocks the train loop on the shared engines, so keep subsets small
+    # (full sweeps: w_qwen3_swe_eval). Only eval_interval=None is "off".
     eval_interval = 5
     skip_eval_before_train = True
 
@@ -170,9 +183,11 @@ class _Slime(SlimeConfig):
     expert_tensor_parallel_size = 1
     # MoE dispatch: flex + DeepEP (config args win over the model script's alltoall).
     moe_token_dispatcher_type = "flex"
-    moe_enable_deepep = True
+    moe_enable_deepep = True  # training-side expert all-to-all (rollout-side deepep is off)
     use_dynamic_batch_size = True
-    max_tokens_per_gpu = rollout_max_context_len // context_parallel_size  # 16384
+    # 64k rollout_max_context_len / CP2 = 32k per rank; this budget covers the
+    # longest sample exactly.
+    max_tokens_per_gpu = 16384 * 2
     log_probs_chunk_size = 1024
     recompute_granularity = "full"
     recompute_method = "uniform"
@@ -182,6 +197,9 @@ class _Slime(SlimeConfig):
     accumulate_allreduce_grads_in_fp32 = True
     attention_softmax_in_fp32 = True
     attention_backend = "flash"
+    # mtp_num_layers = 1
+    # enable_mtp_training = True
+    # mtp_loss_scaling_factor = 0.2
     # Dump every rollout under the W&B group subdir; relaunches overwrite.
     save_debug_rollout_data = (
         f"{CHECKPOINTS_PATH}/swe_rollout_dumps/{_RUN_TAG}/rollout_{{rollout_id}}.pt"
@@ -196,6 +214,11 @@ class _Slime(SlimeConfig):
     entropy_coef = 0.0
     eps_clip = 0.2
     eps_clip_high = 0.28
+    # Truncated importance sampling: corrects for the (up to
+    # update_weights_interval-step) staleness between rollout and train weights.
+    use_tis = True
+    tis_clip = 2.0
+    tis_clip_low = 0.5
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = "adam"
@@ -220,8 +243,7 @@ class _Slime(SlimeConfig):
         "ASYNC_RL_TASK_ROOT": f"{DATA_PATH}",
         "SLIME_AGENT_SANDBOX_CPU": "2",
         "SLIME_AGENT_SANDBOX_MEMORY_MB": "4096",
-        # Authenticated Docker Hub pulls (not yet wired into the in-process
-        # sandbox): "MODAL_REGISTRY_SECRET": "dockerhub-creds".
+        "ASYNC_RL_REWARD_SHAPE": "binary",
     }
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -231,13 +253,8 @@ class _Slime(SlimeConfig):
     disable_wandb_random_suffix = True
 
     def download_data(self) -> None:
-        """Pull each dataset's HF repo into /data/<key>/ and subsample eval slices.
-
-        Conversion is offline (environment/convert2slime → per-dataset HF repos);
-        here we just download. In-distribution eval (swe_gym_lite) shares the train
-        repo's tasks/ tree — same converter version keeps task ids aligned.
-        Run on the slime-data volume: ``modal run slime/modal_train.py::download_data``.
-        """
+        """Pull the SWE-rebench-V2 repo into /data/swe_rebench_v2/ and subsample
+        the eval slice. Conversion/publish is offline (convert2slime/swerebench.py)."""
         for key in {_TRAIN, *(k for k, _ in _EVAL)}:
             pull(key)  # whole repo (train + eval + tasks) into /data/<key>/
         for key, n in _EVAL:

@@ -66,6 +66,11 @@ def get_checkpoint_conversion_policy(slime_cfg) -> tuple[int, int, list[str]]:
         # PP=1 makes TP*PP exceed world_size and trips Megatron's validate_args.
         # The torch_dist output is reshardable, so the conversion layout is irrelevant.
         extra_args: list[str] = []
+        # if tp > 1 or pp > 1:
+        #     extra_args += [
+        #         f"--tensor-model-parallel-size {tp}",
+        #         f"--pipeline-model-parallel-size {pp}",
+        #     ]
         for attr, flag in _CONVERSION_EXTRA_ARGS:
             if x := getattr(slime_cfg, attr, None):
                 extra_args.append(f"--{flag} {x}")
@@ -102,6 +107,10 @@ def get_modal_cluster_context(n_nodes: int) -> tuple[int, str, str, int]:
 def start_ray_head(my_ip: str, n_nodes: int) -> None:
     """Start Ray head node and wait for all workers to join."""
     import ray
+
+    # On a Modal retry this process may still hold a Ray client session from
+    # the previous attempt; drop it or ray.init below raises "called twice".
+    ray.shutdown()
 
     subprocess.Popen(
         [

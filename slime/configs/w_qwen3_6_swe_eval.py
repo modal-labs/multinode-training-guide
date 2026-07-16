@@ -4,37 +4,28 @@ Reuses ``w_qwen3_6_swe_colocate_1n`` (already ``async_mode = False``).
 ``num_rollout = 0`` routes through train.py's stock eval-only branch (eval once,
 exit) — for baselining the base model or sweeping a checkpoint.
 
-Data: the published eval set (https://huggingface.co/datasets/junlin-modal/agentic-rl-evalsets),
-pulled onto the /data volume by ``download_data()``. Edit ``_EVAL_DATASETS`` to
-select datasets.
+Datasets: one HF repo each (configs/datasets.py). Edit ``_EVAL`` to pick datasets
++ per-dataset subsample size (``None`` = full held-out eval.jsonl).
 
     EXPERIMENT_CONFIG=w_qwen3_6_swe_eval uv run --no-dev modal run slime/modal_train.py::download_data
     EXPERIMENT_CONFIG=w_qwen3_6_swe_eval uv run --no-dev modal run -d slime/modal_train.py::train
 """
 
-import os
-from pathlib import Path
-
-from configs.base import CHECKPOINTS_PATH, DATA_PATH, run_tag
-from configs.w_qwen3_6_swe_colocate_1n import _Slime, modal
-
-HF_EVAL_REPO = "junlin-modal/agentic-rl-evalsets"
+from configs.base import CHECKPOINTS_PATH, run_tag
+from configs.datasets import eval_datasets, pull, subsample
+from configs.w_qwen3_6_swe_colocate_1n import _Slime, modal  # noqa: F401
 
 # W&B run name; run_tag() appends a launch timestamp so dumps don't collide.
 _RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-eval")
 
-# Eval-set version, switched with EVAL_VERSION on launch (download_data pulls the
-# whole HF repo, so both versions live on the volume; only paths change).
-#   v0 = swe_gym_lite_100 (train distribution) / swebench_verified_100 /
-#        openthoughts_tblite / usaco_50
-#   v1 = swebench_verified / swebenchpro / swebench_multilingual / terminal_bench
-EVAL_VERSION = os.environ.get("EVAL_VERSION", "v1")
-_EVAL_SUBSETS = {
-    "v0": ["swe_gym_lite_100", "swebench_verified_100", "openthoughts_tblite", "usaco_50"],
-    "v1": ["swebench_verified", "swebenchpro", "swebench_multilingual", "terminal_bench"],
-}[EVAL_VERSION]
-# Comment names out above to eval fewer subsets.
-_EVAL_DATASETS = [f"{DATA_PATH}/evalsets/{EVAL_VERSION}/{name}.jsonl" for name in _EVAL_SUBSETS]
+# (dataset key, subsample n | None). None evals the full held-out eval.jsonl.
+_EVAL = [
+    ("swebench_verified", None),
+    ("swebenchpro", None),
+    ("swebench_multilingual", None),
+    ("terminal_bench_2_1", None),
+    # ("swegym_lite", 100), ("usaco", 50),  # in-distribution / transfer
+]
 
 
 class _SlimeEval(_Slime):
@@ -52,17 +43,9 @@ class _SlimeEval(_Slime):
     # hf_checkpoint weights are evaluated.
     # load = f"{CHECKPOINTS_PATH}/<run>/..."
 
-    # metadata_overrides keeps per-dataset attribution in the flattened dump.
     eval_config = {
         "defaults": {"n_samples_per_eval_prompt": 1, "temperature": 0.6, "top_p": 1.0},
-        "datasets": [
-            {
-                "name": Path(p).stem,
-                "path": p,
-                "metadata_overrides": {"eval_dataset": Path(p).stem},
-            }
-            for p in _EVAL_DATASETS
-        ],
+        "datasets": eval_datasets(_EVAL),
     }
 
     wandb_group = _RUN_TAG
@@ -73,11 +56,12 @@ class _SlimeEval(_Slime):
     )
 
     def download_data(self) -> None:
-        """Pull the published eval set from HF straight onto the data volume."""
-        from huggingface_hub import snapshot_download
-
-        path = snapshot_download(repo_id=HF_EVAL_REPO, repo_type="dataset", local_dir=str(DATA_PATH))
-        print(f"downloaded {HF_EVAL_REPO} -> {path}")
+        """Pull each eval dataset's repo into /data/<key>/, then subsample where asked."""
+        for key, _ in _EVAL:
+            pull(key)
+        for key, n in _EVAL:
+            if n is not None:
+                subsample(key, n)
 
 
 slime = _SlimeEval()

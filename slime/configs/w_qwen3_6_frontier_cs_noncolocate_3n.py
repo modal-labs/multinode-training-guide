@@ -1,30 +1,39 @@
-"""Qwen3.6-35B-A3B SWE agentic RL — colocated, single node (1× H200:8).
+"""Qwen3.6-35B-A3B on Frontier-CS algorithmic (competitive programming) — noncolocate, three nodes.
 
-Port of ``w_qwen3_swe_colocate_1n`` to Qwen3.6-35B-A3B, self-contained so it can
-be tuned independently. Qwen3.6 uses the qwen3.5 architecture (hybrid
-gated-deltanet + full-attention, gated attention output, 248k vocab) via
-``scripts/models/qwen3.5-35B-A3B.sh`` + ``slime_plugins.models.qwen3_5``.
-Colocated sync: each step runs rollout, then the engine offloads and Megatron
-trains.
+Frontier-CS sibling of ``w_qwen3_6_swe_noncolocate_3n``: identical topology and
+engine recipe (1 train + 2 rollout nodes, dp-attention OFF, 8× TP2 SGLang behind
+sgl-router — see that config's docstring for the perf rationale), only the
+**task family** changes (SWE-Gym-Lite → Frontier-CS).
 
-Model-driven deltas vs the 30B-A3B version:
-  - TP 4 -> 2: full-attention layers have num_query_groups=2 (Megatron needs
-    num_query_groups % TP == 0).
-  - mamba scheduler "extra_buffer" for the deltanet state pool; also
-    radix-caches mamba states (critical for multi-turn re-prefill).
-  - EAGLE speculative decoding off the MTP head (latency win on decode-bound
-    rollout; qwen3_5 bridge keeps the draft head fresh across weight updates).
-  - MoE dispatch: flex + DeepEP (config flags come after the model script's
-    alltoall MODEL_ARGS, so they win).
-  - New torch_dist conversion required (one-time):
-        EXPERIMENT_CONFIG=w_qwen3_6_swe_colocate_1n \
-        modal run slime/modal_train.py::convert_hf_to_megatron_checkpoint
+Frontier-CS runs as **harbor tasks** (per-task Dockerfile + in-sandbox
+``tests/evaluate.py``). The agent writes ``/app/solution.cpp`` and iterates with
+``bash /app/submit.sh``, which POSTs to a **verifier server** (Node + go-judge)
+booted once per worker by ``FrontierCsEnv`` (``environment/verifier_server/``). The
+2.5 GB of testdata rides on slime-data (``frontier_cs/problems/``); the judge mounts
+slime-data and reads it. Final grade = the judge's score on the final solution.cpp
+(``rewards.py`` shapes it; ``ASYNC_RL_REWARD_SHAPE`` picks fractional|binary|thresholded).
+Rows carry ``task_type=frontier_cs`` (set by the converter), so ``FrontierCsEnv``
+runs them — no env wiring needed beyond the verifier knobs below.
 
-Verify on the first run: tool-call/reasoning parsers (suspect first if the agent
-format-errors in a loop on turn 1); max_tokens_per_gpu >= context_len/CP (raise
-CP to 4 if training OOMs); mem_fraction_static=0.7 (drop toward 0.5 if startup
-OOMs during cuda-graph capture). Training rows are the harbor build of
-SWE-Gym-Lite (``env/harbor.py``).
+Self-contained (inherits only ``SlimeConfig``): the model / checkpoint / agent env /
+algorithm / optimizer / training parallelism are spelled out inline — see
+``w_qwen3_6_swe_colocate_1n`` for the model rationale (qwen3.5 arch, TP2 cap, EAGLE,
+MoE dispatch, the one-time torch_dist conversion) and ``w_qwen3_6_swe_noncolocate_3n``
+for the noncolocate engine recipe.
+
+Competitive programming is reasoning-heavy, so ``eval_max_response_len`` is raised
+to 24576 (the SWE default 8192 guillotines Qwen3.6's first <think> mid-thought
+before any tool call — 32/38 eval problems died at exactly 8192 with 0 tool calls;
+cf. ``w_qwen3_6_frontier_cs_eval``). ``rollout_max_response_len`` (the TRAINING
+per-turn cap) is left at 8192 to match the existing frontier-cs train configs; bump
+it if early training rollouts show the same guillotine.
+
+Prereqs before launch (see agentic_rl/environment/convert2slime/README.md):
+publish the frontier-cs dataset repo (jsonl + tasks/ + the 2.5 GB problems/) to HF;
+``download_data`` pulls all of it onto slime-data.
+
+    EXPERIMENT_CONFIG=w_qwen3_6_frontier_cs_noncolocate_3n \
+        uv run --no-dev modal run -d slime/modal_train.py::train
 """
 
 import os
@@ -40,13 +49,12 @@ from configs.base import (
 from configs.datasets import eval_datasets, pull, subsample, train_path
 
 # W&B run name; run_tag() appends a launch timestamp so dumps don't collide.
-_RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-gym-lite-colocate-1n")
+_RUN_TAG = run_tag("qwen3.6-35b-a3b-frontier-cs-noncolocate-3n")
 
-
-# Datasets (one HF repo each; see configs/datasets.py). Train on swegym_lite;
-# eval the full in-distribution held-out slice (30) + USACO transfer (50).
-_TRAIN = "swegym_lite"
-_EVAL = [("swegym_lite", None), ("usaco", 50)]
+# Datasets (one HF repo each; see configs/datasets.py). Train on frontier_cs; eval
+# the full held-out frontier_cs slice + USACO transfer (50).
+_TRAIN = "frontier_cs"
+_EVAL = [("frontier_cs", None), ("usaco", 50)]
 
 _WANDB_IMAGE_ENV = {
     k: v for k in ("WANDB_PROJECT", "WANDB_GROUP") if (v := os.environ.get(k)) is not None
@@ -61,7 +69,6 @@ modal = ModalConfig(
         "uv pip install --system modal mini-swe-agent datasets",
     ],
     image_env={"MSWEA_SILENT_STARTUP": "1", **_WANDB_IMAGE_ENV},  # no mini-swe banner in rollout logs
-    
 )
 
 
@@ -74,12 +81,12 @@ class _Slime(SlimeConfig):
     hf_checkpoint = "Qwen/Qwen3.6-35B-A3B"
     ref_load = f"{CHECKPOINTS_PATH}/Qwen3.6-35B-A3B_torch_dist"
 
-    # ── Colocate / sync ───────────────────────────────────────────────────────
-    async_mode = False
-    colocate = True
-    actor_num_nodes = 1
+    # ── Async noncolocate (rollout & training on separate nodes) ───────────────
+    async_mode = True
+    colocate = False
+    actor_num_nodes = 1            # 1 training node (8 GPU, Megatron)
     actor_num_gpus_per_node = 8
-    update_weights_interval = 1  # sync: fresh weights every step
+    update_weights_interval = 2    # resync weights every 2 rollout steps
     update_weight_buffer_size = 2147483648  # bucket the update like upstream CI
 
     # ── Custom agentic rollout (reward computed inline; no rm_type) ──────────
@@ -92,38 +99,37 @@ class _Slime(SlimeConfig):
         "agentic_eval_timeout": 600,
     }
     metadata_key = "metadata"
-    # Harbor build of SWE-Gym-Lite, pulled per-dataset from HF into /data/swe_gym_lite/.
+    # Frontier-CS algorithmic (harbor; task_type=frontier_cs), pulled into /data/frontier_cs/.
     prompt_data = train_path(_TRAIN)
     input_key = "prompt"
     label_key = "label"
     apply_chat_template = False  # the adapter renders the chat template itself
     rollout_shuffle = True
-    rm_type = None  # reward from the task env rollout (env/harbor.py), not a reward model
+    rm_type = None  # reward from the task env rollout (FrontierCsEnv judge), not a reward model
     balance_data = True
 
     # ── Rollout sizing ────────────────────────────────────────────────────────
     num_rollout = 500
     rollout_batch_size = 32
-    rollout_max_response_len = 8192
+    rollout_max_response_len = 8192   # TRAINING per-turn cap (see docstring on the CP guillotine)
     rollout_temperature = 1.0
     n_samples_per_prompt = 8
     num_steps_per_rollout = 1
     global_batch_size = 256  # rollout_batch_size * n_samples_per_prompt // steps
     micro_batch_size = 1
-    rollout_max_context_len = 32768  # multi-turn prompt+response budget
+    rollout_max_context_len = 32768 * 2  # 64k multi-turn prompt+response budget
     sglang_reasoning_parser = "qwen3"  # strip <think> blocks
     # mini-swe-agent v2 needs the model-matched parser for native tool-calls.
     sglang_tool_call_parser = "qwen3_coder"
-    rollout_num_gpus_per_engine = 8
 
-    # ── Engine sizing under colocation ────────────────────────────────────────
-    # Megatron residuals share the 141GB, so the static pool shrinks vs a
-    # dedicated rollout node. See docstring for the OOM playbook.
+    # ── Rollout engines: 2 rollout nodes, 8× TP2, dp-attention OFF ────────────
+    rollout_num_gpus = 16             # 2 rollout nodes
+    rollout_num_gpus_per_engine = 2   # TP2 → 16 // 2 = 8 engines (sgl-router load-balanced)
     sglang_mem_fraction_static = 0.7
     sglang_cuda_graph_bs = [1, 2, 4, 8, 16] + list(range(24, 257, 8))
 
     # Required for gated-deltanet; extra_buffer also radix-caches mamba states
-    # across turns (prefix-cache health is the colocate bottleneck).
+    # across turns (prefix-cache health is the multi-turn bottleneck).
     sglang_mamba_scheduler_strategy = "extra_buffer"
 
     # EAGLE speculative decoding off the MTP head (decode-latency win); disable
@@ -133,20 +139,20 @@ class _Slime(SlimeConfig):
     sglang_speculative_eagle_topk = 1
     sglang_speculative_num_draft_tokens = 4
 
+    # dp-attention OFF → pure TP. The DP/EP layout flags (sglang_dp_size /
+    # sglang_ep_size / sglang_enable_dp_lm_head) stay UNSET — they are meaningless
+    # without dp-attention and SGLang would build a contradictory engine if set.
     sglang_enable_dp_attention = False
-    # sglang_dp_size = 8
-    # sglang_ep_size = 8
-
-    sglang_disable_custom_all_reduce = True
+    sglang_disable_custom_all_reduce = False
 
     # ── Eval ──────────────────────────────────────────────────────────────────
-    # Subsets built with `python -m agentic_rl.evalset`. Each pass blocks
-    # the train loop on the shared engines, so keep subsets small (full sweeps:
-    # w_qwen3_swe_eval). Only eval_interval=None is "off".
-    eval_interval = 5
+    # Each pass blocks the train loop on the shared engines. Only eval_interval=None
+    # is "off". Frontier-CS eval is reasoning-heavy → raise the per-turn cap (see
+    # docstring); rollout_max_context_len above (64k) already matches the eval recipe.
+    eval_interval = 10
     skip_eval_before_train = True
 
-    eval_max_response_len = 8192
+    eval_max_response_len = 24576  # CP needs room to finish <think> + iterate (was 8192)
     eval_config = {
         "defaults": {
             "n_samples_per_eval_prompt": 1,
@@ -172,7 +178,11 @@ class _Slime(SlimeConfig):
     moe_token_dispatcher_type = "flex"
     moe_enable_deepep = True
     use_dynamic_batch_size = True
-    max_tokens_per_gpu = rollout_max_context_len // context_parallel_size  # 16384
+    # Retained at the colocate_1n base value (32768 // CP = 16384); it does NOT
+    # scale with the 64k rollout_max_context_len above. Bump to 32768 if you want
+    # the budget to track the full 64k context — at the cost of more activation
+    # memory per GPU.
+    max_tokens_per_gpu = 16384
     log_probs_chunk_size = 1024
     recompute_granularity = "full"
     recompute_method = "uniform"
@@ -208,9 +218,11 @@ class _Slime(SlimeConfig):
     overlap_cpu_optimizer_d2h_h2d = True
     use_precision_aware_optimizer = True
 
-    # ── Environment: PYTHONPATH + Modal sandbox knobs reach the Ray workers ──
-    # In-process design: no adapter/tunnel/in-sandbox runner. Episode limits live
-    # in custom_config_path; only sandbox/runtime knobs belong here.
+    # ── Environment: SWE sandbox knobs + Frontier-CS verifier-server wiring ───
+    # FrontierCsEnv boots the verifier server (vm_runtime Modal Sandbox) once per
+    # worker and exports FRONTIER_CS_JUDGE_URL. Set FRONTIER_CS_JUDGE_URL here to
+    # point at a pre-deployed judge instead (skips the per-worker boot).
+    # ASYNC_RL_REWARD_SHAPE picks the central reward shape (fractional|binary|thresholded).
     environment = {
         "PYTHONPATH": "/root/Megatron-LM/:/root/slime",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
@@ -220,8 +232,8 @@ class _Slime(SlimeConfig):
         "ASYNC_RL_TASK_ROOT": f"{DATA_PATH}",
         "SLIME_AGENT_SANDBOX_CPU": "2",
         "SLIME_AGENT_SANDBOX_MEMORY_MB": "4096",
-        # Authenticated Docker Hub pulls (not yet wired into the in-process
-        # sandbox): "MODAL_REGISTRY_SECRET": "dockerhub-creds".
+        "FRONTIER_CS_JUDGE_URL": os.environ.get("FRONTIER_CS_JUDGE_URL", ""),
+        "ASYNC_RL_REWARD_SHAPE": os.environ.get("ASYNC_RL_REWARD_SHAPE", "fractional"),
     }
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -231,15 +243,13 @@ class _Slime(SlimeConfig):
     disable_wandb_random_suffix = True
 
     def download_data(self) -> None:
-        """Pull each dataset's HF repo into /data/<key>/ and subsample eval slices.
+        """Pull frontier_cs (jsonl + tasks/ + the 2.5 GB problems/) + USACO eval onto /data.
 
-        Conversion is offline (environment/convert2slime → per-dataset HF repos);
-        here we just download. In-distribution eval (swe_gym_lite) shares the train
-        repo's tasks/ tree — same converter version keeps task ids aligned.
-        Run on the slime-data volume: ``modal run slime/modal_train.py::download_data``.
+        The verifier server mounts slime-data and reads /data/frontier_cs/problems —
+        no separate volume. Run: ``modal run slime/modal_train.py::download_data``.
         """
         for key in {_TRAIN, *(k for k, _ in _EVAL)}:
-            pull(key)  # whole repo (train + eval + tasks) into /data/<key>/
+            pull(key)  # whole repo into /data/<key>/ (frontier_cs incl. problems/)
         for key, n in _EVAL:
             if n is not None:
                 subsample(key, n)

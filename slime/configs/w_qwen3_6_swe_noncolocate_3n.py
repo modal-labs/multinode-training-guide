@@ -1,30 +1,41 @@
-"""Qwen3.6-35B-A3B SWE agentic RL — colocated, single node (1× H200:8).
+"""Qwen3.6-35B-A3B SWE agentic RL — noncolocate, three nodes (1 train + 2 rollout).
 
-Port of ``w_qwen3_swe_colocate_1n`` to Qwen3.6-35B-A3B, self-contained so it can
-be tuned independently. Qwen3.6 uses the qwen3.5 architecture (hybrid
-gated-deltanet + full-attention, gated attention output, 248k vocab) via
-``scripts/models/qwen3.5-35B-A3B.sh`` + ``slime_plugins.models.qwen3_5``.
-Colocated sync: each step runs rollout, then the engine offloads and Megatron
-trains.
+Three-node sibling of ``w_qwen3_6_swe_noncolocate_2n`` that adopts the rollout-perf
+study's recommended engine recipe (see
+``slime/agentic_rl/profiles/swe_sglang_rollout_perf_profile``):
 
-Model-driven deltas vs the 30B-A3B version:
-  - TP 4 -> 2: full-attention layers have num_query_groups=2 (Megatron needs
-    num_query_groups % TP == 0).
-  - mamba scheduler "extra_buffer" for the deltanet state pool; also
-    radix-caches mamba states (critical for multi-turn re-prefill).
-  - EAGLE speculative decoding off the MTP head (latency win on decode-bound
-    rollout; qwen3_5 bridge keeps the draft head fresh across weight updates).
-  - MoE dispatch: flex + DeepEP (config flags come after the model script's
-    alltoall MODEL_ARGS, so they win).
-  - New torch_dist conversion required (one-time):
-        EXPERIMENT_CONFIG=w_qwen3_6_swe_colocate_1n \
-        modal run slime/modal_train.py::convert_hf_to_megatron_checkpoint
+  * **dp-attention OFF** (pure tensor parallelism) — the single biggest lever; it
+    unifies the KV pool (less re-prefill) and drops per-token all-gather overhead.
+  * **small TP2 engines** behind sgl-router — 16 rollout GPUs ÷ TP2 = 8 engines,
+    halving per-engine concurrency.
+  * **2 rollout nodes** (16 GPU, vs the 2n config's 1 node / 8 GPU) for headroom.
 
-Verify on the first run: tool-call/reasoning parsers (suspect first if the agent
-format-errors in a loop on turn 1); max_tokens_per_gpu >= context_len/CP (raise
-CP to 4 if training OOMs); mem_fraction_static=0.7 (drop toward 0.5 if startup
-OOMs during cuda-graph capture). Training rows are the harbor build of
-SWE-Gym-Lite (``env/harbor.py``).
+Together these took the profiled per-turn engine latency from ~99s (the 2n
+dp-attention TP8 baseline) to ~2.5s and roughly halved the rollout step wall
+(933→603s), while raising step-0 reward. In fact 603s is the BEST rollout wall the
+study measured at any node count. See ``distilled.md`` F4–F9.
+
+  NB on colocate: a colocate config (``w_qwen3_6_swe_colocate_*``) MAY be more
+  GPU-efficient at the same node budget — it reclaims this layout's train node,
+  which sits idle ~77% of each async iteration. BUT that is NOT established for 3
+  nodes: the profile measured the rollout step only (num_rollout=1), never the
+  full rollout+serial-train cycle, and its one colocate-3n run hung on a straggler
+  (no valid wall). On the rollout wall alone, this noncolocate-3n (603s) actually
+  beat the clean colocate runs at 2n (686s) and 4n (692s). Treat colocate-vs-this
+  as open until the full step_time is measured.
+
+Topology: 1 training node (8 GPU, Megatron) + 2 rollout nodes (16 GPU, 8× TP2
+SGLang engines) = 3 nodes / 24 GPU. Async: rollout and training overlap on
+separate GPUs (weights resync every ``update_weights_interval`` rollout steps).
+
+Self-contained (inherits only ``SlimeConfig``): the model / checkpoint / agent
+env / algorithm / optimizer settings are spelled out inline rather than inherited
+from ``w_qwen3_6_swe_colocate_1n`` — see that file's docstring for the model
+rationale (qwen3.5 arch, TP2 cap, EAGLE, MoE dispatch, the one-time torch_dist
+conversion). Training rows are the harbor build of SWE-Gym-Lite (``env/harbor.py``).
+
+    EXPERIMENT_CONFIG=w_qwen3_6_swe_noncolocate_3n \
+        uv run --no-dev modal run -d slime/modal_train.py::train
 """
 
 import os
@@ -40,8 +51,7 @@ from configs.base import (
 from configs.datasets import eval_datasets, pull, subsample, train_path
 
 # W&B run name; run_tag() appends a launch timestamp so dumps don't collide.
-_RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-gym-lite-colocate-1n")
-
+_RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-gym-lite-noncolocate-3n")
 
 # Datasets (one HF repo each; see configs/datasets.py). Train on swegym_lite;
 # eval the full in-distribution held-out slice (30) + USACO transfer (50).
@@ -61,7 +71,6 @@ modal = ModalConfig(
         "uv pip install --system modal mini-swe-agent datasets",
     ],
     image_env={"MSWEA_SILENT_STARTUP": "1", **_WANDB_IMAGE_ENV},  # no mini-swe banner in rollout logs
-    
 )
 
 
@@ -74,12 +83,12 @@ class _Slime(SlimeConfig):
     hf_checkpoint = "Qwen/Qwen3.6-35B-A3B"
     ref_load = f"{CHECKPOINTS_PATH}/Qwen3.6-35B-A3B_torch_dist"
 
-    # ── Colocate / sync ───────────────────────────────────────────────────────
-    async_mode = False
-    colocate = True
-    actor_num_nodes = 1
+    # ── Async noncolocate (rollout & training on separate nodes) ───────────────
+    async_mode = True
+    colocate = False
+    actor_num_nodes = 1            # 1 training node (8 GPU, Megatron)
     actor_num_gpus_per_node = 8
-    update_weights_interval = 1  # sync: fresh weights every step
+    update_weights_interval = 2    # resync weights every 2 rollout steps
     update_weight_buffer_size = 2147483648  # bucket the update like upstream CI
 
     # ── Custom agentic rollout (reward computed inline; no rm_type) ──────────
@@ -89,7 +98,10 @@ class _Slime(SlimeConfig):
     custom_config_path = {
         "agentic_max_steps": 75,
         "agentic_episode_timeout": 1800,
-        "agentic_eval_timeout": 600,
+        "agentic_eval_timeout": 300,
+        "agentic_exec_timeout": 120,  # per-command sandbox exec
+        "router_policy": "consistent_hashing", 
+
     }
     metadata_key = "metadata"
     # Harbor build of SWE-Gym-Lite, pulled per-dataset from HF into /data/swe_gym_lite/.
@@ -110,20 +122,19 @@ class _Slime(SlimeConfig):
     num_steps_per_rollout = 1
     global_batch_size = 256  # rollout_batch_size * n_samples_per_prompt // steps
     micro_batch_size = 1
-    rollout_max_context_len = 32768  # multi-turn prompt+response budget
+    rollout_max_context_len = 32768 * 2  # 64k multi-turn prompt+response budget
     sglang_reasoning_parser = "qwen3"  # strip <think> blocks
     # mini-swe-agent v2 needs the model-matched parser for native tool-calls.
     sglang_tool_call_parser = "qwen3_coder"
-    rollout_num_gpus_per_engine = 8
 
-    # ── Engine sizing under colocation ────────────────────────────────────────
-    # Megatron residuals share the 141GB, so the static pool shrinks vs a
-    # dedicated rollout node. See docstring for the OOM playbook.
-    sglang_mem_fraction_static = 0.7
+    # ── Rollout engines: 2 rollout nodes, 8× TP2, dp-attention OFF ────────────
+    rollout_num_gpus = 16             # 2 rollout nodes (the +1 node vs the 2n config)
+    rollout_num_gpus_per_engine = 2   # TP2 → 16 // 2 = 8 engines (sgl-router load-balanced)
+    sglang_mem_fraction_static = 0.85
     sglang_cuda_graph_bs = [1, 2, 4, 8, 16] + list(range(24, 257, 8))
 
     # Required for gated-deltanet; extra_buffer also radix-caches mamba states
-    # across turns (prefix-cache health is the colocate bottleneck).
+    # across turns (prefix-cache health is the multi-turn bottleneck).
     sglang_mamba_scheduler_strategy = "extra_buffer"
 
     # EAGLE speculative decoding off the MTP head (decode-latency win); disable
@@ -133,11 +144,11 @@ class _Slime(SlimeConfig):
     sglang_speculative_eagle_topk = 1
     sglang_speculative_num_draft_tokens = 4
 
+    # dp-attention OFF → pure TP. The DP/EP layout flags (sglang_dp_size /
+    # sglang_ep_size / sglang_enable_dp_lm_head) stay UNSET — they are meaningless
+    # without dp-attention and SGLang would build a contradictory engine if set.
     sglang_enable_dp_attention = False
-    # sglang_dp_size = 8
-    # sglang_ep_size = 8
-
-    sglang_disable_custom_all_reduce = True
+    sglang_disable_custom_all_reduce = False
 
     # ── Eval ──────────────────────────────────────────────────────────────────
     # Subsets built with `python -m agentic_rl.evalset`. Each pass blocks
@@ -172,7 +183,11 @@ class _Slime(SlimeConfig):
     moe_token_dispatcher_type = "flex"
     moe_enable_deepep = True
     use_dynamic_batch_size = True
-    max_tokens_per_gpu = rollout_max_context_len // context_parallel_size  # 16384
+    # Retained at the colocate_1n base value (32768 // CP = 16384); it does NOT
+    # scale with the 64k rollout_max_context_len above (preserved from the prior
+    # inherited config). Bump to 32768 if you want the budget to track the full
+    # 64k context — at the cost of more activation memory per GPU.
+    max_tokens_per_gpu = 16384*2
     log_probs_chunk_size = 1024
     recompute_granularity = "full"
     recompute_method = "uniform"
@@ -220,8 +235,6 @@ class _Slime(SlimeConfig):
         "ASYNC_RL_TASK_ROOT": f"{DATA_PATH}",
         "SLIME_AGENT_SANDBOX_CPU": "2",
         "SLIME_AGENT_SANDBOX_MEMORY_MB": "4096",
-        # Authenticated Docker Hub pulls (not yet wired into the in-process
-        # sandbox): "MODAL_REGISTRY_SECRET": "dockerhub-creds".
     }
 
     # ── WandB ─────────────────────────────────────────────────────────────────

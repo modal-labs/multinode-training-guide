@@ -1,10 +1,10 @@
 """Qwen3-30B-A3B SWE agentic RL on SWE-Gym-Lite — async, non-colocated (2× H200:8).
 
 Self-contained (model/optimizer/parallelism copied from ``w_qwen3_dapo``).
-Rollout is the mini-swe-agent driver in ``async_rl_research`` (Modal sandboxes,
+Rollout is the mini-swe-agent driver in ``agentic_rl`` (Modal sandboxes,
 reward graded in a clean sandbox), wired via ``--custom-generate-function-path``.
 The agent dials back to the host adapter through a ``modal.forward`` tunnel
-(``MODAL_EXPOSE_ADAPTER=1``); ``async_rl_research`` ships via the ``local_slime``
+(``MODAL_EXPOSE_ADAPTER=1``); ``agentic_rl`` ships via the ``local_slime``
 overlay and is added to ``PYTHONPATH`` so Ray rollout workers can import it.
 Checkpoint: reuse ``w_qwen3_dapo``'s ``Qwen3-30B-A3B_torch_dist`` (TP=4, PP=1).
 """
@@ -19,6 +19,7 @@ from configs.base import (
     HF_CACHE_PATH,
     run_tag,
 )
+from configs.datasets import eval_datasets, pull, train_path
 
 # W&B run name; run_tag() appends a launch timestamp so dumps don't collide.
 _RUN_TAG = run_tag("qwen3-30b-a3b-swe-gym-lite-async")
@@ -56,9 +57,16 @@ class _Slime(SlimeConfig):
     rollout_num_gpus = 8  # → total_nodes() == 2 (8 actor + 8 rollout)
 
     # ── Custom agentic rollout (reward computed inline; no rm_type) ──────────
-    custom_generate_function_path = "async_rl_research.generate.generate"
+    custom_generate_function_path = "agentic_rl.generate.generate"
+    custom_rollout_log_function_path = "agentic_rl.metrics.log_rollout_data"
+    # Episode limits read off args (launcher materializes this dict to a temp YAML).
+    custom_config_path = {
+        "agentic_max_steps": 50,
+        "agentic_episode_timeout": 1800,
+        "agentic_eval_timeout": 600,
+    }
     metadata_key = "metadata"
-    prompt_data = f"{DATA_PATH}/swe_gym_lite/swe_gym_lite.jsonl"
+    prompt_data = train_path("swegym_lite")
     input_key = "prompt"
     label_key = "label"
     apply_chat_template = False  # the adapter renders the chat template itself
@@ -91,31 +99,20 @@ class _Slime(SlimeConfig):
     sglang_disable_custom_all_reduce = True
 
     # ── Eval ──────────────────────────────────────────────────────────────────
-    # Subsets built with `python -m async_rl_research.evalset`. No step-0
+    # Subsets built with `python -m agentic_rl.evalset`. No step-0
     # baseline in async mode (baseline once with w_qwen3_swe_eval); each pass
     # blocks the train loop on the shared engines, so keep subsets small. Only
     # eval_interval=None is "off".
-    eval_interval = None  # flip on (e.g. 20) once /data/evalsets/v0 is built
+    eval_interval = None  # eval off; flip on (e.g. 20) + add pull/subsample to download_data
     eval_max_response_len = 16384
+    # (key, n) specs via the registry; eval is off so these aren't pulled until armed.
     eval_config = {
         "defaults": {
             "n_samples_per_eval_prompt": 1,
             "temperature": 0.6,  # low-but-nonzero: Qwen3 degenerates at greedy
             "top_p": 1.0,
         },
-        # metadata_overrides keeps per-dataset attribution in the flattened dump.
-        "datasets": [
-            {
-                "name": "usaco_50",
-                "path": f"{DATA_PATH}/evalsets/v0/usaco_50.jsonl",
-                "metadata_overrides": {"eval_dataset": "usaco_50"},
-            },
-            # {
-            #     "name": "swebench_verified_50",
-            #     "path": f"{DATA_PATH}/evalsets/v0/swebench_verified_50.jsonl",
-            #     "metadata_overrides": {"eval_dataset": "swebench_verified_50"},
-            # },
-        ],
+        "datasets": eval_datasets([("usaco", 50)]),
     }
 
     # ── Training ──────────────────────────────────────────────────────────────
@@ -165,27 +162,19 @@ class _Slime(SlimeConfig):
     use_precision_aware_optimizer = True
 
     # ── Environment: PYTHONPATH + Modal sandbox knobs reach the Ray workers ──
-    # NOTE: async_rl_research reads AGENT_*/MODAL_* names, not the upstream SWE_*.
+    # In-process design: no adapter/tunnel/in-sandbox runner. Episode limits live
+    # in custom_config_path; only sandbox/runtime knobs belong here.
     environment = {
         "PYTHONPATH": "/root/Megatron-LM/:/root/slime",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_NVLS_ENABLE": "1",
-        "MODAL_EXPOSE_ADAPTER": "1",  # sandboxes reach adapter via forward tunnel
         "MODAL_ENVIRONMENT": "junlin-dev",  # env the agent sandboxes boot in
         # harbor rows resolve relative task_path here; evalset.py uses the same root.
         "ASYNC_RL_TASK_ROOT": f"{DATA_PATH}",
-        "ASYNC_RL_AGENT_DRIVER": "async_rl_research.agent.mini_swe_agent",
-        "AGENT_TIME_BUDGET_SEC": "1800",  # wallclock per agent run
-        "AGENT_EVAL_TIMEOUT_SEC": "600",  # wallclock cap on the evaluator sandbox
-        "MODAL_BOOT_CONCURRENCY": "8",  # max concurrent sandbox creates
         "SLIME_AGENT_SANDBOX_CPU": "2",
         "SLIME_AGENT_SANDBOX_MEMORY_MB": "4096",
-        # Authenticated Docker Hub pulls for per-instance SWE images avoid the
-        # anonymous pull limit. Points at a modal.Secret with REGISTRY_USERNAME/
-        # PASSWORD (modal secret create dockerhub-creds REGISTRY_USERNAME=<user>
-        # REGISTRY_PASSWORD=<token> --env <your-env>).
-        # "MODAL_REGISTRY_SECRET": "dockerhub-creds",
-        "SHIM_PORT": "18002",
+        # Authenticated Docker Hub pulls (not yet wired into the in-process
+        # sandbox): "MODAL_REGISTRY_SECRET": "dockerhub-creds".
     }
 
     # ── WandB ─────────────────────────────────────────────────────────────────
@@ -195,21 +184,11 @@ class _Slime(SlimeConfig):
     disable_wandb_random_suffix = True
 
     def download_data(self) -> None:
-        """Pull SWE-Gym-Lite from HF and convert to slime prompt JSONL.
+        """Pull the harbor build of SWE-Gym-Lite from HF into /data/swegym_lite/.
 
         Run on the slime-data volume: ``modal run slime/modal_train.py::download_data``.
         """
-        import os
-        import sys
-
-        sys.path.insert(0, "/root/slime")  # local_slime overlay → async_rl_research
-        from async_rl_research.environment.convert2slime.swe_gym import load_hf, write_jsonl
-
-        out_dir = f"{DATA_PATH}/swe_gym_lite"
-        os.makedirs(out_dir, exist_ok=True)
-        rows = load_hf("train", lite=True, limit=None)
-        count = write_jsonl(rows, f"{out_dir}/swe_gym_lite.jsonl")
-        print(f"wrote {count} SWE-Gym-Lite rows -> {out_dir}/swe_gym_lite.jsonl")
+        pull("swegym_lite")
 
 
 slime = _Slime()

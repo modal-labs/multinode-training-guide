@@ -72,6 +72,7 @@ class ModalConfig:
     memory: tuple[int, int] | None = (
         None  # per-container memory in MiB; check https://modal.com/docs/guide/resources#memory-limits
     )
+    ephemeral_disk: int | None = None  # per-container disk quota in MiB (Modal default 512 GiB, max 3 TiB)
     cloud: str | None = None  # e.g. "aws", "gcp"
     region: str | None = None  # e.g. "us-east-2"
     local_slime: str | None = None  # path to local slime repo for dev overlay

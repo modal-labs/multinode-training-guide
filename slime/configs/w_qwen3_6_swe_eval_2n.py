@@ -1,47 +1,50 @@
 """Eval-only run of the Qwen3.6-35B-A3B SWE agentic-RL setup — no training.
+
+Evaluates a list of datasets, one HF repo each (configs/datasets.py). Edit ``_EVAL``
+to pick datasets + per-dataset subsample size (``None`` = full held-out eval.jsonl).
 """
 
-import os
-from pathlib import Path
-
-from configs.base import CHECKPOINTS_PATH, DATA_PATH, run_tag
-from configs.w_qwen3_6_swe_colocate_2n import _Slime, modal
-
-HF_EVAL_REPO = "junlin-modal/agentic-rl-evalsets"
+from configs.base import CHECKPOINTS_PATH, run_tag
+from configs.datasets import eval_datasets, pull, subsample
+from configs.w_qwen3_6_swe_colocate_2n import _Slime, modal  # noqa: F401
 
 # W&B run name; run_tag() appends a launch timestamp so dumps don't collide.
 _RUN_TAG = run_tag("qwen3.6-35b-a3b-swe-eval")
 
-EVAL_VERSION = os.environ.get("EVAL_VERSION", "v1")
-_EVAL_SUBSETS = {
-    "v0": ["swe_gym_lite_100", "swebench_verified_100", "openthoughts_tblite", "usaco_50"],
-    # "v1": ["swebench_verified", "swebenchpro", "swebench_multilingual", "terminal_bench"],
-    "v1": ["terminal_bench"],
-}[EVAL_VERSION]
-# Comment names out above to eval fewer subsets.
-_EVAL_DATASETS = [f"{DATA_PATH}/evalsets/{EVAL_VERSION}/{name}.jsonl" for name in _EVAL_SUBSETS]
+# (dataset key, subsample n | None). None evals the full held-out eval.jsonl; an
+# int subsamples it in download_data. Comment a line out to eval fewer datasets.
+_EVAL = [
+    ("swebench_verified", None),
+    ("swebenchpro", None),
+    ("swebench_multilingual", None),
+    ("terminal_bench_2_1", None),
+    ("swegym_lite", None),   # in-distribution held-out (30)
+    # ("usaco", 50),
+]
 
 
 class _SlimeEval(_Slime):
     num_rollout = 0
     eval_interval = 1  # any non-None value arms the eval-only branch
-    sglang_server_concurrency=128
-
+    sglang_server_concurrency = 32
     lr_decay_iters = 1
-    sglang_mem_fraction_static = 0.85
-    rollout_max_context_len = 32768 * 2
 
-    # metadata_overrides keeps per-dataset attribution in the flattened dump.
+    # Fast rollout-engine recipe from rollout_profile/colo2n_tp2.py: 8×TP2 engines
+    # (dp-attention off) across the 16 GPUs + 64k ctx. mem_fraction stays 0.6 — TP2
+    # replicates the model 8× (each engine spans 2 GPUs), so per-GPU KV headroom is
+    # tight next to the resident Megatron weights; raising it OOMs (drop ctx to 32k if so).
+    rollout_num_gpus = 16
+    rollout_num_gpus_per_engine = 2
+    sglang_enable_dp_attention = False
+    sglang_dp_size = None
+    sglang_enable_dp_lm_head = None
+    sglang_ep_size = None
+    sglang_mem_fraction_static = 0.6
+    rollout_max_context_len = 65536
+
     eval_config = {
         "defaults": {"n_samples_per_eval_prompt": 1, "temperature": 0.6, "top_p": 1.0},
-        "datasets": [
-            {
-                "name": Path(p).stem,
-                "path": p,
-                "metadata_overrides": {"eval_dataset": Path(p).stem},
-            }
-            for p in _EVAL_DATASETS
-        ],
+        "datasets": eval_datasets(_EVAL),
     }
 
     wandb_group = _RUN_TAG
@@ -52,11 +55,12 @@ class _SlimeEval(_Slime):
     )
 
     def download_data(self) -> None:
-        """Pull the published eval set from HF straight onto the data volume."""
-        from huggingface_hub import snapshot_download
-
-        path = snapshot_download(repo_id=HF_EVAL_REPO, repo_type="dataset", local_dir=str(DATA_PATH))
-        print(f"downloaded {HF_EVAL_REPO} -> {path}")
+        """Pull each eval dataset's repo into /data/<key>/, then subsample where asked."""
+        for key, _ in _EVAL:
+            pull(key)
+        for key, n in _EVAL:
+            if n is not None:
+                subsample(key, n)
 
 
 slime = _SlimeEval()

@@ -40,7 +40,17 @@ if modal_cfg:
             modal_cfg.local_slime,
             remote_path=SLIME_ROOT,
             copy=True,
-            ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
+            # agentic_rl/profiles/ holds LOCAL judge/rollout profiling runs that
+            # write logs live (run.log, phase1_trials.jsonl, ...). Copying them
+            # races an in-flight profiler -> Modal "modified during build process";
+            # nothing at runtime imports agentic_rl.profiles, so exclude it.
+            ignore=[
+                "**/__pycache__",
+                "**/*.pyc",
+                "**/.git",
+                "**/.venv",
+                "agentic_rl/profiles/**",
+            ],
         )
     if modal_cfg.image_run_commands:
         image = image.run_commands(*modal_cfg.image_run_commands)
@@ -190,6 +200,9 @@ def download_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     image=image,
     gpu=f"{modal_cfg.gpu}" if modal_cfg else None,
     volumes=modal_volumes,
+    # Hooks may torch.load multi-GB rollout dumps (e.g. the swe_rebench_v2
+    # prefilter aggregation); the Modal default request is far too small.
+    memory=128 * 1024,
     timeout=4 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -791,9 +804,18 @@ def expert_value_check(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
     memory=modal_cfg.memory if modal_cfg and modal_cfg.memory else None,
     cloud=modal_cfg.cloud if modal_cfg and modal_cfg.cloud else None,
     region=modal_cfg.region if modal_cfg and modal_cfg.region else None,
+    # Ray session data (/tmp/ray object spilling + engine logs) plus the local
+    # write buffering of checkpoint saves can blow the 512 GiB default quota on
+    # long RL runs — observed as heartbeat deaths / OSError at the first save.
+    ephemeral_disk=getattr(modal_cfg, "ephemeral_disk", None) if modal_cfg else None,
     volumes=modal_volumes,
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,
+    # Modal hosts last at most 24h (the timeout above). With retries, the
+    # cluster relaunches after a timeout/preemption; configs that bake a
+    # LAUNCH_STAMP into the image env reuse their save dir and resume from the
+    # latest checkpoint, so multi-day runs survive the 24h GPU expiry.
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=60.0),
     experimental_options={"efa_enabled": True},
 )
 @(
@@ -802,6 +824,26 @@ def expert_value_check(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
     else lambda fn: fn
 )
 async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    # A Modal retry re-runs this function in the SAME containers (observed: a
+    # node loss raised on rank 0, then the retry hit "Ray is already running at
+    # <head>:6379"). Tear down any Ray state from the previous attempt so each
+    # attempt starts from a clean slate on every rank.
+    subprocess.run(["ray", "stop", "--force"], check=False, capture_output=True)
+
+    # Ray's default liveness window (~5 × 10s health checks) is far too tight for
+    # these hosts: checkpoint saves (hundreds of GB of optimizer state to the
+    # volume) and weight syncs stall the raylet long enough that GCS marks the
+    # node dead and kills the whole run (observed repeatedly: "health check
+    # failed due to missing too many heartbeats ... likely overloaded", killing
+    # the run mid-save at step 19 and mid weight-sync). Tolerate ~5 minutes of
+    # unresponsiveness before declaring a node dead; a truly lost node just
+    # takes a few extra minutes to detect, which the retry policy then handles.
+    # Must be set before `ray start` on EVERY rank (GCS lives on rank 0; the
+    # raylets read these too).
+    os.environ.setdefault("RAY_health_check_initial_delay_ms", "60000")
+    os.environ.setdefault("RAY_health_check_period_ms", "15000")
+    os.environ.setdefault("RAY_health_check_timeout_ms", "120000")
+    os.environ.setdefault("RAY_health_check_failure_threshold", "20")
     await asyncio.gather(
         hf_cache_volume.reload.aio(),
         data_volume.reload.aio(),
@@ -864,3 +906,12 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
         print(f"Ray dashboard: {tunnel.url}")
         async for line in client.tail_job_logs(job_id):
             print(line, end="", flush=True)
+
+    # The log tail ends whenever the Ray job ends — including on failure (e.g. a
+    # dead actor after a node loss). Raise so Modal's retry policy relaunches the
+    # cluster and the run resumes from its latest checkpoint, instead of the
+    # function returning "success" and the app quietly stopping.
+    status = client.get_job_status(job_id)
+    print(f"Ray job {job_id} finished with status: {status}")
+    if str(status) != "SUCCEEDED":
+        raise RuntimeError(f"Ray job {job_id} ended with status {status}; raising to trigger Modal retry")
