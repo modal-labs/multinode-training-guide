@@ -1,10 +1,5 @@
 # pyright: reportMissingImports=false, reportCallIssue=false, reportOptionalCall=false
-"""DeepSeek-V4-Flash long-context smoke test via NeMo AutoModel on Modal.
-
-This launcher is intentionally separate from ``modal_train.py``. The existing
-entrypoint uses ms-swift/Megatron-Bridge; this one exercises NVIDIA NeMo
-AutoModel's public DSv4 context-parallel path.
-"""
+"""DeepSeek-V4-Flash 60k LoRA SFT and vLLM serving on Modal."""
 
 from __future__ import annotations
 
@@ -17,6 +12,13 @@ import modal
 import modal.experimental
 
 HF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+VLLM_IMAGE = "vllm/vllm-openai:v0.25.1"
+VLLM_VERSION = "0.25.1"
+VLLM_ADAPTER_NAME = "deepseek-v4-flash-60k-lora"
+VLLM_PORT = 8000
+VLLM_PIPELINE_PARALLEL_SIZE = 4
+VLLM_GPU = f"H200:{VLLM_PIPELINE_PARALLEL_SIZE}"
+VLLM_HF_CONFIG_DIR = Path("/tmp/deepseek-v4-flash-vllm-config")
 GPUS_PER_NODE = 8
 N_NODES = int(os.environ.get("N_NODES", "16"))
 HOST_MEMORY_REQUEST_MB = int(os.environ.get("HOST_MEMORY_REQUEST_MB", "128"))
@@ -97,6 +99,10 @@ AUTOMODEL_COMPOSITE_BACKEND_PATCH = Path(__file__).with_name(
 AUTOMODEL_PP_PEFT_CHECKPOINT_PATCH = Path(__file__).with_name(
     "automodel_pp_peft_checkpoint.patch"
 )
+VLLM_LORA_PATCH = Path(__file__).with_name("vllm_deepseek_v4_lora.patch")
+SERVE_RUN_ID = os.environ.get("SERVE_RUN_ID")
+SERVE_CHECKPOINT_STEP = int(os.environ.get("SERVE_CHECKPOINT_STEP", "4"))
+SERVE_MAX_MODEL_LEN = int(os.environ.get("SERVE_MAX_MODEL_LEN", str(64 * 1024)))
 
 app = modal.App("example-deepseek-v4-flash-automodel")
 
@@ -212,6 +218,208 @@ automodel_image = (
         " && git apply /tmp/automodel_pp_peft_checkpoint.patch"
     )
 )
+
+vllm_image = (
+    modal.Image.from_registry(VLLM_IMAGE)
+    .entrypoint([])
+    .run_commands("ln -sf $(which python3) /usr/local/bin/python")
+    .apt_install("patch")
+    .add_local_file(
+        str(VLLM_LORA_PATCH),
+        "/tmp/vllm_deepseek_v4_lora.patch",
+        copy=True,
+    )
+    .run_commands(
+        "cd $(python -c 'import pathlib, vllm; "
+        "print(pathlib.Path(vllm.__file__).resolve().parent.parent)') && "
+        "patch --batch --forward -p1 < /tmp/vllm_deepseek_v4_lora.patch"
+    )
+    .env(
+        {
+            "HF_XET_HIGH_PERFORMANCE": "1",
+            "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+        }
+    )
+)
+
+
+def _finalized_adapter_dir(run_id: str, checkpoint_step: int) -> Path:
+    if not run_id or Path(run_id).name != run_id:
+        raise ValueError("run_id must be a non-empty path component")
+    return Path(CHECKPOINTS_DIR) / run_id / f"epoch_0_step_{checkpoint_step}" / "model"
+
+
+def _vllm_server_command(
+    adapter_dir: Path,
+    *,
+    max_model_len: int,
+    port: int = VLLM_PORT,
+) -> list[str]:
+    return [
+        "python",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        HF_MODEL,
+        "--served-model-name",
+        HF_MODEL,
+        "--pipeline-parallel-size",
+        str(VLLM_PIPELINE_PARALLEL_SIZE),
+        "--enable-expert-parallel",
+        "--trust-remote-code",
+        "--hf-config-path",
+        str(VLLM_HF_CONFIG_DIR),
+        "--tokenizer-mode",
+        "deepseek_v4",
+        "--reasoning-parser",
+        "deepseek_v4",
+        "--max-model-len",
+        str(max_model_len),
+        "--max-num-seqs",
+        "1",
+        "--max-num-batched-tokens",
+        "8192",
+        "--gpu-memory-utilization",
+        "0.92",
+        "--kv-cache-dtype",
+        "fp8",
+        "--block-size",
+        "256",
+        "--enable-lora",
+        "--max-loras",
+        "1",
+        "--max-lora-rank",
+        "64",
+        "--lora-target-modules",
+        "fused_wqa_wkv",
+        "wq_b",
+        "--lora-modules",
+        f"{VLLM_ADAPTER_NAME}={adapter_dir}",
+        "--enforce-eager",
+        "--no-enable-flashinfer-autotune",
+        "--no-enable-log-requests",
+        "--disable-uvicorn-access-log",
+        "--port",
+        str(port),
+    ]
+
+
+def _prepare_vllm_hf_config() -> Path:
+    from huggingface_hub import hf_hub_download
+
+    config_path = Path(
+        hf_hub_download(
+            repo_id=HF_MODEL,
+            filename="config.json",
+            cache_dir="/tmp/vllm-hf-config-cache",
+            local_dir=VLLM_HF_CONFIG_DIR,
+            force_download=True,
+            token=os.environ.get("HF_TOKEN"),
+        )
+    )
+    config = json.loads(config_path.read_text())
+    quantization_config = config.get("quantization_config")
+    expected = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    if quantization_config != expected:
+        raise RuntimeError(
+            f"Unexpected DeepSeek V4 Flash quantization config: {quantization_config}"
+        )
+    return config_path.parent
+
+
+def _validate_finalized_adapter_for_vllm(
+    run_id: str,
+    checkpoint_step: int,
+    max_model_len: int,
+) -> tuple[Path, dict[str, Any]]:
+    import hashlib
+
+    import torch
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
+
+    adapter_dir = _finalized_adapter_dir(run_id, checkpoint_step)
+    adapter_path = adapter_dir / "adapter_model.safetensors"
+    config_path = adapter_dir / "adapter_config.json"
+    manifest_path = adapter_dir.parent / "checkpoint_manifest.json"
+    for path in (adapter_path, config_path, manifest_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing finalized adapter artifact: {path}")
+
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("run_id") != run_id or manifest.get("step") != checkpoint_step:
+        raise RuntimeError(
+            "Checkpoint manifest does not match the requested adapter: "
+            f"run_id={manifest.get('run_id')}, step={manifest.get('step')}"
+        )
+    digest = hashlib.sha256(adapter_path.read_bytes()).hexdigest()
+    if digest != manifest.get("adapter_sha256"):
+        raise RuntimeError(
+            f"Adapter SHA-256 {digest} does not match manifest "
+            f"{manifest.get('adapter_sha256')}"
+        )
+
+    adapter_config = json.loads(config_path.read_text())
+    if adapter_config.get("r") != 64 or adapter_config.get("lora_alpha") != 64:
+        raise RuntimeError(
+            "Serving expects the validated rank-64/alpha-64 adapter, found "
+            f"r={adapter_config.get('r')}, "
+            f"alpha={adapter_config.get('lora_alpha')}"
+        )
+
+    peft_helper = PEFTHelper.from_local_dir(str(adapter_dir), max_model_len)
+    mapper = DeepseekV4ForCausalLM.hf_to_vllm_mapper.get_unstacked_mapper()
+    lora_model = LoRAModel.from_local_checkpoint(
+        str(adapter_dir),
+        {"q_a_proj", "kv_proj", "wq_b"},
+        peft_helper,
+        device="cpu",
+        dtype=torch.bfloat16,
+        weights_mapper=mapper,
+    )
+    expected_shapes = {
+        "q_a_proj": ((64, 4096), (1024, 64)),
+        "kv_proj": ((64, 4096), (512, 64)),
+        "wq_b": ((64, 1024), (32768, 64)),
+    }
+    target_counts = {target: 0 for target in expected_shapes}
+    invalid_shapes: list[str] = []
+    for name, weights in lora_model.loras.items():
+        target = name.rsplit(".", 1)[-1]
+        if target not in expected_shapes:
+            invalid_shapes.append(f"unexpected module {name}")
+            continue
+        if weights.lora_a is None or weights.lora_b is None:
+            invalid_shapes.append(f"{name}: missing LoRA A or B")
+            continue
+        actual = (tuple(weights.lora_a.shape), tuple(weights.lora_b.shape))
+        if actual != expected_shapes[target]:
+            invalid_shapes.append(f"{name}: {actual} != {expected_shapes[target]}")
+        target_counts[target] += 1
+    if invalid_shapes:
+        raise RuntimeError(
+            f"vLLM preflight found invalid adapter modules: {invalid_shapes[:10]}"
+        )
+    expected_target_counts = {target: 43 for target in expected_shapes}
+    if target_counts != expected_target_counts:
+        raise RuntimeError(
+            f"vLLM mapped unexpected adapter target counts: {target_counts}"
+        )
+
+    result = {
+        "adapter_dir": str(adapter_dir),
+        "adapter_sha256": digest,
+        "logical_lora_modules": len(lora_model.loras),
+        "target_counts": target_counts,
+    }
+    return adapter_dir, result
 
 
 UCCL_EP_PROBE_SOURCE = r"""import faulthandler
@@ -669,6 +877,87 @@ def smoke_test_automodel():
         "tilelang": tilelang.__file__,
         "uccl": uccl_path,
     }
+
+
+@app.function(
+    image=vllm_image,
+    volumes={HF_CACHE: hf_cache_vol},
+    timeout=1800,
+)
+def smoke_test_vllm_lora_support():
+    import vllm
+    from transformers import AutoConfig
+    from vllm.config import ModelConfig
+    from vllm.model_executor.models.interfaces import SupportsLoRA
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
+
+    hf_cache_vol.reload()
+    if vllm.__version__ != VLLM_VERSION:
+        raise RuntimeError(f"Expected vLLM {VLLM_VERSION}, found {vllm.__version__}")
+    if SupportsLoRA not in DeepseekV4ForCausalLM.__mro__:
+        raise RuntimeError("DeepseekV4ForCausalLM does not advertise LoRA support")
+
+    expected_packed_mapping = {
+        "fused_wqa_wkv": ["q_a_proj", "kv_proj"],
+    }
+    if DeepseekV4ForCausalLM.lora_packed_modules_mapping != expected_packed_mapping:
+        raise RuntimeError(
+            "Unexpected DSv4 packed LoRA mapping: "
+            f"{DeepseekV4ForCausalLM.lora_packed_modules_mapping}"
+        )
+    if DeepseekV4ForCausalLM.packed_modules_mapping:
+        raise RuntimeError(
+            "DSv4 LoRA mapping leaked into class-level quantization setup"
+        )
+
+    cached_config = AutoConfig.from_pretrained(HF_MODEL, trust_remote_code=True)
+    cached_quant_config = getattr(cached_config, "quantization_config", None)
+    fresh_config_dir = _prepare_vllm_hf_config()
+    hf_config = AutoConfig.from_pretrained(
+        fresh_config_dir,
+        trust_remote_code=True,
+    )
+    raw_quant_config = getattr(hf_config, "quantization_config", None)
+    model_config = ModelConfig(
+        model=HF_MODEL,
+        hf_config_path=str(fresh_config_dir),
+        trust_remote_code=True,
+        max_model_len=SERVE_MAX_MODEL_LEN,
+    )
+    model_quantization = model_config.quantization
+    resolved_quant_config = getattr(
+        model_config.hf_config,
+        "quantization_config",
+        None,
+    )
+    if model_quantization != "deepseek_v4_fp8":
+        raise RuntimeError(
+            f"Expected deepseek_v4_fp8 quantization, found {model_quantization}"
+        )
+
+    mapper = DeepseekV4ForCausalLM.hf_to_vllm_mapper.get_unstacked_mapper()
+    cases = {
+        "model.layers.0.self_attn.q_a_proj": ("model.layers.0.attn.q_a_proj"),
+        "model.layers.0.self_attn.kv_proj": "model.layers.0.attn.kv_proj",
+        "model.layers.0.self_attn.q_b_proj": "model.layers.0.attn.wq_b",
+        "layers.0.attn.wq_a.weight": "model.layers.0.attn.wq_a.weight",
+    }
+    mapped = {source: mapper._map_name(source) for source in cases}
+    if mapped != cases:
+        raise RuntimeError(f"Unexpected DSv4 PEFT name mapping: {mapped}")
+
+    result = {
+        "vllm": vllm.__version__,
+        "supports_lora": True,
+        "packed_modules_mapping": expected_packed_mapping,
+        "mapped_names": mapped,
+        "cached_quantization_config": cached_quant_config,
+        "model_quantization": model_quantization,
+        "raw_quantization_config": raw_quant_config,
+        "resolved_quantization_config": resolved_quant_config,
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
 
 
 @app.function(
@@ -1353,64 +1642,279 @@ def finalize_lora_checkpoint(
     return manifest
 
 
-@app.local_entrypoint()
-def h200_16node_60k_smoke(
-    run_id: str = "dsv4-flash-automodel-h200-16n-cp16-60k-smoke",
-    seq_length: int = 60000,
-    max_steps: int = 1,
-    attn_backend: str = ATTN_BACKEND,
-    moe_dispatcher: str = MOE_DISPATCHER,
-    global_batch_size: int = 8,
-    local_batch_size: int = 4,
-    lora_rank: int = 64,
-    lora_alpha: int = 64,
-    lora_target_modules: str = DEFAULT_LORA_TARGET_MODULES,
-    save_checkpoint: bool = False,
-    save_optimizer: bool = False,
+@app.function(
+    image=vllm_image,
+    gpu=VLLM_GPU,
+    volumes={HF_CACHE: hf_cache_vol, CHECKPOINTS_DIR: checkpoints_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=86400,
+    memory=HOST_MEMORY,
+    cloud=MODAL_CLOUD,
+    experimental_options={"efa_enabled": EFA_ENABLED},
+    **EPHEMERAL_DISK_OPTIONS,
+)
+@modal.web_server(
+    VLLM_PORT,
+    startup_timeout=3600,
+    requires_proxy_auth=True,
+)
+def serve_lora():
+    """Serve the finalized adapter selected by SERVE_RUN_ID."""
+    import subprocess
+
+    if not SERVE_RUN_ID:
+        raise RuntimeError("Set SERVE_RUN_ID to a finalized checkpoint run ID")
+    hf_cache_vol.reload()
+    checkpoints_vol.reload()
+    _prepare_vllm_hf_config()
+    adapter_dir, preflight = _validate_finalized_adapter_for_vllm(
+        SERVE_RUN_ID,
+        SERVE_CHECKPOINT_STEP,
+        SERVE_MAX_MODEL_LEN,
+    )
+    print(json.dumps({"vllm_preflight": preflight}, indent=2, sort_keys=True))
+    subprocess.Popen(
+        _vllm_server_command(
+            adapter_dir,
+            max_model_len=SERVE_MAX_MODEL_LEN,
+        )
+    )
+
+
+@app.function(
+    image=vllm_image,
+    gpu=VLLM_GPU,
+    volumes={HF_CACHE: hf_cache_vol, CHECKPOINTS_DIR: checkpoints_vol},
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=21600,
+    retries=0,
+    memory=HOST_MEMORY,
+    cloud=MODAL_CLOUD,
+    experimental_options={"efa_enabled": EFA_ENABLED},
+    **EPHEMERAL_DISK_OPTIONS,
+)
+def validate_lora_serving(
+    run_id: str,
+    checkpoint_step: int = 4,
+    max_model_len: int = 64 * 1024,
+    long_prompt_tokens: int = 60000,
+    startup_timeout_seconds: int = 3600,
 ):
-    call = train_h200_60k_smoke.spawn(
-        run_id=run_id,
-        seq_length=seq_length,
-        max_steps=max_steps,
-        attn_backend=attn_backend,
-        moe_dispatcher=moe_dispatcher,
-        global_batch_size=global_batch_size,
-        local_batch_size=local_batch_size,
-        lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
-        lora_target_modules=lora_target_modules,
-        save_checkpoint=save_checkpoint,
-        save_optimizer=save_optimizer,
+    """Load the finalized adapter in vLLM and generate at 60k context."""
+    import signal
+    import subprocess
+    import time
+    import traceback
+    import urllib.error
+    import urllib.request
+
+    import vllm
+    from huggingface_hub import snapshot_download
+
+    if long_prompt_tokens <= 0:
+        raise ValueError("long_prompt_tokens must be positive")
+    if long_prompt_tokens + 1 > max_model_len:
+        raise ValueError(
+            "max_model_len must leave room for one generated token: "
+            f"{long_prompt_tokens + 1} > {max_model_len}"
+        )
+
+    hf_cache_vol.reload()
+    checkpoints_vol.reload()
+    fresh_config_dir = _prepare_vllm_hf_config()
+    print(f"vLLM HF config: {fresh_config_dir}")
+    adapter_dir, preflight = _validate_finalized_adapter_for_vllm(
+        run_id,
+        checkpoint_step,
+        max_model_len,
     )
-    call_id = (
-        getattr(call, "object_id", None)
-        or getattr(call, "function_call_id", None)
-        or str(call)
+    print(json.dumps({"vllm_preflight": preflight}, indent=2, sort_keys=True))
+
+    snapshot_path = snapshot_download(
+        HF_MODEL,
+        token=os.environ.get("HF_TOKEN"),
     )
-    result = {
-        "function_call_id": call_id,
-        "run_id": run_id,
-        "seq_length": seq_length,
-        "max_steps": max_steps,
-        "attn_backend": attn_backend,
-        "moe_dispatcher": moe_dispatcher,
-        "global_batch_size": global_batch_size,
-        "local_batch_size": local_batch_size,
-        "lora_rank": lora_rank,
-        "lora_alpha": lora_alpha,
-        "lora_target_modules": lora_target_modules if lora_rank > 0 else None,
-        "save_checkpoint": save_checkpoint,
-        "save_optimizer": save_optimizer,
-        "nodes": N_NODES,
-    }
-    print(json.dumps(result, indent=2))
-    return result
+    hf_cache_vol.commit()
+    print(f"Base model snapshot: {snapshot_path}")
+
+    server_log_path = "/tmp/vllm-lora-server.log"
+    server_log = open(server_log_path, "w")
+    server_command = _vllm_server_command(
+        adapter_dir,
+        max_model_len=max_model_len,
+    )
+    server_proc: subprocess.Popen[bytes] | None = None
+
+    def tail_log(limit: int = 50000) -> str:
+        server_log.flush()
+        return Path(server_log_path).read_text(errors="replace")[-limit:]
+
+    def stop_server(proc: subprocess.Popen[bytes]) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=30)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=30)
+
+    def request_json(
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        body = json.dumps(payload).encode() if payload is not None else None
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{VLLM_PORT}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"} if body else {},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode(errors="replace")
+            raise RuntimeError(
+                f"vLLM {path} returned HTTP {exc.code}: {error_body[:2000]}"
+            ) from None
+
+    try:
+        max_starts = 4
+        ready = False
+        for start_attempt in range(1, max_starts + 1):
+            print(
+                f"Starting vLLM {vllm.__version__} "
+                f"(attempt {start_attempt}/{max_starts})"
+            )
+            server_proc = subprocess.Popen(
+                server_command,
+                stdout=server_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + startup_timeout_seconds
+            while time.monotonic() < deadline:
+                if server_proc.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{VLLM_PORT}/health",
+                        timeout=5,
+                    ):
+                        ready = True
+                        break
+                except Exception:
+                    time.sleep(5)
+            if ready:
+                break
+
+            startup_log = tail_log(20000)
+            stop_server(server_proc)
+            transient_cuda_init = (
+                "system not yet initialized" in startup_log
+                or "Error 802" in startup_log
+            )
+            if transient_cuda_init and start_attempt < max_starts:
+                print("Retrying transient CUDA error 802 after 15 seconds")
+                time.sleep(15)
+                continue
+            raise RuntimeError("vLLM server failed to become healthy:\n" + startup_log)
+        if not ready or server_proc is None:
+            raise RuntimeError("vLLM server did not become healthy")
+
+        models = request_json("/v1/models", timeout=30)
+        model_ids = {item["id"] for item in models.get("data", [])}
+        if VLLM_ADAPTER_NAME not in model_ids:
+            raise RuntimeError(
+                f"Adapter is absent from /v1/models: {sorted(model_ids)}"
+            )
+
+        chat = request_json(
+            "/v1/chat/completions",
+            {
+                "model": VLLM_ADAPTER_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "What is 2 + 2? Return only the integer.",
+                    }
+                ],
+                "max_tokens": 16,
+                "temperature": 0,
+                "chat_template_kwargs": {"thinking": False},
+            },
+            timeout=600,
+        )
+        if chat.get("model") != VLLM_ADAPTER_NAME or not chat.get("choices"):
+            raise RuntimeError(f"Invalid adapter chat response: {chat}")
+        message = chat["choices"][0].get("message", {})
+        chat_text = message.get("content") or message.get("reasoning_content")
+        if not chat_text:
+            raise RuntimeError(f"Adapter chat returned no text: {chat}")
+
+        completion = request_json(
+            "/v1/completions",
+            {
+                "model": VLLM_ADAPTER_NAME,
+                "prompt": [0] * long_prompt_tokens,
+                "max_tokens": 1,
+                "temperature": 0,
+            },
+            timeout=3600,
+        )
+        usage = completion.get("usage", {})
+        if completion.get("model") != VLLM_ADAPTER_NAME:
+            raise RuntimeError(
+                f"Long-context response used the wrong model: {completion}"
+            )
+        if usage.get("prompt_tokens") != long_prompt_tokens:
+            raise RuntimeError(
+                f"Long-context request did not process the requested prompt: {usage}"
+            )
+        if usage.get("completion_tokens") != 1 or not completion.get("choices"):
+            raise RuntimeError(f"Long-context generation failed: {completion}")
+
+        result = {
+            "adapter_name": VLLM_ADAPTER_NAME,
+            "adapter_sha256": preflight["adapter_sha256"],
+            "chat_output": str(chat_text)[:200],
+            "checkpoint_step": checkpoint_step,
+            "long_context_finish_reason": completion["choices"][0].get("finish_reason"),
+            "long_context_usage": usage,
+            "max_model_len": max_model_len,
+            "model_ids": sorted(model_ids),
+            "run_id": run_id,
+            "vllm": vllm.__version__,
+            "vllm_log_tail": tail_log(4000),
+            "vllm_preflight": preflight,
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return result
+    except Exception:
+        traceback.print_exc()
+        print("\n=== vLLM server log ===")
+        print(tail_log())
+        raise
+    finally:
+        if server_proc is not None:
+            stop_server(server_proc)
+        server_log.close()
 
 
 @app.local_entrypoint()
 def h200_16node_60k_lora_5step(
-    run_id: str = "dsv4-flash-h200-16n-cp16-60k-lora-5step",
+    run_id: str,
 ):
+    if N_NODES != 16:
+        raise ValueError(
+            f"This validated entrypoint requires N_NODES=16, found {N_NODES}"
+        )
     call = train_h200_60k_smoke.spawn(
         run_id=run_id,
         max_steps=5,

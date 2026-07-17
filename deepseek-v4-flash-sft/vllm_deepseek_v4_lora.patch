@@ -1,0 +1,46 @@
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 5f4a638c24..9d11e35f53 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -52,6 +52,7 @@ from vllm.model_executor.models.interfaces import (
+     EagleModelMixin,
+     MixtureOfExperts,
+     SupportsEagle3,
++    SupportsLoRA,
+     SupportsPP,
+ )
+ from vllm.model_executor.models.utils import (
+@@ -1312,6 +1313,8 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
+         },
+         orig_to_new_substr={
+             ".shared_experts.w2": ".shared_experts.down_proj",
++            ".self_attn.": ".attn.",
++            ".q_b_proj": ".wq_b",
+         },
+     )
+ 
+@@ -1354,8 +1357,15 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
+ 
+ 
+ class DeepseekV4ForCausalLM(
+-    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
++    nn.Module,
++    SupportsPP,
++    SupportsLoRA,
++    SupportsEagle3,
++    DeepseekV4MixtureOfExperts,
+ ):
++    lora_packed_modules_mapping = {
++        "fused_wqa_wkv": ["q_a_proj", "kv_proj"],
++    }
+     model_cls = DeepseekV4Model
+ 
+     # Default mapper assumes the original FP4-expert checkpoint layout.
+@@ -1364,6 +1374,7 @@ class DeepseekV4ForCausalLM(
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
++        self.packed_modules_mapping = self.lora_packed_modules_mapping
+ 
+         config = vllm_config.model_config.hf_config
+         self.config = config
