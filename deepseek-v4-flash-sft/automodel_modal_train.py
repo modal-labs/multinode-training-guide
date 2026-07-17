@@ -1151,6 +1151,7 @@ def train_h200_60k_smoke(
     os.environ["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
     os.environ["NCCL_DEBUG_FILE"] = "/tmp/nccl.%h.%p.log"
     os.environ["NCCL_SOCKET_FAMILY"] = "AF_INET6"
+    os.environ["NCCL_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
     os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME"] = NVSHMEM_BOOTSTRAP_IFNAME
     os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY"] = NVSHMEM_BOOTSTRAP_FAMILY
     os.environ["NVSHMEM_IBGDA_NIC_HANDLER"] = nvshmem_ibgda_nic_handler
