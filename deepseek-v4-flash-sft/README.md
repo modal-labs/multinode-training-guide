@@ -149,17 +149,13 @@ and name mapping. `_prepare_vllm_hf_config` also downloads a clean official
 `config.json` outside the shared training cache so stale cache metadata cannot
 silently select an unquantized loader.
 
-## Validation record
+## Validation
 
-The checked five-step run used run ID
-`dsv4-flash-h200-16n-cp16-60k-lora64-5step-20260716-203704`. Every step had
-finite loss and nonzero gradient norm. The finalized adapter has SHA-256
-`93839c8de196c581bf76f4305906eeaa5d9e22bf7ac5d5fe073ddc3970bf6a4f`.
-
-The end-to-end serving check used that exact digest with vLLM 0.25.1 on four
-H200 GPUs. It registered 129 logical LoRA modules (three targets in each of 43
-layers), returned a chat completion from the adapter model ID, and reported
-60,000 prompt tokens plus one completion token.
+The checked five-step run had finite loss and nonzero gradient norm at every
+step. The end-to-end serving check used the finalized adapter with vLLM 0.25.1
+on four H200 GPUs. It registered 129 logical LoRA modules (three targets in each
+of 43 layers), returned a chat completion from the adapter model ID, and
+reported 60,000 prompt tokens plus one completion token.
 
 ## Limits
 
