@@ -49,7 +49,7 @@ Run from the repository root. Choose a unique run ID because the checkpoint
 writer refuses to overwrite an existing run:
 
 ```bash
-EFA_ENABLED=1 N_NODES=16 uv run --frozen modal run --detach \
+uv run --frozen modal run --detach \
   deepseek-v4-flash-sft/automodel_modal_train.py::h200_16node_60k_lora_5step \
   --run-id dsv4-flash-60k-lora-$(date -u +%Y%m%d-%H%M%S)
 ```
@@ -94,17 +94,18 @@ adapter rather than an exact training-resume checkpoint.
 ## Validate serving
 
 The validator starts vLLM on four H200 GPUs with pipeline parallelism, verifies
-the adapter manifest and tensor mapping, makes a chat request through the LoRA
-model ID, then sends a 60,000-token prompt and requires one generated token:
+the adapter manifest and tensor mapping, compares the base and adapter on a
+fixed 12-example GSM8K slice, then runs a semantic retrieval prompt with exactly
+60,000 input tokens through both model IDs:
 
 ```bash
-EFA_ENABLED=1 uv run --frozen modal run \
+uv run --frozen modal run \
   deepseek-v4-flash-sft/automodel_modal_train.py::validate_lora_serving \
   --run-id <run-id>
 ```
 
-A passing result includes both the base and adapter IDs from `/v1/models`,
-`prompt_tokens: 60000`, and `completion_tokens: 1`.
+A result includes per-example base and adapter outputs, both model IDs from
+`/v1/models`, and exact token-usage records for the two 60k retrieval requests.
 
 The server uses vLLM's native DeepSeek-V4 FP8/FP4 kernels with PP=4. It does not
 use tensor parallelism: vLLM's native FP4 MoE TP path is not yet the conservative
@@ -115,7 +116,7 @@ choice for this checkpoint layout.
 Select the finalized run when deploying:
 
 ```bash
-SERVE_RUN_ID=<run-id> SERVE_CHECKPOINT_STEP=4 EFA_ENABLED=1 \
+SERVE_RUN_ID=<run-id> \
   uv run --frozen modal deploy \
   deepseek-v4-flash-sft/automodel_modal_train.py
 ```
@@ -154,13 +155,17 @@ silently select an unquantized loader.
 The checked five-step run had finite loss and nonzero gradient norm at every
 step. The end-to-end serving check used the finalized adapter with vLLM 0.25.1
 on four H200 GPUs. It registered 129 logical LoRA modules (three targets in each
-of 43 layers), returned a chat completion from the adapter model ID, and
-reported 60,000 prompt tokens plus one completion token.
+of 43 layers). On the fixed GSM8K sanity slice, base and adapter each scored
+11/12 and their numeric predictions agreed on all 12 examples. Both model IDs
+then retrieved the expected code from the beginning of an exact 60,000-token
+prompt.
 
 ## Limits
 
 - The training evidence is a five-step synthetic-data smoke test, not a
   convergence or quality result.
+- The 12-example GSM8K comparison is a regression sanity check, not a model
+  quality benchmark.
 - The checkpoint does not contain optimizer state.
 - The first training step includes TileLang compilation and UCCL setup, so it
   is not representative of steady-state throughput.

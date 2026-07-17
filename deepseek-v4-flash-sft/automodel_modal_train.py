@@ -13,78 +13,52 @@ import modal.experimental
 
 HF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 VLLM_IMAGE = "vllm/vllm-openai:v0.25.1"
-VLLM_VERSION = "0.25.1"
 VLLM_ADAPTER_NAME = "deepseek-v4-flash-60k-lora"
 VLLM_PORT = 8000
 VLLM_PIPELINE_PARALLEL_SIZE = 4
 VLLM_GPU = f"H200:{VLLM_PIPELINE_PARALLEL_SIZE}"
 VLLM_HF_CONFIG_DIR = Path("/tmp/deepseek-v4-flash-vllm-config")
+GSM8K_TEST_URL = (
+    "https://raw.githubusercontent.com/openai/grade-school-math/"
+    "master/grade_school_math/data/test.jsonl"
+)
+GSM8K_EVAL_INDICES = tuple(range(0, 600, 50))
+
 GPUS_PER_NODE = 8
-N_NODES = int(os.environ.get("N_NODES", "16"))
-HOST_MEMORY_REQUEST_MB = int(os.environ.get("HOST_MEMORY_REQUEST_MB", "128"))
-HOST_MEMORY_LIMIT_MB = int(os.environ.get("HOST_MEMORY_LIMIT_MB", str(256 * 1024)))
-HOST_MEMORY = (
-    HOST_MEMORY_REQUEST_MB
-    if HOST_MEMORY_REQUEST_MB == HOST_MEMORY_LIMIT_MB
-    else (HOST_MEMORY_REQUEST_MB, HOST_MEMORY_LIMIT_MB)
+N_NODES = 16
+HOST_MEMORY = (128, 256 * 1024)
+SEQ_LENGTH = 60_000
+MAX_STEPS = 5
+CP_SIZE = 16
+PP_SIZE = 4
+EP_SIZE = 32
+GLOBAL_BATCH_SIZE = 8
+LOCAL_BATCH_SIZE = 4
+LORA_RANK = 64
+LORA_ALPHA = 64
+SYNTHETIC_EXAMPLES = 40
+MODEL_LAYERS = 43
+LORA_TARGET_MODULES = (
+    "*.self_attn.wq_a",
+    "*.self_attn.wq_b",
+    "*.self_attn.wkv",
 )
-EPHEMERAL_DISK_MB = int(os.environ.get("EPHEMERAL_DISK_MB", "0"))
-EPHEMERAL_DISK_OPTIONS: dict[str, Any] = (
-    {"ephemeral_disk": EPHEMERAL_DISK_MB} if EPHEMERAL_DISK_MB > 0 else {}
-)
-ATTN_BACKEND = os.environ.get("ATTN_BACKEND", "tilelang")
-MOE_DISPATCHER = os.environ.get("MOE_DISPATCHER", "uccl_ep")
-EFA_ENABLED = os.environ.get("EFA_ENABLED", "1").lower() not in {"0", "false", "no"}
-MODAL_CLOUD = os.environ.get("MODAL_CLOUD") or None
-NVSHMEM_BOOTSTRAP_IFNAME = os.environ.get("NVSHMEM_BOOTSTRAP_IFNAME", "eth1")
-NVSHMEM_BOOTSTRAP_FAMILY = os.environ.get("NVSHMEM_BOOTSTRAP_FAMILY", "AF_INET6")
-NVSHMEM_IBGDA_NIC_HANDLER = os.environ.get("NVSHMEM_IBGDA_NIC_HANDLER", "auto")
-NVSHMEM_DISABLE_P2P = int(os.environ.get("NVSHMEM_DISABLE_P2P", "0"))
-INSTALL_UCCL_EP = os.environ.get("INSTALL_UCCL_EP", "1").lower() in {"1", "true", "yes"}
-UCCL_EP_USE_EFA = os.environ.get("UCCL_EP_USE_EFA", "1").lower() in {"1", "true", "yes"}
-UCCL_EP_BUILD_FROM_SOURCE = os.environ.get(
-    "UCCL_EP_BUILD_FROM_SOURCE", "1"
-).lower() in {"1", "true", "yes"}
-UCCL_EP_USE_DMABUF = os.environ.get("UCCL_EP_USE_DMABUF", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-UCCL_SOCKET_IFNAME = os.environ.get("UCCL_SOCKET_IFNAME", "eth1")
-UCCL_SOCKET_FAMILY = os.environ.get("UCCL_SOCKET_FAMILY", "AF_INET6")
-UCCL_IB_GID_INDEX = int(os.environ.get("UCCL_IB_GID_INDEX", "-1"))
-DIST_BACKEND = os.environ.get("DIST_BACKEND", "cpu:gloo,cuda:nccl")
-UCCL_CUDA_ALLOC_CONF = os.environ.get(
-    "UCCL_CUDA_ALLOC_CONF", "expandable_segments:False"
-)
-NCCL_MAX_NCHANNELS = os.environ.get("NCCL_MAX_NCHANNELS", "8")
-UCCL_EP_CPU_TIMEOUT_SECS = os.environ.get("UCCL_EP_CPU_TIMEOUT_SECS", "600")
-DEFAULT_LORA_TARGET_MODULES = ",".join(
-    (
-        "*.self_attn.wq_a",
-        "*.self_attn.wq_b",
-        "*.self_attn.wkv",
-    )
-)
+UCCL_SOCKET_IFNAME = "eth1"
+UCCL_SOCKET_FAMILY = "AF_INET6"
+DIST_BACKEND = "cpu:gloo,cuda:nccl"
+UCCL_CUDA_ALLOC_CONF = "expandable_segments:False"
+NCCL_MAX_NCHANNELS = "8"
+UCCL_EP_CPU_TIMEOUT_SECS = "600"
 
 HF_CACHE = "/root/.cache/huggingface"
 CHECKPOINTS_DIR = "/checkpoints"
 
 # Includes DSv4 model-owned CP support and the TileLang dependency fixes.
-AUTOMODEL_COMMIT = os.environ.get(
-    "AUTOMODEL_COMMIT", "1197b6281255957cc2c58e79d50796c1b256c57c"
-)
+AUTOMODEL_COMMIT = "1197b6281255957cc2c58e79d50796c1b256c57c"
 AUTOMODEL_IMAGE = "nvcr.io/nvidia/nemo-automodel:26.06.00"
-UCCL_EP_VARIANT = "cu13.efa" if UCCL_EP_USE_EFA else "cu13"
-UCCL_EP_WHEEL = (
-    "https://github.com/uccl-project/uccl/releases/download/v0.1.1/"
-    f"uccl-0.1.1%2B{UCCL_EP_VARIANT}-cp312-abi3-manylinux_2_35_x86_64.whl"
-)
 # v0.1.1's EFA wheel predates USE_DMABUF support and requires the host's
 # efa_nv_peermem module. This commit includes the public DMA-BUF build path.
-UCCL_EP_COMMIT = os.environ.get(
-    "UCCL_EP_COMMIT", "66170bc299205228f0170bc1638594a39af9ffd5"
-)
+UCCL_EP_COMMIT = "66170bc299205228f0170bc1638594a39af9ffd5"
 UCCL_EFA_INSTALLER_VERSION = "1.42.0"
 UCCL_IPV6_PATCH = Path(__file__).with_name("uccl_ipv6_oob.patch")
 AUTOMODEL_UCCL_TEARDOWN_PATCH = Path(__file__).with_name(
@@ -101,8 +75,8 @@ AUTOMODEL_PP_PEFT_CHECKPOINT_PATCH = Path(__file__).with_name(
 )
 VLLM_LORA_PATCH = Path(__file__).with_name("vllm_deepseek_v4_lora.patch")
 SERVE_RUN_ID = os.environ.get("SERVE_RUN_ID")
-SERVE_CHECKPOINT_STEP = int(os.environ.get("SERVE_CHECKPOINT_STEP", "4"))
-SERVE_MAX_MODEL_LEN = int(os.environ.get("SERVE_MAX_MODEL_LEN", str(64 * 1024)))
+SERVE_CHECKPOINT_STEP = MAX_STEPS - 1
+SERVE_MAX_MODEL_LEN = 64 * 1024
 
 app = modal.App("example-deepseek-v4-flash-automodel")
 
@@ -137,58 +111,53 @@ automodel_image = (
     )
 )
 
-if INSTALL_UCCL_EP:
-    if UCCL_EP_BUILD_FROM_SOURCE:
-        automodel_image = automodel_image.apt_install(
-            "build-essential",
-            "curl",
-            "libibverbs-dev",
-            "libnl-3-dev",
-            "libnl-route-3-dev",
-            "libnuma-dev",
-            "ninja-build",
-            "patch",
-            "rdma-core",
-        ).uv_pip_install(
-            "intervaltree==3.1.0",
-            "nanobind==2.13.0",
-            "pybind11==3.0.1",
-        )
-        if UCCL_EP_USE_EFA:
-            automodel_image = automodel_image.run_commands(
-                "cd /tmp && "
-                f"curl -fsSLO https://efa-installer.amazonaws.com/aws-efa-installer-{UCCL_EFA_INSTALLER_VERSION}.tar.gz && "
-                f"tar -xzf aws-efa-installer-{UCCL_EFA_INSTALLER_VERSION}.tar.gz && "
-                "cd aws-efa-installer && "
-                "./efa_installer.sh -y --skip-kmod -g --no-verify && "
-                "rm -rf /tmp/aws-efa-installer*"
-            )
-        automodel_image = automodel_image.add_local_file(
-            str(UCCL_IPV6_PATCH), "/tmp/uccl_ipv6_oob.patch", copy=True
-        ).run_commands(
-            "rm -rf /opt/uccl && mkdir -p /opt/uccl && "
-            f"curl -fsSL https://github.com/uccl-project/uccl/archive/{UCCL_EP_COMMIT}.tar.gz "
-            "| tar -xz --strip-components=1 -C /opt/uccl && "
-            "cd /opt/uccl && patch -p1 < /tmp/uccl_ipv6_oob.patch",
-            "cd /opt/uccl/ep && rm -rf build ep*.so && "
-            "EFA_HOME=/opt/amazon/efa "
-            f"USE_DMABUF={int(UCCL_EP_USE_DMABUF)} "
-            "TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=8 "
-            "/opt/venv/bin/python setup.py build_ext --inplace && "
-            "cp ep*.so /opt/uccl/uccl/ep.efa.abi3.so",
-            "cd /opt/uccl/ep && rm -rf build ep*.so && "
-            "EFA_HOME=/opt/uccl/no-efa "
-            f"USE_DMABUF={int(UCCL_EP_USE_DMABUF)} "
-            "TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=8 "
-            "/opt/venv/bin/python setup.py build_ext --inplace && "
-            "cp ep*.so /opt/uccl/uccl/ep.mellanox.abi3.so && "
-            "cp ep*.so /opt/uccl/uccl/ep.abi3.so",
-            "cd /opt/uccl && "
-            "uv pip install --python /opt/venv/bin/python --no-build-isolation "
-            "--no-deps --force-reinstall .",
-        )
-    else:
-        automodel_image = automodel_image.uv_pip_install(UCCL_EP_WHEEL)
+automodel_image = (
+    automodel_image.apt_install(
+        "build-essential",
+        "curl",
+        "libibverbs-dev",
+        "libnl-3-dev",
+        "libnl-route-3-dev",
+        "libnuma-dev",
+        "ninja-build",
+        "patch",
+        "rdma-core",
+    )
+    .uv_pip_install(
+        "intervaltree==3.1.0",
+        "nanobind==2.13.0",
+        "pybind11==3.0.1",
+    )
+    .run_commands(
+        "cd /tmp && "
+        f"curl -fsSLO https://efa-installer.amazonaws.com/aws-efa-installer-{UCCL_EFA_INSTALLER_VERSION}.tar.gz && "
+        f"tar -xzf aws-efa-installer-{UCCL_EFA_INSTALLER_VERSION}.tar.gz && "
+        "cd aws-efa-installer && "
+        "./efa_installer.sh -y --skip-kmod -g --no-verify && "
+        "rm -rf /tmp/aws-efa-installer*"
+    )
+    .add_local_file(str(UCCL_IPV6_PATCH), "/tmp/uccl_ipv6_oob.patch", copy=True)
+    .run_commands(
+        "rm -rf /opt/uccl && mkdir -p /opt/uccl && "
+        f"curl -fsSL https://github.com/uccl-project/uccl/archive/{UCCL_EP_COMMIT}.tar.gz "
+        "| tar -xz --strip-components=1 -C /opt/uccl && "
+        "cd /opt/uccl && patch -p1 < /tmp/uccl_ipv6_oob.patch",
+        "cd /opt/uccl/ep && rm -rf build ep*.so && "
+        "EFA_HOME=/opt/amazon/efa USE_DMABUF=1 "
+        "TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=8 "
+        "/opt/venv/bin/python setup.py build_ext --inplace && "
+        "cp ep*.so /opt/uccl/uccl/ep.efa.abi3.so",
+        "cd /opt/uccl/ep && rm -rf build ep*.so && "
+        "EFA_HOME=/opt/uccl/no-efa USE_DMABUF=1 "
+        "TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS=8 "
+        "/opt/venv/bin/python setup.py build_ext --inplace && "
+        "cp ep*.so /opt/uccl/uccl/ep.mellanox.abi3.so && "
+        "cp ep*.so /opt/uccl/uccl/ep.abi3.so",
+        "cd /opt/uccl && "
+        "uv pip install --python /opt/venv/bin/python --no-build-isolation "
+        "--no-deps --force-reinstall .",
+    )
+)
 
 automodel_image = (
     automodel_image.add_local_file(
@@ -289,7 +258,7 @@ def _vllm_server_command(
         "--max-loras",
         "1",
         "--max-lora-rank",
-        "64",
+        str(LORA_RANK),
         "--lora-target-modules",
         "fused_wqa_wkv",
         "wq_b",
@@ -367,9 +336,12 @@ def _validate_finalized_adapter_for_vllm(
         )
 
     adapter_config = json.loads(config_path.read_text())
-    if adapter_config.get("r") != 64 or adapter_config.get("lora_alpha") != 64:
+    if (
+        adapter_config.get("r") != LORA_RANK
+        or adapter_config.get("lora_alpha") != LORA_ALPHA
+    ):
         raise RuntimeError(
-            "Serving expects the validated rank-64/alpha-64 adapter, found "
+            f"Serving expects rank-{LORA_RANK}/alpha-{LORA_ALPHA}, found "
             f"r={adapter_config.get('r')}, "
             f"alpha={adapter_config.get('lora_alpha')}"
         )
@@ -385,9 +357,9 @@ def _validate_finalized_adapter_for_vllm(
         weights_mapper=mapper,
     )
     expected_shapes = {
-        "q_a_proj": ((64, 4096), (1024, 64)),
-        "kv_proj": ((64, 4096), (512, 64)),
-        "wq_b": ((64, 1024), (32768, 64)),
+        "q_a_proj": ((LORA_RANK, 4096), (1024, LORA_RANK)),
+        "kv_proj": ((LORA_RANK, 4096), (512, LORA_RANK)),
+        "wq_b": ((LORA_RANK, 1024), (32768, LORA_RANK)),
     }
     target_counts = {target: 0 for target in expected_shapes}
     invalid_shapes: list[str] = []
@@ -407,7 +379,7 @@ def _validate_finalized_adapter_for_vllm(
         raise RuntimeError(
             f"vLLM preflight found invalid adapter modules: {invalid_shapes[:10]}"
         )
-    expected_target_counts = {target: 43 for target in expected_shapes}
+    expected_target_counts = {target: MODEL_LAYERS for target in expected_shapes}
     if target_counts != expected_target_counts:
         raise RuntimeError(
             f"vLLM mapped unexpected adapter target counts: {target_counts}"
@@ -420,120 +392,6 @@ def _validate_finalized_adapter_for_vllm(
         "target_counts": target_counts,
     }
     return adapter_dir, result
-
-
-UCCL_EP_PROBE_SOURCE = r"""import faulthandler
-import os
-
-import torch
-import torch.distributed as dist
-
-from uccl import ep as uccl_ep
-
-from nemo_automodel.components.moe.megatron.fused_a2a import (
-    free_uccl_buffer,
-    uccl_fused_combine,
-    uccl_fused_dispatch,
-)
-
-
-def main() -> None:
-    faulthandler.enable()
-    faulthandler.dump_traceback_later(120, repeat=True)
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend=os.environ["UCCL_PROBE_DIST_BACKEND"])
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    # Composite process groups keep Python-object metadata on Gloo while CUDA
-    # tensor collectives continue to use NCCL.
-    tensor_probe = torch.tensor(rank + 1, device="cuda", dtype=torch.int64)
-    dist.all_reduce(tensor_probe)
-    expected_sum = world_size * (world_size + 1) // 2
-    if tensor_probe.item() != expected_sum:
-        raise RuntimeError(f"NCCL all-reduce returned {tensor_probe.item()}, expected {expected_sum}")
-    object_probe = [None] * world_size
-    dist.all_gather_object(object_probe, {"rank": rank})
-    if [item["rank"] for item in object_probe] != list(range(world_size)):
-        raise RuntimeError(f"Gloo object gather returned invalid metadata: {object_probe}")
-    oob_ips = [None] * world_size
-    dist.all_gather_object(oob_ips, uccl_ep.get_oob_ip())
-    if rank == 0:
-        print(
-            "UCCL_EP_CONTROL_PLANE_OK "
-            f"backend={os.environ['UCCL_PROBE_DIST_BACKEND']} world_size={world_size} "
-            f"oob_ips={sorted(set(oob_ips))}",
-            flush=True,
-        )
-
-    tokens = int(os.environ["UCCL_PROBE_TOKENS"])
-    hidden_size = int(os.environ["UCCL_PROBE_HIDDEN_SIZE"])
-    num_experts = int(os.environ["UCCL_PROBE_NUM_EXPERTS"])
-    topk = int(os.environ["UCCL_PROBE_TOPK"])
-    if num_experts % world_size != 0:
-        raise ValueError(f"num_experts={num_experts} must divide world_size={world_size}")
-
-    generator = torch.Generator(device="cuda").manual_seed(1234 + rank)
-    hidden = torch.randn(
-        tokens,
-        hidden_size,
-        device="cuda",
-        dtype=torch.bfloat16,
-        generator=generator,
-        requires_grad=True,
-    )
-    token_offsets = torch.arange(tokens, device="cuda", dtype=torch.int64)[:, None] * topk
-    topk_offsets = torch.arange(topk, device="cuda", dtype=torch.int64)[None, :]
-    token_indices = (token_offsets + topk_offsets + rank * topk) % num_experts
-    token_probs = torch.full(
-        (tokens, topk),
-        1.0 / topk,
-        device="cuda",
-        dtype=torch.float32,
-    )
-
-    recv_hidden, _, recv_probs, _, handle = uccl_fused_dispatch(
-        hidden,
-        token_indices,
-        token_probs,
-        num_experts,
-        dist.group.WORLD,
-    )
-    # Keep a gradient edge through the returned probabilities, as real MoE
-    # expert weighting does, while leaving this transport probe numerically neutral.
-    recv_hidden = recv_hidden * (1.0 + recv_probs.sum() * 0.0)
-    combined, _ = uccl_fused_combine(recv_hidden, dist.group.WORLD, handle)
-    if combined.shape != hidden.shape:
-        raise RuntimeError(f"combine shape {combined.shape} != input shape {hidden.shape}")
-    if not torch.isfinite(combined).all():
-        raise RuntimeError("UCCL-EP combine produced non-finite values")
-
-    combined.float().square().mean().backward()
-    if hidden.grad is None or not torch.isfinite(hidden.grad).all():
-        raise RuntimeError("UCCL-EP backward produced an invalid input gradient")
-
-    torch.cuda.synchronize()
-    completed = torch.ones((), device="cuda", dtype=torch.int32)
-    dist.all_reduce(completed)
-    if rank == 0:
-        print(
-            "UCCL_EP_PROBE_OK "
-            f"world_size={world_size} tokens={tokens} hidden_size={hidden_size} "
-            f"num_experts={num_experts} topk={topk} completed={completed.item()}"
-        )
-    dist.barrier()
-    free_uccl_buffer()
-    dist.barrier()
-    if rank == 0:
-        print("UCCL_EP_TEARDOWN_OK", flush=True)
-    dist.destroy_process_group()
-    faulthandler.cancel_dump_traceback_later()
-
-
-if __name__ == "__main__":
-    main()
-"""
 
 
 def _network_fingerprint() -> dict[str, object]:
@@ -578,25 +436,23 @@ def _network_fingerprint() -> dict[str, object]:
     }
 
 
-def _select_uccl_ep_variant(network: dict[str, object]) -> str | None:
+def _select_uccl_ep_variant(network: dict[str, object]) -> str:
     """Install the UCCL extension matching the runtime RDMA provider."""
     import importlib.util
     import shutil
 
     uccl_spec = importlib.util.find_spec("uccl")
     if uccl_spec is None or not uccl_spec.submodule_search_locations:
-        return None
+        raise RuntimeError("UCCL is missing from the training image")
     package_dir = Path(next(iter(uccl_spec.submodule_search_locations)))
     variants = {
         "efa": package_dir / "ep.efa.abi3.so",
         "mellanox": package_dir / "ep.mellanox.abi3.so",
     }
     if not any(path.exists() for path in variants.values()):
-        return None
+        raise RuntimeError("UCCL-EP extensions are missing from the training image")
 
     provider = str(network["provider"])
-    if provider == "none":
-        provider = "efa" if UCCL_EP_USE_EFA else "mellanox"
     if provider not in {"efa", "mellanox"}:
         raise RuntimeError(
             f"No UCCL-EP build is available for RDMA provider {provider!r}"
@@ -609,44 +465,6 @@ def _select_uccl_ep_variant(network: dict[str, object]) -> str | None:
     shutil.copy2(source, target)
     print(f"selected_uccl_ep_provider={provider}, extension={target}")
     return provider
-
-
-def _print_nccl_network_logs(node_rank: int) -> None:
-    """Print a bounded NCCL transport summary after torchrun exits."""
-    markers = (
-        "Bootstrap : Using",
-        "NET/Plugin",
-        "NET/IB",
-        "NET/OFI",
-        "NET/Socket",
-        "Using network",
-        "NCCL_NET",
-        "RAS",
-    )
-    matches: list[str] = []
-    seen: set[str] = set()
-    log_paths = sorted(Path("/tmp").glob("nccl.*.log"))
-    for log_path in log_paths:
-        try:
-            lines = log_path.read_text(errors="replace").splitlines()
-        except OSError as exc:
-            print(f"[node {node_rank}] failed to read {log_path}: {exc}")
-            continue
-        for line in lines:
-            if any(marker in line for marker in markers) and line not in seen:
-                seen.add(line)
-                matches.append(line)
-                if len(matches) >= 120:
-                    break
-        if len(matches) >= 120:
-            break
-
-    print(
-        f"[node {node_rank}] NCCL network diagnostics: "
-        f"files={len(log_paths)}, matching_lines={len(matches)}"
-    )
-    for line in matches:
-        print(f"[node {node_rank}] {line}")
 
 
 def _write_synthetic_chat_jsonl(path: str, *, examples: int, target_words: int) -> None:
@@ -680,73 +498,31 @@ def _print_cgroup_memory_status(node_rank: int) -> None:
         print(f"[node {node_rank}] cgroup_{name.replace('.', '_')}={value}")
 
 
-def _recipe_yaml(
-    *,
-    dataset_path: str,
-    seq_length: int,
-    max_steps: int,
-    global_batch_size: int,
-    local_batch_size: int,
-    cp_size: int,
-    pp_size: int,
-    ep_size: int,
-    attn_backend: str,
-    moe_dispatcher: str,
-    dist_backend: str,
-    lora_rank: int,
-    lora_alpha: int,
-    lora_target_modules: str,
-    checkpoint_dir: str | None,
-    save_optimizer: bool,
-) -> str:
-    peft_block = ""
-    if lora_rank > 0:
-        targets = [
-            target.strip()
-            for target in lora_target_modules.split(",")
-            if target.strip()
-        ]
-        if not targets:
-            raise ValueError(
-                "lora_target_modules must contain at least one target when LoRA is enabled"
-            )
-        target_lines = "\n".join(f"  - {json.dumps(target)}" for target in targets)
-        peft_block = f"""
-peft:
-  _target_: nemo_automodel.components._peft.lora.PeftConfig
-  target_modules:
-{target_lines}
-  dim: {lora_rank}
-  alpha: {lora_alpha}
-  dropout: 0.0
-  use_memory_efficient_lora: true
-  use_triton: false
-"""
-
-    checkpoint_enabled = checkpoint_dir is not None
-    checkpoint_path = checkpoint_dir or "/tmp/disabled-checkpoints"
-
+def _recipe_yaml(*, dataset_path: str, checkpoint_dir: str) -> str:
+    target_lines = "\n".join(
+        f"  - {json.dumps(target)}" for target in LORA_TARGET_MODULES
+    )
     return f"""
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
 step_scheduler:
-  global_batch_size: {global_batch_size}
-  local_batch_size: {local_batch_size}
-  ckpt_every_steps: {max_steps}
+  global_batch_size: {GLOBAL_BATCH_SIZE}
+  local_batch_size: {LOCAL_BATCH_SIZE}
+  ckpt_every_steps: {MAX_STEPS}
   save_checkpoint_every_epoch: false
   val_every_steps: 100000
   gc_every_steps: 1
   num_epochs: 1
-  max_steps: {max_steps}
+  max_steps: {MAX_STEPS}
 
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: {cp_size}
-  pp_size: {pp_size}
-  ep_size: {ep_size}
+  cp_size: {CP_SIZE}
+  pp_size: {PP_SIZE}
+  ep_size: {EP_SIZE}
   sequence_parallel: false
   activation_checkpointing: true
   pipeline:
@@ -763,7 +539,7 @@ distributed:
     wrap_outer_model: false
 
 dist_env:
-  backend: {dist_backend}
+  backend: {DIST_BACKEND}
   timeout_minutes: 60
 
 model:
@@ -778,22 +554,32 @@ model:
   mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: {attn_backend}
+    attn: tilelang
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    dispatcher: {moe_dispatcher}
+    dispatcher: uccl_ep
     experts: torch_mm
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-{peft_block}
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+{target_lines}
+  dim: {LORA_RANK}
+  alpha: {LORA_ALPHA}
+  dropout: 0.0
+  use_memory_efficient_lora: true
+  use_triton: false
+
 
 checkpoint:
-  enabled: {str(checkpoint_enabled).lower()}
-  checkpoint_dir: {json.dumps(checkpoint_path)}
+  enabled: true
+  checkpoint_dir: {json.dumps(checkpoint_dir)}
   model_save_format: safetensors
   save_consolidated: final
-  save_optimizer: {str(save_optimizer).lower()}
+  save_optimizer: false
   dequantize_base_checkpoint: true
 
 loss_fn:
@@ -805,7 +591,7 @@ dataset:
   split: train
   shuffle_seed: 42
   truncation: true
-  seq_length: {seq_length}
+  seq_length: {SEQ_LENGTH}
   padding: max_length
   chat_template: |-
     {{% for message in messages %}}{{% if message['role'] == 'user' %}}User:
@@ -838,227 +624,6 @@ optimizer:
 """
 
 
-@app.function(image=automodel_image, timeout=1800)
-def smoke_test_automodel():
-    import importlib.util
-    import subprocess
-
-    import nemo_automodel
-    import torch
-
-    try:
-        import tilelang
-    except ImportError as exc:
-        raise RuntimeError(f"TileLang import failed: {exc}") from exc
-
-    print(f"nemo_automodel={nemo_automodel.__file__}")
-    automodel_source_commit = subprocess.check_output(
-        ["git", "-C", "/opt/Automodel", "rev-parse", "HEAD"],
-        text=True,
-    ).strip()
-    print(f"automodel_source_commit={automodel_source_commit}")
-    torch_version = str(torch.__version__)
-    cuda_version = str(torch.version.cuda)
-    print(f"torch={torch_version}, cuda={cuda_version}")
-    print(f"tilelang={tilelang.__file__}")
-    network = _network_fingerprint()
-    _select_uccl_ep_variant(network)
-    uccl_spec = importlib.util.find_spec("uccl")
-    uccl_path = uccl_spec.origin if uccl_spec is not None else None
-    if uccl_spec is not None:
-        import uccl.ep as uccl_ep
-
-        print(f"uccl_ep={uccl_ep.__file__}")
-    return {
-        "automodel": nemo_automodel.__file__,
-        "automodel_source_commit": automodel_source_commit,
-        "torch": torch_version,
-        "cuda": cuda_version,
-        "tilelang": tilelang.__file__,
-        "uccl": uccl_path,
-    }
-
-
-@app.function(
-    image=vllm_image,
-    volumes={HF_CACHE: hf_cache_vol},
-    timeout=1800,
-)
-def smoke_test_vllm_lora_support():
-    import vllm
-    from transformers import AutoConfig
-    from vllm.config import ModelConfig
-    from vllm.model_executor.models.interfaces import SupportsLoRA
-    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4ForCausalLM
-
-    hf_cache_vol.reload()
-    if vllm.__version__ != VLLM_VERSION:
-        raise RuntimeError(f"Expected vLLM {VLLM_VERSION}, found {vllm.__version__}")
-    if SupportsLoRA not in DeepseekV4ForCausalLM.__mro__:
-        raise RuntimeError("DeepseekV4ForCausalLM does not advertise LoRA support")
-
-    expected_packed_mapping = {
-        "fused_wqa_wkv": ["q_a_proj", "kv_proj"],
-    }
-    if DeepseekV4ForCausalLM.lora_packed_modules_mapping != expected_packed_mapping:
-        raise RuntimeError(
-            "Unexpected DSv4 packed LoRA mapping: "
-            f"{DeepseekV4ForCausalLM.lora_packed_modules_mapping}"
-        )
-    if DeepseekV4ForCausalLM.packed_modules_mapping:
-        raise RuntimeError(
-            "DSv4 LoRA mapping leaked into class-level quantization setup"
-        )
-
-    cached_config = AutoConfig.from_pretrained(HF_MODEL, trust_remote_code=True)
-    cached_quant_config = getattr(cached_config, "quantization_config", None)
-    fresh_config_dir = _prepare_vllm_hf_config()
-    hf_config = AutoConfig.from_pretrained(
-        fresh_config_dir,
-        trust_remote_code=True,
-    )
-    raw_quant_config = getattr(hf_config, "quantization_config", None)
-    model_config = ModelConfig(
-        model=HF_MODEL,
-        hf_config_path=str(fresh_config_dir),
-        trust_remote_code=True,
-        max_model_len=SERVE_MAX_MODEL_LEN,
-    )
-    model_quantization = model_config.quantization
-    resolved_quant_config = getattr(
-        model_config.hf_config,
-        "quantization_config",
-        None,
-    )
-    if model_quantization != "deepseek_v4_fp8":
-        raise RuntimeError(
-            f"Expected deepseek_v4_fp8 quantization, found {model_quantization}"
-        )
-
-    mapper = DeepseekV4ForCausalLM.hf_to_vllm_mapper.get_unstacked_mapper()
-    cases = {
-        "model.layers.0.self_attn.q_a_proj": ("model.layers.0.attn.q_a_proj"),
-        "model.layers.0.self_attn.kv_proj": "model.layers.0.attn.kv_proj",
-        "model.layers.0.self_attn.q_b_proj": "model.layers.0.attn.wq_b",
-        "layers.0.attn.wq_a.weight": "model.layers.0.attn.wq_a.weight",
-    }
-    mapped = {source: mapper._map_name(source) for source in cases}
-    if mapped != cases:
-        raise RuntimeError(f"Unexpected DSv4 PEFT name mapping: {mapped}")
-
-    result = {
-        "vllm": vllm.__version__,
-        "supports_lora": True,
-        "packed_modules_mapping": expected_packed_mapping,
-        "mapped_names": mapped,
-        "cached_quantization_config": cached_quant_config,
-        "model_quantization": model_quantization,
-        "raw_quantization_config": raw_quant_config,
-        "resolved_quantization_config": resolved_quant_config,
-    }
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return result
-
-
-@app.function(
-    image=automodel_image,
-    gpu="H200:8",
-    timeout=1800,
-    retries=0,
-    memory=HOST_MEMORY,
-    cloud=MODAL_CLOUD,
-    experimental_options={"efa_enabled": EFA_ENABLED},
-    **EPHEMERAL_DISK_OPTIONS,
-)
-@modal.experimental.clustered(size=N_NODES, rdma=True)
-def probe_uccl_ep_transport(
-    tokens: int = 128,
-    hidden_size: int = 2048,
-    num_experts: int = 256,
-    topk: int = 8,
-    uccl_ib_gid_index: int = UCCL_IB_GID_INDEX,
-):
-    import subprocess
-
-    cluster_info = modal.experimental.get_cluster_info()
-    node_rank = cluster_info.rank
-    n_nodes = len(cluster_info.container_ips) if cluster_info.container_ips else 1
-    master_addr = (
-        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
-    )
-    total_gpus = n_nodes * GPUS_PER_NODE
-
-    if num_experts % total_gpus != 0:
-        raise ValueError(
-            f"num_experts={num_experts} must be divisible by total_gpus={total_gpus}"
-        )
-    if topk <= 0 or topk > num_experts:
-        raise ValueError(f"topk={topk} must be in [1, {num_experts}]")
-
-    os.environ["NCCL_DEBUG"] = "WARN"
-    os.environ["NCCL_SOCKET_FAMILY"] = "AF_INET6"
-    os.environ["NCCL_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
-    os.environ["GLOO_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
-    os.environ["UCCL_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
-    os.environ["UCCL_SOCKET_FAMILY"] = UCCL_SOCKET_FAMILY
-    if uccl_ib_gid_index >= 0:
-        os.environ["NCCL_IB_GID_INDEX"] = str(uccl_ib_gid_index)
-        os.environ["UCCL_IB_GID_INDEX"] = str(uccl_ib_gid_index)
-    os.environ["UCCL_PROBE_TOKENS"] = str(tokens)
-    os.environ["UCCL_PROBE_HIDDEN_SIZE"] = str(hidden_size)
-    os.environ["UCCL_PROBE_NUM_EXPERTS"] = str(num_experts)
-    os.environ["UCCL_PROBE_TOPK"] = str(topk)
-    os.environ["UCCL_PROBE_DIST_BACKEND"] = DIST_BACKEND
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = UCCL_CUDA_ALLOC_CONF
-    os.environ["NCCL_MAX_NCHANNELS"] = NCCL_MAX_NCHANNELS
-    os.environ["UCCL_EP_CPU_TIMEOUT_SECS"] = UCCL_EP_CPU_TIMEOUT_SECS
-
-    network = _network_fingerprint()
-    uccl_provider = _select_uccl_ep_variant(network)
-    print(
-        f"[node {node_rank}] network_fingerprint={json.dumps(network, sort_keys=True)}"
-    )
-    if node_rank == 0:
-        print(
-            "UCCL-EP transport probe: "
-            f"nodes={n_nodes}, total_gpus={total_gpus}, gid_index={uccl_ib_gid_index}, "
-            f"socket_ifname={UCCL_SOCKET_IFNAME}, dist_backend={DIST_BACKEND}, "
-            f"socket_family={UCCL_SOCKET_FAMILY}, "
-            f"cuda_alloc_conf={UCCL_CUDA_ALLOC_CONF}, "
-            f"nccl_max_nchannels={NCCL_MAX_NCHANNELS}, "
-            f"cpu_timeout_secs={UCCL_EP_CPU_TIMEOUT_SECS}"
-        )
-
-    probe_path = "/tmp/uccl_ep_transport_probe.py"
-    Path(probe_path).write_text(UCCL_EP_PROBE_SOURCE)
-    cmd = [
-        "torchrun",
-        "--nproc-per-node",
-        str(GPUS_PER_NODE),
-        "--nnodes",
-        str(n_nodes),
-        "--node-rank",
-        str(node_rank),
-        "--master-addr",
-        master_addr,
-        "--master-port",
-        "29502",
-        probe_path,
-    ]
-    print(f"[node {node_rank}] Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    return {
-        "nodes": n_nodes,
-        "total_gpus": total_gpus,
-        "tokens": tokens,
-        "hidden_size": hidden_size,
-        "num_experts": num_experts,
-        "topk": topk,
-        "uccl_ib_gid_index": uccl_ib_gid_index,
-        "uccl_provider": uccl_provider,
-    }
-
-
 @app.function(
     image=automodel_image,
     gpu="H200:8",
@@ -1067,35 +632,14 @@ def probe_uccl_ep_transport(
     timeout=86400,
     retries=0,
     memory=HOST_MEMORY,
-    cloud=MODAL_CLOUD,
-    experimental_options={"efa_enabled": EFA_ENABLED},
-    **EPHEMERAL_DISK_OPTIONS,
+    experimental_options={"efa_enabled": True},
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
-def train_h200_60k_smoke(
-    run_id: str = "dsv4-flash-automodel-h200-16n-cp16-60k-smoke",
-    seq_length: int = 60000,
-    max_steps: int = 1,
-    cp_size: int = 16,
-    pp_size: int = 4,
-    ep_size: int = 32,
-    attn_backend: str = ATTN_BACKEND,
-    moe_dispatcher: str = MOE_DISPATCHER,
-    global_batch_size: int = 8,
-    local_batch_size: int = 4,
-    lora_rank: int = 64,
-    lora_alpha: int = 64,
-    lora_target_modules: str = DEFAULT_LORA_TARGET_MODULES,
-    synthetic_examples: int = 8,
-    save_checkpoint: bool = False,
-    save_optimizer: bool = False,
-    nvshmem_ibgda_nic_handler: str = NVSHMEM_IBGDA_NIC_HANDLER,
-    nvshmem_disable_cuda_vmm: int = 0,
-    nvshmem_disable_p2p: int = NVSHMEM_DISABLE_P2P,
-    uccl_ib_gid_index: int = UCCL_IB_GID_INDEX,
-):
-    import shutil
+def train_h200_60k_lora(run_id: str):
     import subprocess
+
+    if not run_id or Path(run_id).name != run_id:
+        raise ValueError("run_id must be a non-empty path component")
 
     cluster_info = modal.experimental.get_cluster_info()
     node_rank = cluster_info.rank
@@ -1103,73 +647,26 @@ def train_h200_60k_smoke(
     master_addr = (
         cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
     )
-
     if n_nodes != N_NODES:
-        print(f"[warn] decorator N_NODES={N_NODES}, runtime n_nodes={n_nodes}")
-
+        raise RuntimeError(f"Expected {N_NODES} nodes, scheduled {n_nodes}")
     total_gpus = n_nodes * GPUS_PER_NODE
-    if total_gpus % (pp_size * cp_size) != 0:
-        raise ValueError(
-            f"pp_size*cp_size={pp_size * cp_size} must divide {total_gpus}"
-        )
-    dp_size = total_gpus // (pp_size * cp_size)
-    if ep_size > (total_gpus // pp_size):
-        raise ValueError(
-            f"ep_size={ep_size} cannot exceed non-PP group size {total_gpus // pp_size}"
-        )
-    if ep_size > dp_size * cp_size:
-        raise ValueError(f"ep_size={ep_size} cannot exceed dp*cp={dp_size * cp_size}")
-    if nvshmem_ibgda_nic_handler not in {
-        "auto",
-        "gpu",
-        "cpu",
-        "cpu_cuda_memory",
-        "cpu_host_memory",
-    }:
-        raise ValueError(
-            "nvshmem_ibgda_nic_handler must be one of "
-            "auto, gpu, cpu, cpu_cuda_memory, or cpu_host_memory"
-        )
-    if nvshmem_disable_cuda_vmm not in {0, 1}:
-        raise ValueError("nvshmem_disable_cuda_vmm must be 0 or 1")
-    if nvshmem_disable_p2p not in {0, 1}:
-        raise ValueError("nvshmem_disable_p2p must be 0 or 1")
-    if lora_rank < 0:
-        raise ValueError("lora_rank must be non-negative; use 0 for full finetuning")
-    if lora_rank > 0 and lora_alpha <= 0:
-        raise ValueError("lora_alpha must be positive when LoRA is enabled")
-    if max_steps <= 0:
-        raise ValueError("max_steps must be positive")
-    if global_batch_size <= 0 or local_batch_size <= 0:
-        raise ValueError("global_batch_size and local_batch_size must be positive")
-    if not run_id or Path(run_id).name != run_id:
-        raise ValueError("run_id must be a non-empty path component")
+    dp_size = total_gpus // (PP_SIZE * CP_SIZE)
+    if dp_size != 2:
+        raise RuntimeError(f"Expected DP=2, derived DP={dp_size}")
 
     os.environ.setdefault("HF_HOME", HF_CACHE)
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-    os.environ["NCCL_DEBUG"] = "INFO"
-    os.environ["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
-    os.environ["NCCL_DEBUG_FILE"] = "/tmp/nccl.%h.%p.log"
+    os.environ["NCCL_DEBUG"] = "WARN"
     os.environ["NCCL_SOCKET_FAMILY"] = "AF_INET6"
     os.environ["NCCL_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
-    os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME"] = NVSHMEM_BOOTSTRAP_IFNAME
-    os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY"] = NVSHMEM_BOOTSTRAP_FAMILY
-    os.environ["NVSHMEM_IBGDA_NIC_HANDLER"] = nvshmem_ibgda_nic_handler
-    os.environ["NVSHMEM_DISABLE_CUDA_VMM"] = str(nvshmem_disable_cuda_vmm)
-    os.environ["NVSHMEM_DISABLE_P2P"] = str(nvshmem_disable_p2p)
     os.environ["GLOO_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
     os.environ["UCCL_SOCKET_IFNAME"] = UCCL_SOCKET_IFNAME
     os.environ["UCCL_SOCKET_FAMILY"] = UCCL_SOCKET_FAMILY
-    if moe_dispatcher == "uccl_ep":
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = UCCL_CUDA_ALLOC_CONF
-        os.environ["NCCL_MAX_NCHANNELS"] = NCCL_MAX_NCHANNELS
-        os.environ["UCCL_EP_CPU_TIMEOUT_SECS"] = UCCL_EP_CPU_TIMEOUT_SECS
-    if uccl_ib_gid_index >= 0:
-        os.environ["NCCL_IB_GID_INDEX"] = str(uccl_ib_gid_index)
-        os.environ["UCCL_IB_GID_INDEX"] = str(uccl_ib_gid_index)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = UCCL_CUDA_ALLOC_CONF
+    os.environ["NCCL_MAX_NCHANNELS"] = NCCL_MAX_NCHANNELS
+    os.environ["UCCL_EP_CPU_TIMEOUT_SECS"] = UCCL_EP_CPU_TIMEOUT_SECS
     hf_cache_vol.reload()
-    if save_checkpoint:
-        checkpoints_vol.reload()
+    checkpoints_vol.reload()
 
     network = _network_fingerprint()
     uccl_provider = _select_uccl_ep_variant(network)
@@ -1178,91 +675,50 @@ def train_h200_60k_smoke(
     )
 
     dataset_path = "/tmp/dsv4_60k_synthetic/training.jsonl"
-    effective_synthetic_examples = max(
-        synthetic_examples, max_steps * global_batch_size
-    )
     # Over-generate words; the tokenizer truncates to seq_length and pads to the
     # fixed length required by DSv4 CP.
     _write_synthetic_chat_jsonl(
         dataset_path,
-        examples=effective_synthetic_examples,
-        target_words=max(seq_length * 2, 1000),
+        examples=SYNTHETIC_EXAMPLES,
+        target_words=SEQ_LENGTH * 2,
     )
 
-    checkpoint_dir = f"{CHECKPOINTS_DIR}/{run_id}" if save_checkpoint else None
-    if checkpoint_dir is not None and Path(checkpoint_dir).exists():
+    checkpoint_dir = f"{CHECKPOINTS_DIR}/{run_id}"
+    if Path(checkpoint_dir).exists():
         raise FileExistsError(f"Checkpoint directory already exists: {checkpoint_dir}")
 
     recipe_path = f"/tmp/{run_id}.yaml"
     Path(recipe_path).write_text(
         _recipe_yaml(
             dataset_path=dataset_path,
-            seq_length=seq_length,
-            max_steps=max_steps,
-            global_batch_size=global_batch_size,
-            local_batch_size=local_batch_size,
-            cp_size=cp_size,
-            pp_size=pp_size,
-            ep_size=ep_size,
-            attn_backend=attn_backend,
-            moe_dispatcher=moe_dispatcher,
-            dist_backend=DIST_BACKEND,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_target_modules=lora_target_modules,
             checkpoint_dir=checkpoint_dir,
-            save_optimizer=save_optimizer,
         )
     )
 
+    summary = {
+        "run_id": run_id,
+        "nodes": n_nodes,
+        "total_gpus": total_gpus,
+        "topology": {
+            "tp": 1,
+            "dp": dp_size,
+            "pp": PP_SIZE,
+            "cp": CP_SIZE,
+            "ep": EP_SIZE,
+        },
+        "sequence_length": SEQ_LENGTH,
+        "optimizer_steps": MAX_STEPS,
+        "global_batch_size": GLOBAL_BATCH_SIZE,
+        "local_batch_size": LOCAL_BATCH_SIZE,
+        "lora_rank": LORA_RANK,
+        "lora_alpha": LORA_ALPHA,
+        "lora_targets": LORA_TARGET_MODULES,
+        "checkpoint_dir": checkpoint_dir,
+        "automodel_commit": AUTOMODEL_COMMIT,
+        "uccl_provider": uccl_provider,
+    }
     if node_rank == 0:
-        automodel_source_commit = subprocess.check_output(
-            ["git", "-C", "/opt/Automodel", "rev-parse", "HEAD"],
-            text=True,
-        ).strip()
-        print("=" * 80)
-        print("DeepSeek-V4-Flash AutoModel H200 60k smoke")
-        print(f"run_id={run_id}")
-        print(f"nodes={n_nodes}, total_gpus={total_gpus}")
-        print(f"seq_length={seq_length}, max_steps={max_steps}")
-        print(f"tp=1, dp={dp_size}, pp={pp_size}, cp={cp_size}, ep={ep_size}")
-        print(f"attn_backend={attn_backend}")
-        print(f"moe_dispatcher={moe_dispatcher}")
-        print(f"dist_backend={DIST_BACKEND}")
-        print(f"pytorch_cuda_alloc_conf={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
-        print(f"nccl_max_nchannels={os.environ.get('NCCL_MAX_NCHANNELS')}")
-        print(f"uccl_ep_cpu_timeout_secs={os.environ.get('UCCL_EP_CPU_TIMEOUT_SECS')}")
-        print(f"requested_efa_enabled={EFA_ENABLED}, requested_cloud={MODAL_CLOUD}")
-        print(f"runtime_cloud_provider={os.environ.get('MODAL_CLOUD_PROVIDER')}")
-        print(
-            f"nvshmem_bootstrap={NVSHMEM_BOOTSTRAP_IFNAME}/{NVSHMEM_BOOTSTRAP_FAMILY}"
-        )
-        print(f"nvshmem_ibgda_nic_handler={nvshmem_ibgda_nic_handler}")
-        print(f"nvshmem_disable_cuda_vmm={nvshmem_disable_cuda_vmm}")
-        print(f"nvshmem_disable_p2p={nvshmem_disable_p2p}")
-        print(f"uccl_socket_ifname={UCCL_SOCKET_IFNAME}")
-        print(f"uccl_socket_family={UCCL_SOCKET_FAMILY}")
-        print(f"uccl_ib_gid_index={uccl_ib_gid_index}")
-        print(
-            f"global_batch_size={global_batch_size}, local_batch_size={local_batch_size}"
-        )
-        print(
-            f"lora_rank={lora_rank}, lora_alpha={lora_alpha}, "
-            f"lora_target_modules={lora_target_modules if lora_rank > 0 else 'disabled'}"
-        )
-        print(f"synthetic_examples={effective_synthetic_examples}")
-        print(f"checkpoint_dir={checkpoint_dir}")
-        print(f"save_optimizer={save_optimizer}")
-        print(f"automodel_commit={AUTOMODEL_COMMIT}")
-        print(f"automodel_source_commit={automodel_source_commit}")
-        print(f"recipe={recipe_path}")
-        print("=" * 80)
-        print(Path(recipe_path).read_text())
-        print("=" * 80)
-
-    automodel_bin = shutil.which("automodel")
-    if automodel_bin is None:
-        raise RuntimeError("automodel CLI not found in image")
+        print(json.dumps(summary, indent=2, sort_keys=True))
 
     cmd = [
         "torchrun",
@@ -1281,34 +737,12 @@ def train_h200_60k_smoke(
         recipe_path,
     ]
     print(f"[node {node_rank}] Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=False, text=True)
-    if node_rank == 0:
-        _print_nccl_network_logs(node_rank)
+    result = subprocess.run(cmd)
     if result.returncode != 0:
         _print_cgroup_memory_status(node_rank)
-        raise RuntimeError(f"AutoModel smoke failed with code {result.returncode}")
-    if save_checkpoint:
-        checkpoints_vol.commit()
-
-    return {
-        "run_id": run_id,
-        "seq_length": seq_length,
-        "max_steps": max_steps,
-        "nodes": n_nodes,
-        "total_gpus": total_gpus,
-        "cp_size": cp_size,
-        "pp_size": pp_size,
-        "ep_size": ep_size,
-        "attn_backend": attn_backend,
-        "moe_dispatcher": moe_dispatcher,
-        "lora_rank": lora_rank,
-        "lora_alpha": lora_alpha,
-        "lora_target_modules": lora_target_modules if lora_rank > 0 else None,
-        "checkpoint_dir": checkpoint_dir,
-        "save_optimizer": save_optimizer,
-        "nvshmem_disable_p2p": nvshmem_disable_p2p,
-        "uccl_provider": uccl_provider,
-    }
+        raise RuntimeError(f"AutoModel training failed with code {result.returncode}")
+    checkpoints_vol.commit()
+    return summary
 
 
 def _validate_hf_peft_checkpoint(
@@ -1433,14 +867,7 @@ def _validate_hf_peft_checkpoint(
     timeout=1800,
     memory=HOST_MEMORY,
 )
-def finalize_lora_checkpoint(
-    run_id: str,
-    expected_step: int = 4,
-    expected_pp_size: int = 4,
-    expected_layers: int = 43,
-    expected_lora_rank: int = 64,
-    expected_lora_alpha: int = 64,
-):
+def finalize_lora_checkpoint(run_id: str):
     """Merge PP-local LoRA shards after all training nodes commit the volume."""
     import hashlib
     import re
@@ -1450,6 +877,12 @@ def finalize_lora_checkpoint(
 
     if not run_id or Path(run_id).name != run_id:
         raise ValueError("run_id must be a non-empty path component")
+
+    expected_step = MAX_STEPS - 1
+    expected_pp_size = PP_SIZE
+    expected_layers = MODEL_LAYERS
+    expected_lora_rank = LORA_RANK
+    expected_lora_alpha = LORA_ALPHA
 
     checkpoints_vol.reload()
     run_dir = Path(CHECKPOINTS_DIR) / run_id
@@ -1650,9 +1083,7 @@ def finalize_lora_checkpoint(
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=86400,
     memory=HOST_MEMORY,
-    cloud=MODAL_CLOUD,
-    experimental_options={"efa_enabled": EFA_ENABLED},
-    **EPHEMERAL_DISK_OPTIONS,
+    experimental_options={"efa_enabled": True},
 )
 @modal.web_server(
     VLLM_PORT,
@@ -1690,18 +1121,12 @@ def serve_lora():
     timeout=21600,
     retries=0,
     memory=HOST_MEMORY,
-    cloud=MODAL_CLOUD,
-    experimental_options={"efa_enabled": EFA_ENABLED},
-    **EPHEMERAL_DISK_OPTIONS,
+    experimental_options={"efa_enabled": True},
 )
-def validate_lora_serving(
-    run_id: str,
-    checkpoint_step: int = 4,
-    max_model_len: int = 64 * 1024,
-    long_prompt_tokens: int = 60000,
-    startup_timeout_seconds: int = 3600,
-):
-    """Load the finalized adapter in vLLM and generate at 60k context."""
+def validate_lora_serving(run_id: str):
+    """Compare base and adapter quality, including retrieval at 60k context."""
+    import decimal
+    import re
     import signal
     import subprocess
     import time
@@ -1711,14 +1136,12 @@ def validate_lora_serving(
 
     import vllm
     from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
 
-    if long_prompt_tokens <= 0:
-        raise ValueError("long_prompt_tokens must be positive")
-    if long_prompt_tokens + 1 > max_model_len:
-        raise ValueError(
-            "max_model_len must leave room for one generated token: "
-            f"{long_prompt_tokens + 1} > {max_model_len}"
-        )
+    checkpoint_step = MAX_STEPS - 1
+    max_model_len = 64 * 1024
+    long_prompt_tokens = SEQ_LENGTH
+    startup_timeout_seconds = 3600
 
     hf_cache_vol.reload()
     checkpoints_vol.reload()
@@ -1785,6 +1208,36 @@ def validate_lora_serving(
                 f"vLLM {path} returned HTTP {exc.code}: {error_body[:2000]}"
             ) from None
 
+    def response_text(response: dict[str, Any]) -> str:
+        if not response.get("choices"):
+            raise RuntimeError(f"vLLM returned no choices: {response}")
+        message = response["choices"][0].get("message", {})
+        parts = [
+            message.get("reasoning_content"),
+            message.get("content"),
+        ]
+        text = "\n".join(part for part in parts if part)
+        if not text:
+            raise RuntimeError(f"vLLM returned no response text: {response}")
+        return text
+
+    def extract_number(text: str) -> str | None:
+        final_matches = re.findall(
+            r"FINAL\s*:\s*(-?\d[\d,]*(?:\.\d+)?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        matches = final_matches or re.findall(r"-?\d[\d,]*(?:\.\d+)?", text)
+        return matches[-1].replace(",", "") if matches else None
+
+    def numbers_equal(predicted: str | None, expected: str) -> bool:
+        if predicted is None:
+            return False
+        try:
+            return decimal.Decimal(predicted) == decimal.Decimal(expected)
+        except decimal.InvalidOperation:
+            return False
+
     try:
         max_starts = 4
         ready = False
@@ -1831,63 +1284,154 @@ def validate_lora_serving(
 
         models = request_json("/v1/models", timeout=30)
         model_ids = {item["id"] for item in models.get("data", [])}
-        if VLLM_ADAPTER_NAME not in model_ids:
+        expected_model_ids = {HF_MODEL, VLLM_ADAPTER_NAME}
+        if not expected_model_ids.issubset(model_ids):
             raise RuntimeError(
-                f"Adapter is absent from /v1/models: {sorted(model_ids)}"
+                f"Base or adapter is absent from /v1/models: {sorted(model_ids)}"
             )
 
-        chat = request_json(
-            "/v1/chat/completions",
-            {
-                "model": VLLM_ADAPTER_NAME,
-                "messages": [
+        with urllib.request.urlopen(GSM8K_TEST_URL, timeout=60) as response:
+            gsm8k_records = [
+                json.loads(line) for line in response.read().decode().splitlines()
+            ]
+        eval_records = [gsm8k_records[index] for index in GSM8K_EVAL_INDICES]
+        quality_results: dict[str, Any] = {}
+        for model_id in (HF_MODEL, VLLM_ADAPTER_NAME):
+            examples = []
+            for index, record in zip(GSM8K_EVAL_INDICES, eval_records, strict=True):
+                expected = (
+                    record["answer"].rsplit("####", 1)[-1].strip().replace(",", "")
+                )
+                chat = request_json(
+                    "/v1/chat/completions",
                     {
-                        "role": "user",
-                        "content": "What is 2 + 2? Return only the integer.",
+                        "model": model_id,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Solve this math problem. End with a line in the "
+                                    "form FINAL: <number>.\n\n" + record["question"]
+                                ),
+                            }
+                        ],
+                        "max_tokens": 512,
+                        "temperature": 0,
+                        "chat_template_kwargs": {"thinking": False},
+                    },
+                    timeout=900,
+                )
+                text = response_text(chat)
+                predicted = extract_number(text)
+                examples.append(
+                    {
+                        "index": index,
+                        "expected": expected,
+                        "predicted": predicted,
+                        "correct": numbers_equal(predicted, expected),
+                        "output_tail": text[-300:],
                     }
-                ],
-                "max_tokens": 16,
-                "temperature": 0,
-                "chat_template_kwargs": {"thinking": False},
-            },
-            timeout=600,
-        )
-        if chat.get("model") != VLLM_ADAPTER_NAME or not chat.get("choices"):
-            raise RuntimeError(f"Invalid adapter chat response: {chat}")
-        message = chat["choices"][0].get("message", {})
-        chat_text = message.get("content") or message.get("reasoning_content")
-        if not chat_text:
-            raise RuntimeError(f"Adapter chat returned no text: {chat}")
+                )
+                print(
+                    f"GSM8K model={model_id} index={index} "
+                    f"predicted={predicted} expected={expected}"
+                )
+            quality_results[model_id] = {
+                "correct": sum(example["correct"] for example in examples),
+                "total": len(examples),
+                "examples": examples,
+            }
 
-        completion = request_json(
-            "/v1/completions",
-            {
-                "model": VLLM_ADAPTER_NAME,
-                "prompt": [0] * long_prompt_tokens,
-                "max_tokens": 1,
-                "temperature": 0,
-            },
-            timeout=3600,
+        tokenizer = AutoTokenizer.from_pretrained(
+            snapshot_path,
+            trust_remote_code=True,
         )
-        usage = completion.get("usage", {})
-        if completion.get("model") != VLLM_ADAPTER_NAME:
+        secret = "7391846250"
+        prefix = (
+            "A long archive document follows. Preserve its verified code.\n"
+            f"VERIFIED ARCHIVE CODE: {secret}\n"
+        )
+        filler = (
+            "This unrelated archive line records routine inventory notes and "
+            "does not modify the verified code.\n"
+        )
+        suffix = (
+            "\nEnd of archive. What is the VERIFIED ARCHIVE CODE stated near "
+            "the beginning? Reply with only the ten digits.\nAnswer: "
+        )
+        prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+        filler_ids = tokenizer.encode(filler, add_special_tokens=False)
+        suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        filler_count = long_prompt_tokens - len(prefix_ids) - len(suffix_ids)
+        if filler_count <= 0 or not filler_ids:
+            raise RuntimeError("Could not construct the long-context prompt")
+        repeated_filler = (
+            filler_ids * ((filler_count + len(filler_ids) - 1) // len(filler_ids))
+        )[:filler_count]
+        prompt_ids = prefix_ids + repeated_filler + suffix_ids
+        if len(prompt_ids) != long_prompt_tokens:
             raise RuntimeError(
-                f"Long-context response used the wrong model: {completion}"
+                f"Constructed {len(prompt_ids)} prompt tokens, "
+                f"expected {long_prompt_tokens}"
             )
-        if usage.get("prompt_tokens") != long_prompt_tokens:
-            raise RuntimeError(
-                f"Long-context request did not process the requested prompt: {usage}"
-            )
-        if usage.get("completion_tokens") != 1 or not completion.get("choices"):
-            raise RuntimeError(f"Long-context generation failed: {completion}")
 
+        retrieval_results: dict[str, Any] = {}
+        for model_id in (HF_MODEL, VLLM_ADAPTER_NAME):
+            completion = request_json(
+                "/v1/completions",
+                {
+                    "model": model_id,
+                    "prompt": prompt_ids,
+                    "max_tokens": 32,
+                    "temperature": 0,
+                },
+                timeout=3600,
+            )
+            usage = completion.get("usage", {})
+            if completion.get("model") != model_id:
+                raise RuntimeError(
+                    f"Long-context response used the wrong model: {completion}"
+                )
+            if usage.get("prompt_tokens") != long_prompt_tokens:
+                raise RuntimeError(
+                    f"Long-context request did not process 60k tokens: {usage}"
+                )
+            if usage.get("completion_tokens", 0) <= 0 or not completion.get("choices"):
+                raise RuntimeError(f"Long-context generation failed: {completion}")
+            text = completion["choices"][0].get("text", "")
+            answer = text.strip().splitlines()[0] if text.strip() else ""
+            retrieved = answer == secret
+            if not retrieved:
+                raise RuntimeError(
+                    f"{model_id} failed 60k retrieval: output={text[:200]!r}"
+                )
+            retrieval_results[model_id] = {
+                "answer": answer,
+                "output": text[:200],
+                "retrieved": retrieved,
+                "usage": usage,
+            }
+            print(
+                f"60k retrieval model={model_id} "
+                f"retrieved={retrieved} output={text[:200]!r}"
+            )
+
+        base_examples = quality_results[HF_MODEL]["examples"]
+        adapter_examples = quality_results[VLLM_ADAPTER_NAME]["examples"]
+        prediction_agreement = sum(
+            base["predicted"] == adapter["predicted"]
+            for base, adapter in zip(base_examples, adapter_examples, strict=True)
+        )
         result = {
             "adapter_name": VLLM_ADAPTER_NAME,
             "adapter_sha256": preflight["adapter_sha256"],
-            "chat_output": str(chat_text)[:200],
             "checkpoint_step": checkpoint_step,
-            "long_context_finish_reason": completion["choices"][0].get("finish_reason"),
-            "long_context_usage": usage,
+            "gsm8k": quality_results,
+            "gsm8k_prediction_agreement": {
+                "matching": prediction_agreement,
+                "total": len(base_examples),
+            },
+            "long_context_retrieval": retrieval_results,
             "max_model_len": max_model_len,
             "model_ids": sorted(model_ids),
             "run_id": run_id,
@@ -1912,20 +1456,7 @@ def validate_lora_serving(
 def h200_16node_60k_lora_5step(
     run_id: str,
 ):
-    if N_NODES != 16:
-        raise ValueError(
-            f"This validated entrypoint requires N_NODES=16, found {N_NODES}"
-        )
-    call = train_h200_60k_smoke.spawn(
-        run_id=run_id,
-        max_steps=5,
-        lora_rank=64,
-        lora_alpha=64,
-        lora_target_modules=DEFAULT_LORA_TARGET_MODULES,
-        synthetic_examples=40,
-        save_checkpoint=True,
-        save_optimizer=False,
-    )
+    call = train_h200_60k_lora.spawn(run_id=run_id)
     call_id = (
         getattr(call, "object_id", None)
         or getattr(call, "function_call_id", None)
@@ -1934,7 +1465,7 @@ def h200_16node_60k_lora_5step(
     result = {
         "function_call_id": call_id,
         "run_id": run_id,
-        "max_steps": 5,
+        "max_steps": MAX_STEPS,
         "checkpoint_dir": f"{CHECKPOINTS_DIR}/{run_id}",
         "nodes": N_NODES,
     }
