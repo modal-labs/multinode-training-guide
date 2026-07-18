@@ -5,15 +5,15 @@ Train a rank-64 attention LoRA for
 at a 60,000-token sequence length with NeMo AutoModel, then serve the resulting
 PEFT adapter with vLLM.
 
-This is a systems-validation recipe. The checked configuration completed five
-forward, backward, and optimizer steps on 128 H200 GPUs, exported a complete
-adapter, loaded that exact adapter in vLLM 0.25.1, generated through it, and
-processed a 60,000-token prompt. It uses synthetic SFT data and does not
-demonstrate model quality.
+This is a systems-validation recipe. The checked 64- and 128-GPU
+configurations completed five forward, backward, and optimizer steps, exported
+complete adapters, and loaded them in vLLM 0.25.1. The 64-GPU adapter was also
+generated through and processed a 60,000-token serving prompt. The recipe uses
+synthetic SFT data and does not demonstrate model quality.
 
 ## Requirements
 
-1. Modal multi-node cluster access and quota for 16 nodes of 8 H200 GPUs.
+1. Modal multi-node cluster access and quota for 8 nodes of 8 H200 GPUs.
 2. A Modal secret named `huggingface-secret` containing `HF_TOKEN`.
 3. The repository's locked `uv` environment.
 
@@ -25,19 +25,20 @@ uv run --frozen modal secret create huggingface-secret HF_TOKEN=hf_xxxxx
 
 ## Validated topology
 
-| Dimension | Value |
-| --- | ---: |
-| Nodes / GPUs | 16 / 128 H200 |
-| TP / DP / PP / CP / EP | 1 / 2 / 4 / 16 / 32 |
-| Sequence length | 60,000 |
-| Global / local batch | 8 / 4 |
-| Attention / MoE dispatch | TileLang / UCCL-EP |
-| LoRA | rank 64, alpha 64 |
-| AutoModel targets | `wq_a`, `wq_b`, `wkv` |
-| Exported PEFT targets | `q_a_proj`, `q_b_proj`, `kv_proj` |
-| Optimizer steps | 5 |
-| Checkpoint step | 4 (zero-based) |
-| Scheduler / cgroup memory | 128 MiB / 256 GiB per node |
+| Dimension | 8-node default | 16-node option |
+| --- | ---: | ---: |
+| Nodes / GPUs | 8 / 64 H200 | 16 / 128 H200 |
+| TP / DP / PP / CP / EP | 1 / 1 / 4 / 16 / 16 | 1 / 2 / 4 / 16 / 32 |
+| Sequence length | 60,000 | 60,000 |
+| Global / local batch | 8 / 4 | 8 / 4 |
+| Gradient accumulation | 2 | 1 |
+| Attention / MoE dispatch | TileLang / UCCL-EP | TileLang / UCCL-EP |
+| LoRA | rank 64, alpha 64 | rank 64, alpha 64 |
+| AutoModel targets | `wq_a`, `wq_b`, `wkv` | `wq_a`, `wq_b`, `wkv` |
+| Exported PEFT targets | `q_a_proj`, `q_b_proj`, `kv_proj` | `q_a_proj`, `q_b_proj`, `kv_proj` |
+| Optimizer steps | 5 | 5 |
+| Checkpoint step | 4 (zero-based) | 4 (zero-based) |
+| Scheduler / cgroup memory | 128 MiB / 256 GiB per node | 128 MiB / 256 GiB per node |
 
 EFA is enabled on the Modal request so the job can use the larger EFA-capable
 pool. The image contains UCCL extensions for both EFA and Mellanox/RoCE and
@@ -50,9 +51,13 @@ writer refuses to overwrite an existing run:
 
 ```bash
 uv run --frozen modal run --detach \
-  deepseek-v4-flash-sft/automodel_modal_train.py::h200_16node_60k_lora_5step \
+  deepseek-v4-flash-sft/automodel_modal_train.py::h200_60k_lora_5step \
   --run-id dsv4-flash-60k-lora-$(date -u +%Y%m%d-%H%M%S)
 ```
+
+Eight nodes is the default. Set `N_NODES=16` before the command to use the
+validated DP=2 topology; the recipe derives EP=16 or EP=32 from the selected
+node count and rejects incompatible layouts before scheduling.
 
 The detached app must finish successfully before finalization. Each pipeline
 stage writes its own adapter shard to the
@@ -152,13 +157,14 @@ silently select an unquantized loader.
 
 ## Validation
 
-The checked five-step run had finite loss and nonzero gradient norm at every
-step. The end-to-end serving check used the finalized adapter with vLLM 0.25.1
-on four H200 GPUs. It registered 129 logical LoRA modules (three targets in each
-of 43 layers). On the fixed GSM8K sanity slice, base and adapter each scored
-11/12 and their numeric predictions agreed on all 12 examples. Both model IDs
-then retrieved the expected code from the beginning of an exact 60,000-token
-prompt.
+The checked 8-node DP=1 run completed all five steps with finite loss and
+nonzero gradient norm. Its final step reported loss 0.0008, gradient norm
+0.0014, and 25.35 GiB of trainer GPU memory. The end-to-end serving check used
+that finalized adapter with vLLM 0.25.1 on four H200 GPUs. It registered 129
+logical LoRA modules (three targets in each of 43 layers). On the fixed GSM8K
+sanity slice, base and adapter each scored 11/12 and their numeric predictions
+agreed on all 12 examples. Both model IDs then retrieved the expected code from
+the beginning of an exact 60,000-token prompt.
 
 ## Limits
 

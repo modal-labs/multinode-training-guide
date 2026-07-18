@@ -25,13 +25,13 @@ GSM8K_TEST_URL = (
 GSM8K_EVAL_INDICES = tuple(range(0, 600, 50))
 
 GPUS_PER_NODE = 8
-N_NODES = 16
+N_NODES = int(os.environ.get("N_NODES", "8"))
 HOST_MEMORY = (128, 256 * 1024)
 SEQ_LENGTH = 60_000
 MAX_STEPS = 5
 CP_SIZE = 16
 PP_SIZE = 4
-EP_SIZE = 32
+MAX_EP_SIZE = 32
 GLOBAL_BATCH_SIZE = 8
 LOCAL_BATCH_SIZE = 4
 LORA_RANK = 64
@@ -498,7 +498,32 @@ def _print_cgroup_memory_status(node_rank: int) -> None:
         print(f"[node {node_rank}] cgroup_{name.replace('.', '_')}={value}")
 
 
-def _recipe_yaml(*, dataset_path: str, checkpoint_dir: str) -> str:
+def _training_topology(n_nodes: int) -> tuple[int, dict[str, int]]:
+    if n_nodes < 1:
+        raise ValueError("N_NODES must be positive")
+
+    total_gpus = n_nodes * GPUS_PER_NODE
+    if total_gpus % (PP_SIZE * CP_SIZE):
+        raise ValueError(
+            f"{total_gpus} GPUs cannot be divided across "
+            f"PP={PP_SIZE} and CP={CP_SIZE}"
+        )
+
+    non_pp_size = total_gpus // PP_SIZE
+    ep_size = min(MAX_EP_SIZE, non_pp_size)
+    if non_pp_size % ep_size:
+        raise ValueError(f"{non_pp_size=} must be divisible by {ep_size=}")
+
+    return total_gpus, {
+        "tp": 1,
+        "dp": total_gpus // (PP_SIZE * CP_SIZE),
+        "pp": PP_SIZE,
+        "cp": CP_SIZE,
+        "ep": ep_size,
+    }
+
+
+def _recipe_yaml(*, dataset_path: str, checkpoint_dir: str, ep_size: int) -> str:
     target_lines = "\n".join(
         f"  - {json.dumps(target)}" for target in LORA_TARGET_MODULES
     )
@@ -522,7 +547,7 @@ distributed:
   tp_size: 1
   cp_size: {CP_SIZE}
   pp_size: {PP_SIZE}
-  ep_size: {EP_SIZE}
+  ep_size: {ep_size}
   sequence_parallel: false
   activation_checkpointing: true
   pipeline:
@@ -635,7 +660,7 @@ optimizer:
     experimental_options={"efa_enabled": True},
 )
 @modal.experimental.clustered(size=N_NODES, rdma=True)
-def train_h200_60k_lora(run_id: str):
+def train_h200_60k_lora(run_id: str, expected_nodes: int):
     import subprocess
 
     if not run_id or Path(run_id).name != run_id:
@@ -647,12 +672,10 @@ def train_h200_60k_lora(run_id: str):
     master_addr = (
         cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
     )
-    if n_nodes != N_NODES:
-        raise RuntimeError(f"Expected {N_NODES} nodes, scheduled {n_nodes}")
-    total_gpus = n_nodes * GPUS_PER_NODE
-    dp_size = total_gpus // (PP_SIZE * CP_SIZE)
-    if dp_size != 2:
-        raise RuntimeError(f"Expected DP=2, derived DP={dp_size}")
+    if n_nodes != expected_nodes:
+        raise RuntimeError(f"Expected {expected_nodes} nodes, scheduled {n_nodes}")
+    total_gpus, topology = _training_topology(n_nodes)
+    ep_size = topology["ep"]
 
     os.environ.setdefault("HF_HOME", HF_CACHE)
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
@@ -692,6 +715,7 @@ def train_h200_60k_lora(run_id: str):
         _recipe_yaml(
             dataset_path=dataset_path,
             checkpoint_dir=checkpoint_dir,
+            ep_size=ep_size,
         )
     )
 
@@ -699,13 +723,7 @@ def train_h200_60k_lora(run_id: str):
         "run_id": run_id,
         "nodes": n_nodes,
         "total_gpus": total_gpus,
-        "topology": {
-            "tp": 1,
-            "dp": dp_size,
-            "pp": PP_SIZE,
-            "cp": CP_SIZE,
-            "ep": EP_SIZE,
-        },
+        "topology": topology,
         "sequence_length": SEQ_LENGTH,
         "optimizer_steps": MAX_STEPS,
         "global_batch_size": GLOBAL_BATCH_SIZE,
@@ -1453,10 +1471,14 @@ def validate_lora_serving(run_id: str):
 
 
 @app.local_entrypoint()
-def h200_16node_60k_lora_5step(
+def h200_60k_lora_5step(
     run_id: str,
 ):
-    call = train_h200_60k_lora.spawn(run_id=run_id)
+    _, topology = _training_topology(N_NODES)
+    call = train_h200_60k_lora.spawn(
+        run_id=run_id,
+        expected_nodes=N_NODES,
+    )
     call_id = (
         getattr(call, "object_id", None)
         or getattr(call, "function_call_id", None)
@@ -1468,6 +1490,7 @@ def h200_16node_60k_lora_5step(
         "max_steps": MAX_STEPS,
         "checkpoint_dir": f"{CHECKPOINTS_DIR}/{run_id}",
         "nodes": N_NODES,
+        "topology": topology,
     }
     print(json.dumps(result, indent=2))
     return result
