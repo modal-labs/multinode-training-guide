@@ -2,14 +2,8 @@
 
 Train a rank-64 attention LoRA for
 [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
-at a 60,000-token sequence length with NeMo AutoModel, then serve the resulting
-PEFT adapter with vLLM.
-
-This is a systems-validation recipe. The checked 64- and 128-GPU
-configurations completed five forward, backward, and optimizer steps, exported
-complete adapters, and loaded them in vLLM 0.25.1. The 64-GPU adapter was also
-generated through and processed a 60,000-token serving prompt. The recipe uses
-synthetic SFT data and does not demonstrate model quality.
+at a 60,000-token sequence length with NeMo AutoModel, finalize the
+pipeline-parallel checkpoint as a PEFT adapter, and serve it with vLLM.
 
 ## Requirements
 
@@ -23,7 +17,7 @@ Create the Hugging Face secret once:
 uv run --frozen modal secret create huggingface-secret HF_TOKEN=hf_xxxxx
 ```
 
-## Validated topology
+## Topology
 
 | Dimension | 8-node default | 16-node option |
 | --- | ---: | ---: |
@@ -40,47 +34,46 @@ uv run --frozen modal secret create huggingface-secret HF_TOKEN=hf_xxxxx
 | Checkpoint step | 4 (zero-based) | 4 (zero-based) |
 | Scheduler / cgroup memory | 128 MiB / 256 GiB per node | 128 MiB / 256 GiB per node |
 
-EFA is enabled on the Modal request so the job can use the larger EFA-capable
+The request enables EFA so Modal can schedule from the larger RDMA-capable
 pool. The image contains UCCL extensions for both EFA and Mellanox/RoCE and
-selects the matching extension after scheduling.
+activates the extension that matches the scheduled nodes.
 
 ## Train
 
-Run from the repository root. Choose a unique run ID because the checkpoint
-writer refuses to overwrite an existing run:
+Run from the repository root with a unique run ID:
 
 ```bash
 uv run --frozen modal run --detach \
-  deepseek-v4-flash-sft/automodel_modal_train.py::h200_60k_lora_5step \
+  deepseek-v4-flash-sft/modal_train.py::train \
   --run-id dsv4-flash-60k-lora-$(date -u +%Y%m%d-%H%M%S)
 ```
 
-Eight nodes is the default. Set `N_NODES=16` before the command to use the
-validated DP=2 topology; the recipe derives EP=16 or EP=32 from the selected
-node count and rejects incompatible layouts before scheduling.
+Eight nodes is the default. Set `N_NODES=16` before the command to select the
+DP=2, EP=32 layout. The launcher derives the topology from `N_NODES` and
+rejects incompatible layouts before scheduling.
 
-The detached app must finish successfully before finalization. Each pipeline
-stage writes its own adapter shard to the
-`example-deepseek-v4-flash-sft-checkpoints` volume.
+The training function writes a fixed-length synthetic chat dataset on each
+node and renders [`train_recipe.yaml`](train_recipe.yaml) with the selected EP
+size and checkpoint path. Replace `_write_synthetic_dataset` and the recipe's
+`dataset` section to use a production dataset.
 
-The synthetic data generator creates at least 40 examples and supervises the
-assistant tokens. Replace `_write_synthetic_chat_jsonl` and the `dataset`
-section of `_recipe_yaml` before using customer data.
+Each pipeline stage writes its adapter shard to the
+`example-deepseek-v4-flash-sft-checkpoints` volume. The run ID is immutable:
+the trainer refuses to overwrite an existing checkpoint directory.
 
 ## Finalize
 
-Merge the four pipeline-stage shards and validate the adapter:
+After the detached training app finishes, merge the four pipeline-stage shards:
 
 ```bash
 uv run --frozen modal run \
-  deepseek-v4-flash-sft/automodel_modal_train.py::finalize_lora_checkpoint \
+  deepseek-v4-flash-sft/modal_train.py::finalize \
   --run-id <run-id>
 ```
 
-The finalizer requires all 258 expected tensors across all 43 layers. It
-rejects duplicate, missing, non-finite, wrong-shaped, and unchanged LoRA-B
-tensors, rewrites AutoModel projection names to the official Transformers
-names, and loads the result through PEFT against a meta-device base model.
+Finalization requires all 258 tensors across all 43 layers, verifies their
+shapes and values, rewrites AutoModel projection names to the Transformers
+names used by PEFT and vLLM, and loads the complete adapter through PEFT.
 
 The finalized files are:
 
@@ -92,90 +85,46 @@ The finalized files are:
     `-- adapter_model.safetensors
 ```
 
-The manifest records the adapter SHA-256 digest and validation result. This
-recipe intentionally omits AdamW state, so the output is a serving/export
-adapter rather than an exact training-resume checkpoint.
+The manifest records the adapter SHA-256 digest. Optimizer state is not saved,
+so this output is a serving adapter rather than a training-resume checkpoint.
 
-## Validate serving
+## Serve
 
-The validator starts vLLM on four H200 GPUs with pipeline parallelism, verifies
-the adapter manifest and tensor mapping, compares the base and adapter on a
-fixed 12-example GSM8K slice, then runs a semantic retrieval prompt with exactly
-60,000 input tokens through both model IDs:
-
-```bash
-uv run --frozen modal run \
-  deepseek-v4-flash-sft/automodel_modal_train.py::validate_lora_serving \
-  --run-id <run-id>
-```
-
-A result includes per-example base and adapter outputs, both model IDs from
-`/v1/models`, and exact token-usage records for the two 60k retrieval requests.
-
-The server uses vLLM's native DeepSeek-V4 FP8/FP4 kernels with PP=4. It does not
-use tensor parallelism: vLLM's native FP4 MoE TP path is not yet the conservative
-choice for this checkpoint layout.
-
-## Deploy
-
-Select the finalized run when deploying:
+Deploy the finalized run:
 
 ```bash
 SERVE_RUN_ID=<run-id> \
   uv run --frozen modal deploy \
-  deepseek-v4-flash-sft/automodel_modal_train.py
+  deepseek-v4-flash-sft/modal_train.py
 ```
 
-The `serve_lora` endpoint is an OpenAI-compatible vLLM server protected by
-Modal proxy authentication. It exposes the adapter as
-`deepseek-v4-flash-60k-lora`.
+The `serve` endpoint is an OpenAI-compatible vLLM server protected by Modal
+proxy authentication. It exposes the base model as
+`deepseek-ai/DeepSeek-V4-Flash` and the adapter as
+`deepseek-v4-flash-60k-lora`, with a maximum model length of 65,536 tokens.
+
+Serving uses pipeline parallelism across four H200 GPUs. The launcher verifies
+the finalized manifest and adapter digest before starting vLLM.
 
 ## Integration patches
 
-The recipe carries six pinned integration patches:
+The pinned AutoModel, UCCL, and vLLM images use six integration patches:
 
-| Patch | Scope | Why it remains |
+| Patch | Scope | Purpose |
 | --- | --- | --- |
-| `automodel_checkpoint_dequant.patch` | AutoModel loading | Passes FP4 checkpoint dequantization through the pinned recipe API. |
-| `automodel_pp_peft_checkpoint.patch` | AutoModel checkpointing | Saves one PEFT shard per PP stage and permits omitting optimizer state. |
-| `automodel_composite_backend.patch` | AutoModel control plane | Handles the `cpu:gloo,cuda:nccl` composite backend in signal handling. |
-| `automodel_uccl_teardown.patch` | AutoModel shutdown | Frees UCCL before distributed/CUDA teardown. |
-| `uccl_ipv6_oob.patch` | UCCL transport | Adds IPv6 OOB support for Modal's inter-node interface. |
-| `vllm_deepseek_v4_lora.patch` | vLLM adapter loading | Advertises DSv4 LoRA support and maps PEFT attention names to vLLM's fused modules. |
+| [`patches/automodel_checkpoint_dequant.patch`](patches/automodel_checkpoint_dequant.patch) | AutoModel loading | Pass FP4 checkpoint dequantization through the recipe API. |
+| [`patches/automodel_pp_peft_checkpoint.patch`](patches/automodel_pp_peft_checkpoint.patch) | AutoModel checkpointing | Save one PEFT shard per pipeline stage without optimizer state. |
+| [`patches/automodel_composite_backend.patch`](patches/automodel_composite_backend.patch) | AutoModel control plane | Handle the `cpu:gloo,cuda:nccl` backend in signal handling. |
+| [`patches/automodel_uccl_teardown.patch`](patches/automodel_uccl_teardown.patch) | AutoModel shutdown | Release UCCL before distributed and CUDA teardown. |
+| [`patches/uccl_ipv6_oob.patch`](patches/uccl_ipv6_oob.patch) | UCCL transport | Use Modal's IPv6 inter-node interface for OOB coordination. |
+| [`patches/vllm_deepseek_v4_lora.patch`](patches/vllm_deepseek_v4_lora.patch) | vLLM adapter loading | Register DeepSeek-V4 LoRA and map PEFT attention names to fused modules. |
 
-None of these patches changes the model forward pass, attention math, or
-autograd graph. The former Megatron/ms-swift experiment and its DSv4 boundary
-rewrite are deliberately excluded because that path still OOMed at 60k and was
-not part of the successful run.
+These patches cover model loading, checkpoint export, transport, shutdown, and
+adapter registration. They do not modify the model forward pass, attention
+math, or autograd graph.
 
-vLLM 0.25.1 contains native DeepSeek-V4 serving and pipeline parallel support,
-but its `DeepseekV4ForCausalLM` class does not yet expose the LoRA interface or
-the packed Q/KV adapter mapping. The vLLM patch is limited to that registration
-and name mapping. `_prepare_vllm_hf_config` also downloads a clean official
-`config.json` outside the shared training cache so stale cache metadata cannot
-silently select an unquantized loader.
-
-## Validation
-
-The checked 8-node DP=1 run completed all five steps with finite loss and
-nonzero gradient norm. Its final step reported loss 0.0008, gradient norm
-0.0014, and 25.35 GiB of trainer GPU memory. The end-to-end serving check used
-that finalized adapter with vLLM 0.25.1 on four H200 GPUs. It registered 129
-logical LoRA modules (three targets in each of 43 layers). On the fixed GSM8K
-sanity slice, base and adapter each scored 11/12 and their numeric predictions
-agreed on all 12 examples. Both model IDs then retrieved the expected code from
-the beginning of an exact 60,000-token prompt.
-
-## Limits
-
-- The training evidence is a five-step synthetic-data smoke test, not a
-  convergence or quality result.
-- The 12-example GSM8K comparison is a regression sanity check, not a model
-  quality benchmark.
-- The checkpoint does not contain optimizer state.
-- The first training step includes TileLang compilation and UCCL setup, so it
-  is not representative of steady-state throughput.
-- Serving was validated for correctness at 60k, not benchmarked for throughput
-  or latency.
-- The pinned upstream commits and local patches should be replaced as their
-  corresponding fixes ship upstream.
+vLLM 0.25.1 provides DeepSeek-V4 serving and pipeline parallelism, while the
+patch supplies the LoRA registration and packed Q/KV mapping for
+`DeepseekV4ForCausalLM`. The serving image downloads the official model config
+to an isolated directory so the FP8 quantization metadata comes directly from
+the model repository.
