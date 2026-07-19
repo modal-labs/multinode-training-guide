@@ -1,0 +1,259 @@
+--- a/ep/src/rdma.cpp
++++ b/ep/src/rdma.cpp
+@@ -318,12 +318,12 @@
+                                     int listen_fd,
+                                     RDMAConnectionInfo* remote_array) {
+   int sockfd;
+-  struct sockaddr_in addr;
++  struct sockaddr_storage addr;
+   memset(&addr, 0, sizeof(addr));
+ 
+   // Already listening when calling uccl::create_listen_socket().
+   socklen_t len = sizeof(addr);
+-  sockfd = accept(listen_fd, (struct sockaddr*)&addr, &len);
++  sockfd = accept(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
+ 
+   // Exchange info
+   uccl::receive_message(sockfd, actual_peer, sizeof(*actual_peer));
+@@ -335,20 +335,18 @@
+ void send_connection_info_as_client(int my_rank, int peer, char const* peer_ip,
+                                     int peer_listen_port,
+                                     RDMAConnectionInfo* local) {
+-  int sockfd;
+-  struct sockaddr_in addr;
+-  memset(&addr, 0, sizeof(addr));
++  struct sockaddr_storage addr;
++  socklen_t const addr_len =
++      uccl::make_oob_socket_address(peer_ip, peer_listen_port, &addr);
+ 
+   // Connect
+-  sockfd = socket(AF_INET, SOCK_STREAM, 0);
++  int sockfd = socket(addr.ss_family, SOCK_STREAM, 0);
+   int one = 1;
+   setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+-  addr.sin_family = AF_INET;
+-  addr.sin_port = htons(peer_listen_port);
+-  inet_pton(AF_INET, peer_ip, &addr.sin_addr);
+ 
+   int retry = 0;
+-  while (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
++  while (connect(sockfd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) !=
++         0) {
+     if (errno == ECONNREFUSED || errno == ENETUNREACH) {
+       if (++retry > MAX_RETRIES) {
+         fprintf(stderr, "Rank %d: failed to connect to %d after %d retries\n",
+--- a/include/util/net.h
++++ b/include/util/net.h
+@@ -130,7 +130,8 @@
+ /* Allow the user to force the IPv4/IPv6 interface selection */
+ static inline int env_socket_family(void) {
+   int family = -1;  // Family selection is not forced, will use first one found
+-  char* env = getenv("NCCL_SOCKET_FAMILY");
++  char* env = getenv("UCCL_SOCKET_FAMILY");
++  if (env == NULL) env = getenv("NCCL_SOCKET_FAMILY");
+   if (env == NULL) return family;
+ 
+   UCCL_LOG(INFO, UCCL_UTIL)
+@@ -497,6 +498,16 @@
+   int num_ifs =
+       uccl::find_interfaces(uccl_ifname, &uccl_ifaddr, MAX_IF_NAME_SIZE, 1);
+   UCCL_CHECK(num_ifs == 1) << "No IP interface found";
+-  return uccl::get_dev_ip(uccl_ifname);
++
++  int const family = uccl_ifaddr.sa.sa_family;
++  void const* addr = family == AF_INET
++                         ? static_cast<void const*>(&uccl_ifaddr.sin.sin_addr)
++                         : static_cast<void const*>(&uccl_ifaddr.sin6.sin6_addr);
++  char address[INET6_ADDRSTRLEN]{};
++  UCCL_CHECK(family == AF_INET || family == AF_INET6)
++      << "Unsupported OOB address family " << family;
++  UCCL_CHECK(inet_ntop(family, addr, address, sizeof(address)) != nullptr)
++      << "Failed to format OOB address for interface " << uccl_ifname;
++  return std::string(address);
+ }
+-}  // namespace uccl
+\ No newline at end of file
++}  // namespace uccl
+--- a/include/util/util.h
++++ b/include/util/util.h
+@@ -169,20 +169,73 @@
+   UCCL_DCHECK(ret == sizeof(bool) && sync) << ret << ", " << sync;
+ }
+ 
++inline int oob_socket_family() {
++  char const* family = getenv("UCCL_SOCKET_FAMILY");
++  if (family == nullptr) family = getenv("NCCL_SOCKET_FAMILY");
++  return family != nullptr && strcmp(family, "AF_INET6") == 0 ? AF_INET6
++                                                               : AF_INET;
++}
++
++inline socklen_t make_oob_any_address(int family, uint16_t port,
++                                      struct sockaddr_storage* storage) {
++  memset(storage, 0, sizeof(*storage));
++  if (family == AF_INET6) {
++    auto* addr = reinterpret_cast<struct sockaddr_in6*>(storage);
++    addr->sin6_family = AF_INET6;
++    addr->sin6_addr = in6addr_any;
++    addr->sin6_port = htons(port);
++    return sizeof(*addr);
++  }
++
++  auto* addr = reinterpret_cast<struct sockaddr_in*>(storage);
++  addr->sin_family = AF_INET;
++  addr->sin_addr.s_addr = INADDR_ANY;
++  addr->sin_port = htons(port);
++  return sizeof(*addr);
++}
++
++inline socklen_t make_oob_socket_address(char const* ip, uint16_t port,
++                                         struct sockaddr_storage* storage) {
++  memset(storage, 0, sizeof(*storage));
++  if (strchr(ip, ':') != nullptr) {
++    auto* addr = reinterpret_cast<struct sockaddr_in6*>(storage);
++    addr->sin6_family = AF_INET6;
++    addr->sin6_port = htons(port);
++    UCCL_CHECK(inet_pton(AF_INET6, ip, &addr->sin6_addr) == 1)
++        << "Invalid IPv6 OOB address " << ip;
++    return sizeof(*addr);
++  }
++
++  auto* addr = reinterpret_cast<struct sockaddr_in*>(storage);
++  addr->sin_family = AF_INET;
++  addr->sin_port = htons(port);
++  UCCL_CHECK(inet_pton(AF_INET, ip, &addr->sin_addr) == 1)
++      << "Invalid IPv4 OOB address " << ip;
++  return sizeof(*addr);
++}
++
++inline uint16_t oob_socket_port(struct sockaddr_storage const& storage) {
++  if (storage.ss_family == AF_INET6) {
++    auto const* addr = reinterpret_cast<struct sockaddr_in6 const*>(&storage);
++    return ntohs(addr->sin6_port);
++  }
++  auto const* addr = reinterpret_cast<struct sockaddr_in const*>(&storage);
++  return ntohs(addr->sin_port);
++}
++
+ inline void create_listen_socket(int* listen_fd, uint16_t listen_port) {
+-  *listen_fd = socket(AF_INET, SOCK_STREAM, 0);
++  int const family = oob_socket_family();
++  *listen_fd = socket(family, SOCK_STREAM, 0);
+   UCCL_DCHECK(*listen_fd >= 0) << "ERROR: opening socket";
+   int flag = 1;
+   UCCL_CHECK(
+       setsockopt(*listen_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int)) >= 0)
+       << "ERROR: setsockopt SO_REUSEADDR fails";
+-  struct sockaddr_in serv_addr;
+-  bzero((char*)&serv_addr, sizeof(serv_addr));
+-  serv_addr.sin_family = AF_INET;
+-  serv_addr.sin_addr.s_addr = INADDR_ANY;
+-  serv_addr.sin_port = htons(listen_port);
+-  UCCL_CHECK(
+-      bind(*listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0)
++  struct sockaddr_storage serv_addr;
++  socklen_t const addr_len =
++      make_oob_any_address(family, listen_port, &serv_addr);
++  UCCL_CHECK(bind(*listen_fd, reinterpret_cast<struct sockaddr*>(&serv_addr),
++                  addr_len) >= 0)
+       << "ERROR: binding";
+ 
+   UCCL_CHECK(!listen(*listen_fd, 128)) << "ERROR: listen";
+@@ -190,7 +243,8 @@
+ }
+ 
+ inline uint16_t create_listen_socket(int* listen_fd) {
+-  *listen_fd = socket(AF_INET, SOCK_STREAM, 0);
++  int const family = oob_socket_family();
++  *listen_fd = socket(family, SOCK_STREAM, 0);
+   UCCL_DCHECK(*listen_fd >= 0) << "ERROR: opening socket";
+ 
+   int flag = 1;
+@@ -198,22 +252,20 @@
+       setsockopt(*listen_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int)) >= 0)
+       << "ERROR: setsockopt SO_REUSEADDR fails";
+ 
+-  struct sockaddr_in serv_addr;
+-  bzero((char*)&serv_addr, sizeof(serv_addr));
+-  serv_addr.sin_family = AF_INET;
+-  serv_addr.sin_addr.s_addr = INADDR_ANY;
+-  serv_addr.sin_port = htons(0);  // Ask OS for ephemeral port
+-
+-  UCCL_CHECK(
+-      bind(*listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0)
++  struct sockaddr_storage serv_addr;
++  socklen_t addr_len = make_oob_any_address(family, 0, &serv_addr);
++  UCCL_CHECK(bind(*listen_fd, reinterpret_cast<struct sockaddr*>(&serv_addr),
++                  addr_len) >= 0)
+       << "ERROR: binding";
+ 
+   // Get the assigned port
+-  socklen_t len = sizeof(serv_addr);
+-  UCCL_CHECK(getsockname(*listen_fd, (struct sockaddr*)&serv_addr, &len) >= 0)
++  addr_len = sizeof(serv_addr);
++  UCCL_CHECK(getsockname(*listen_fd,
++                         reinterpret_cast<struct sockaddr*>(&serv_addr),
++                         &addr_len) >= 0)
+       << "ERROR: getsockname";
+ 
+-  uint16_t assigned_port = ntohs(serv_addr.sin_port);
++  uint16_t assigned_port = oob_socket_port(serv_addr);
+ 
+   UCCL_CHECK(!listen(*listen_fd, 128)) << "ERROR: listen";
+   UCCL_VLOG(5) << "[Endpoint] server ready, listening on ephemeral port "
+@@ -231,19 +283,29 @@
+   UCCL_VLOG(5) << "[listen_accept_exchange] server ready, listening on port "
+                << oobport;
+ 
+-  struct sockaddr_in client_addr;
++  struct sockaddr_storage client_addr;
+   socklen_t client_len = sizeof(client_addr);
+ 
+   int client_fd =
+-      accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
++      accept(listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr),
++             &client_len);
+   UCCL_CHECK(client_fd >= 0) << "Failed to accept connection";
+ 
+   // Set nodelay
+   int flag = 1;
+   setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (void*)&flag, sizeof(int));
+ 
+-  char client_ip[INET_ADDRSTRLEN];
+-  inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
++  char client_ip[INET6_ADDRSTRLEN]{};
++  void const* client_addr_ptr =
++      client_addr.ss_family == AF_INET6
++          ? static_cast<void const*>(&reinterpret_cast<struct sockaddr_in6*>(
++                                         &client_addr)
++                                         ->sin6_addr)
++          : static_cast<void const*>(&reinterpret_cast<struct sockaddr_in*>(
++                                         &client_addr)
++                                         ->sin_addr);
++  inet_ntop(client_addr.ss_family, client_addr_ptr, client_ip,
++            sizeof(client_ip));
+   UCCL_VLOG(5) << "[listen_accept_exchange] accepted connection from "
+                << client_ip;
+ 
+@@ -257,16 +319,14 @@
+ inline static void connect_exchange(int oobport, std::string oob_ip,
+                                     void* send_data, int send_size,
+                                     void* recv_data, int recv_size) {
+-  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
++  struct sockaddr_storage server_addr;
++  socklen_t const addr_len =
++      make_oob_socket_address(oob_ip.c_str(), oobport, &server_addr);
++  int sockfd = socket(server_addr.ss_family, SOCK_STREAM, 0);
+   UCCL_CHECK(sockfd >= 0) << "Failed to create socket";
+ 
+-  struct sockaddr_in server_addr;
+-  server_addr.sin_family = AF_INET;
+-  server_addr.sin_port = htons(oobport);
+-  server_addr.sin_addr.s_addr = inet_addr(oob_ip.c_str());
+-
+-  while (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) <
+-         0) {
++  while (connect(sockfd, reinterpret_cast<struct sockaddr*>(&server_addr),
++                 addr_len) < 0) {
+     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+     UCCL_VLOG(5) << "[connect_exchange] connecting to " << oob_ip << ":"
+                  << oobport;

@@ -1,0 +1,56 @@
+diff --git a/nemo_automodel/components/distributed/init_utils.py b/nemo_automodel/components/distributed/init_utils.py
+index 57433706c0..98852b1dbd 100644
+--- a/nemo_automodel/components/distributed/init_utils.py
++++ b/nemo_automodel/components/distributed/init_utils.py
+@@ -157,19 +157,18 @@ def destroy_global_state():
+     It temporarily ignores SIGINT to avoid interruption during cleanup.
+ 
+-    For MoE runs that use DeepEP, the process-global DeepEP ``Buffer`` (NVSHMEM symmetric memory
+-    plus its own NCCL sub-groups) is destroyed *before* ``destroy_process_group()``. Tearing the
+-    buffer down first releases that pending collective state; otherwise ``destroy_process_group()``
+-    hangs on it. Freeing the buffer is a no-op when DeepEP was never used.
++    For MoE runs, process-global DeepEP or UCCL-EP buffers are destroyed *before*
++    ``destroy_process_group()`` so their communication runtimes do not outlive CUDA.
+     """
+     # Don't allow Ctrl+C to interrupt this handler
+     signal.signal(signal.SIGINT, signal.SIG_IGN)
+     try:
+-        from nemo_automodel.components.moe.megatron.fused_a2a import free_buffer
++        from nemo_automodel.components.moe.megatron.fused_a2a import free_buffer, free_uccl_buffer
+ 
+         if torch.cuda.is_available():
+             torch.cuda.synchronize()
+         free_buffer()
+-    except Exception:  # pragma: no cover - best effort; deep_ep may be absent
++        free_uccl_buffer()
++    except Exception:  # pragma: no cover - best effort; communication libraries may be absent
+         pass
+     if torch.distributed.is_available() and torch.distributed.is_initialized():
+         torch.distributed.destroy_process_group()
+diff --git a/nemo_automodel/components/moe/megatron/fused_a2a.py b/nemo_automodel/components/moe/megatron/fused_a2a.py
+index cec285cc1e..a70a59ab9c 100644
+--- a/nemo_automodel/components/moe/megatron/fused_a2a.py
++++ b/nemo_automodel/components/moe/megatron/fused_a2a.py
+@@ -541,10 +541,21 @@ def get_uccl_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
+         or _uccl_buffer.num_nvl_bytes < num_nvl_bytes
+         or _uccl_buffer.num_rdma_bytes < num_rdma_bytes
+     ):
+-        _uccl_buffer = UCCLBuffer(group, num_nvl_bytes, num_rdma_bytes)
++        _uccl_buffer = UCCLBuffer(
++            group, num_nvl_bytes, num_rdma_bytes, explicitly_destroy=True
++        )
+     return _uccl_buffer
+ 
+ 
++def free_uccl_buffer() -> None:
++    """Destroy the global UCCL-EP buffer while CUDA is still available."""
++    global _uccl_buffer
++    buffer = _uccl_buffer
++    _uccl_buffer = None
++    if buffer is not None:
++        buffer.destroy()
++
++
+ class UCCLFusedDispatch(torch.autograd.Function):
+     """Fused dispatch using UCCL-EP instead of DeepEP."""
+ 

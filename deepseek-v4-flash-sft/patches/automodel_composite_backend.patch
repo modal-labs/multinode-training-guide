@@ -1,0 +1,22 @@
+diff --git a/nemo_automodel/components/training/signal_handler.py b/nemo_automodel/components/training/signal_handler.py
+index e1a526baad..a7f715e765 100644
+--- a/nemo_automodel/components/training/signal_handler.py
++++ b/nemo_automodel/components/training/signal_handler.py
+@@ -38,11 +38,13 @@ def get_device(local_rank: Optional[int] = None) -> torch.device:
+-    backend = torch.distributed.get_backend()
+-    if backend == "nccl":
++    backend = str(torch.distributed.get_backend()).lower()
++    if backend == "nccl":
+         if local_rank is None:
+             device = torch.device("cuda")
+         else:
+             device = torch.device(f"cuda:{local_rank}")
+-    elif backend == "gloo":
++    elif backend == "gloo" or "gloo" in backend or "undefined" in backend:
++        # Composite process groups dispatch collectives by tensor device, so
++        # keep this control-plane collective on CPU/Gloo.
+         device = torch.device("cpu")
+     else:
+-        raise RuntimeError
++        raise RuntimeError(f"Unsupported distributed backend: {backend!r}")
+     return device
