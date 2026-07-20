@@ -34,6 +34,9 @@ _SLIME_SKIP = {
     "slime_model_script",
     "source_hf_checkpoint",
     "megatron_conversion_hf_checkpoint",
+    "conversion_tensor_model_parallel_size",
+    "conversion_pipeline_model_parallel_size",
+    "wandb_key",
 }
 
 # SlimeConfig fields that SLIME reads as YAML files at runtime.
@@ -52,11 +55,13 @@ class ModalConfig:
 
     docker_image: str = "slimerl/slime:nightly-dev-20260529a"
     gpu: GPUType = "H100"
+    conversion_gpu: GPUType | None = None
     memory: tuple[int, int] | None = (
         None  # per-container memory in MiB; check https://modal.com/docs/guide/resources#memory-limits
     )
     cloud: str | None = None  # e.g. "aws", "gcp"
     region: str | None = None  # e.g. "us-east-2"
+    efa_enabled: bool = True  # AWS EFA-specific Modal experimental option
     local_slime: str | None = None  # path to local slime repo for dev overlay
     patch_files: list[
         str
@@ -93,6 +98,10 @@ class SlimeConfig:
       megatron_conversion_hf_checkpoint — optional HF-format repo/local path to
                                           convert in convert_hf_to_megatron_checkpoint();
                                           defaults to hf_checkpoint
+      conversion_tensor_model_parallel_size / conversion_pipeline_model_parallel_size
+                            — optional raw-conversion TP/PP override when the
+                              checkpoint should be converted with a different
+                              sharding layout than training.
 
     Example:
 
@@ -120,6 +129,8 @@ class SlimeConfig:
     slime_model_script: str = ""  # shell script path relative to /root/slime
     source_hf_checkpoint: str | None = None
     megatron_conversion_hf_checkpoint: str | None = None
+    conversion_tensor_model_parallel_size: int | None = None
+    conversion_pipeline_model_parallel_size: int | None = None
 
     def __init__(self, **kwargs: Any) -> None:
         # Fresh environment dict per instance — never mutate the class-level default.
