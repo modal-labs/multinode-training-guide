@@ -1,0 +1,157 @@
+diff --git a/megatron/bridge/models/glm5/tilelang/sparse_mla.py b/megatron/bridge/models/glm5/tilelang/sparse_mla.py
+--- a/megatron/bridge/models/glm5/tilelang/sparse_mla.py
++++ b/megatron/bridge/models/glm5/tilelang/sparse_mla.py
+@@ -59,6 +59,14 @@ class SparseMLA(torch.autograd.Function):
+         scaling = ctx.scaling
+ 
+         tl_dq, tl_dkv = sparse_mla_bwd(q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling)
++        for name, grad in (("dQ", tl_dq), ("dKV", tl_dkv)):
++            finite = torch.isfinite(grad)
++            if not finite.all():
++                nonfinite = (~finite).sum().item()
++                raise FloatingPointError(
++                    f"TileLang SparseMLA {name} contains {nonfinite} non-finite values "
++                    f"(shape={tuple(grad.shape)}, dtype={grad.dtype})"
++                )
+ 
+         # Return gradients for each input (None for indices as it's not differentiable)
+         return tl_dq, tl_dkv, None, None
+diff --git a/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_fwd.py b/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_fwd.py
+--- a/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_fwd.py
++++ b/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_fwd.py
+@@ -109,6 +109,7 @@ def sparse_mla_fwd(
+             O_shared = T.alloc_shared([H_per_block, D], dtype)
+             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
+             mask = T.alloc_fragment([BI], "bool")
++            safe_indices = T.alloc_shared([BI], indices_dtype)
+ 
+             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+@@ -136,13 +137,25 @@ def sparse_mla_fwd(
+ 
+             for i_i in T.Pipelined(NI, num_stages=num_stages):
+                 for bi_i in T.Parallel(BI):
+-                    # Changed here for thd
+-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] != -1
++                    mask[bi_i] = (
++                        Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
++                        and Indices[b_i, s_i, g_i, i_i * BI + bi_i] < seq_len_kv
++                    )
++                    safe_indices[bi_i] = T.if_then_else(
++                        mask[bi_i],
++                        Indices[b_i, s_i, g_i, i_i * BI + bi_i],
++                        0,
++                    )
++                T.sync_threads()
+ 
+                 for bi_i, d_i in T.Parallel(BI, D):
+-                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
++                    KV_shared[bi_i, d_i] = T.if_then_else(
++                        mask[bi_i], KV[b_i, safe_indices[bi_i], g_i, d_i], 0
++                    )
+                 for bi_i, d_i in T.Parallel(BI, D_tail):
+-                    K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
++                    K_tail_shared[bi_i, d_i] = T.if_then_else(
++                        mask[bi_i], KV[b_i, safe_indices[bi_i], g_i, D + d_i], 0
++                    )
+ 
+                 for h_i, bi_i in T.Parallel(H_per_block, BI):
+                     acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
+diff --git a/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_bwd.py b/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_bwd.py
+--- a/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_bwd.py
++++ b/megatron/bridge/models/glm5/tilelang/tilelang_sparse_mla_bwd.py
+@@ -98,7 +98,7 @@ def bwd(
+     pass_configs={
+         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+-        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
++        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False,
+     },
+ )
+ def bwd(
+@@ -168,6 +168,7 @@ def bwd(
+             KV_tail_shared = T.alloc_shared([BS, D_tail], dtype)
+             dO_shared = T.alloc_shared([block_H, D], dtype)
+             mask = T.alloc_fragment([BS], "bool")
++            safe_indices = T.alloc_shared([BS], indices_dtype)
+ 
+             P_shared_cast = T.alloc_shared([block_H, BS], dtype)
+             dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
+@@ -195,21 +196,33 @@ def bwd(
+             # Process each block of indices
+             for i_i in T.Pipelined(NS, num_stages=num_stages):
+                 # Check which indices are valid
+                 for bi_i in T.Parallel(BS):
+-                    # Changed here for thd
+-                    mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] != -1
++                    mask[bi_i] = (
++                        Indices[by, s_i, bz // NH, i_i * BS + bi_i] >= 0
++                        and Indices[by, s_i, bz // NH, i_i * BS + bi_i] < S_kv
++                    )
++                    safe_indices[bi_i] = T.if_then_else(
++                        mask[bi_i],
++                        Indices[by, s_i, bz // NH, i_i * BS + bi_i],
++                        0,
++                    )
++                T.sync_threads()
+ 
+                 # Compute attention scores
+                 for h_i, bi_i in T.Parallel(block_H, BS):
+                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_p.dtype))
+ 
+                 # Load KV, V for this block of indices
+                 for bi_i, d_i in T.Parallel(BS, D):
+-                    KV_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, d_i]
++                    KV_shared[bi_i, d_i] = T.if_then_else(
++                        mask[bi_i], KV[by, safe_indices[bi_i], bz // NH, d_i], 0
++                    )
+ 
+                 T.gemm(Q_shared, KV_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+ 
+                 for bi_i, d_i in T.Parallel(BS, D_tail):
+-                    KV_tail_shared[bi_i, d_i] = KV[by, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, D + d_i]
++                    KV_tail_shared[bi_i, d_i] = T.if_then_else(
++                        mask[bi_i], KV[by, safe_indices[bi_i], bz // NH, D + d_i], 0
++                    )
+                 T.gemm(Q_tail_shared, KV_tail_shared, acc_p, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+ 
+@@ -256,27 +269,21 @@ def bwd(
+                             acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
+ 
+                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
+-                        T.atomic_addx4(
+-                            dKV[
+-                                by,
+-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+-                                bz // NH,
+-                                d_i * 4,
+-                            ],
+-                            acc_dkv_shared[bi_i, d_i * 4],
+-                        )
++                        index_offset = bi_i + s * (BS // split_store)
++                        if mask[index_offset]:
++                            T.atomic_addx4(
++                                dKV[by, safe_indices[index_offset], bz // NH, d_i * 4],
++                                acc_dkv_shared[bi_i, d_i * 4],
++                            )
+ 
+                     # Atomically update dKV, dKV_tail tensors
+                     for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+-                        T.atomic_addx4(
+-                            dKV[
+-                                by,
+-                                Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+-                                bz // NH,
+-                                D + d_i * 4,
+-                            ],
+-                            acc_dkv_tail_shared[bi_i, d_i * 4],
+-                        )
++                        index_offset = bi_i + s * (BS // split_store)
++                        if mask[index_offset]:
++                            T.atomic_addx4(
++                                dKV[by, safe_indices[index_offset], bz // NH, D + d_i * 4],
++                                acc_dkv_tail_shared[bi_i, d_i * 4],
++                            )
+ 
+             # Store the accumulated dQ
+             T.copy(acc_dq, dQ_shared)
