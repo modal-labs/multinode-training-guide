@@ -74,6 +74,33 @@ This command:
 
 **Memory Note:** The default configuration (mbs=1, full recompute) is chosen for long-context examples. Increase micro batch size only if you have headroom, or increase tensor/pipeline parallelism.
 
+### 4. Evaluation
+
+Run Megatron native evaluation on the latest LoRA checkpoint using the
+existing LongMIT-128K dataset:
+
+```bash
+modal run modal_train.py::eval_lora
+```
+
+Optional overrides:
+
+```bash
+# Use a specific checkpoint subdirectory under /checkpoints
+modal run modal_train.py::eval_lora --checkpoint-subdir glm47_lora
+
+# Point directly to a checkpoint dir or use a run id suffix
+modal run modal_train.py::eval_lora --checkpoint-dir /checkpoints/glm47_lora
+modal run modal_train.py::eval_lora --run-id <run-id>
+
+# Adjust evaluation settings
+modal run modal_train.py::eval_lora --context 128k --lora-rank 128 --eval-iters 2
+```
+
+The evaluator will re-use the existing preprocessed dataset at
+`/data/longmit-128k`. If `validation.jsonl` is missing, it creates a
+lightweight link to `training.jsonl` for the duration of the run.
+
 ## Training Configuration
 
 ### Parallelism Strategy
@@ -152,5 +179,6 @@ nvidia-smi
 |------|-------------|
 | `modal_train.py` | Modal app with download, convert, prep, and train functions |
 | `train.py` | Training script executed via torchrun on each node |
+| `eval.py` | Evaluation script executed via torchrun on each node |
 | `memory_calc.py` | GPU memory calculator for exploring parallelism configurations |
 

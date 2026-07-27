@@ -20,6 +20,7 @@ LOCAL_CODE_DIR = pathlib.Path(__file__).parent.resolve()
 
 REMOTE_CODE_DIR = "/root/"
 REMOTE_TRAIN_SCRIPT_PATH = "/root/train.py"
+REMOTE_EVAL_SCRIPT_PATH = "/root/eval.py"
 
 app = modal.App("glm47-lora")
 
@@ -385,3 +386,173 @@ def train_lora():
 
     checkpoints_volume.commit()
     return {"status": "optimized_v3_training_complete"}
+
+
+@app.function(
+    image=nemo_image,
+    gpu="B200:8",
+    volumes={
+        MODELS_DIR: models_volume,
+        DATA_DIR: data_volume,
+        CHECKPOINTS_DIR: checkpoints_volume,
+    },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=3600,
+    experimental_options={"efa_enabled": True},
+)
+@modal.experimental.clustered(size=N_NODES, rdma=True)
+def eval_lora(
+    run_id: str = "",
+    checkpoint_dir: str = "",
+    checkpoint_subdir: str = "",
+    preprocessed_dir: str = PREPROCESSED_DIR,
+    context: str = "128k",
+    lora_rank: int = 128,
+    eval_iters: int = 2,
+):
+    """Run Megatron native evaluation on the latest LoRA checkpoint."""
+    import shutil
+    import time
+
+    def resolve_checkpoint_dir():
+        if checkpoint_dir:
+            if checkpoint_dir.startswith("/"):
+                return checkpoint_dir
+            return f"{CHECKPOINTS_DIR}/{checkpoint_dir}"
+        if checkpoint_subdir:
+            return f"{CHECKPOINTS_DIR}/{checkpoint_subdir}"
+        if run_id:
+            return f"{CHECKPOINTS_DIR}/glm47_lora_{run_id}"
+        return f"{CHECKPOINTS_DIR}/glm47_lora"
+
+    def link_or_copy(src, dst):
+        if os.path.exists(dst):
+            return
+        try:
+            os.symlink(src, dst)
+            return
+        except FileExistsError:
+            return
+        except OSError:
+            shutil.copy(src, dst)
+
+    def ensure_validation_files(dataset_dir):
+        train_file = os.path.join(dataset_dir, "training.jsonl")
+        val_file = os.path.join(dataset_dir, "validation.jsonl")
+
+        if os.path.exists(val_file):
+            return
+        if not os.path.exists(train_file):
+            raise RuntimeError(f"Training dataset not found: {train_file}")
+
+        print("validation.jsonl missing; linking to training.jsonl for eval")
+        link_or_copy(train_file, val_file)
+        for suffix in [".idx.npy", ".idx.info"]:
+            train_idx = f"{train_file}{suffix}"
+            val_idx = f"{val_file}{suffix}"
+            if os.path.exists(train_idx):
+                link_or_copy(train_idx, val_idx)
+
+    # Environment variables
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.environ["NVTE_FWD_LAYERNORM_SM_MARGIN"] = "16"
+    os.environ["NVTE_BWD_LAYERNORM_SM_MARGIN"] = "16"
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+
+    cluster_info = modal.experimental.get_cluster_info()
+    node_rank = cluster_info.rank
+    master_addr = (
+        cluster_info.container_ips[0] if cluster_info.container_ips else "localhost"
+    )
+    master_port = 29500
+
+    resolved_preprocessed_dir = preprocessed_dir
+    if not resolved_preprocessed_dir.startswith("/"):
+        resolved_preprocessed_dir = os.path.join(DATA_DIR, resolved_preprocessed_dir)
+
+    resolved_checkpoint_dir = resolve_checkpoint_dir()
+
+    print(f"Node {node_rank}/{N_NODES}, Master: {master_addr}:{master_port}")
+
+    if not os.path.exists(resolved_checkpoint_dir):
+        raise RuntimeError(f"Checkpoint not found: {resolved_checkpoint_dir}")
+    if not os.path.exists(MEGATRON_CHECKPOINT):
+        raise RuntimeError(f"Base checkpoint not found: {MEGATRON_CHECKPOINT}")
+    if not os.path.exists(resolved_preprocessed_dir):
+        raise RuntimeError(
+            f"Preprocessed data not found: {resolved_preprocessed_dir}"
+        )
+
+    ensure_validation_files(resolved_preprocessed_dir)
+
+    tracker_file = os.path.join(
+        resolved_checkpoint_dir, "latest_checkpointed_iteration.txt"
+    )
+    if not os.path.exists(tracker_file):
+        raise RuntimeError(f"No tracker file found: {tracker_file}")
+
+    with open(tracker_file, "r") as f:
+        iteration = int(f.read().strip())
+
+    print("\n" + "=" * 70)
+    print(f"EVALUATING CHECKPOINT: iter_{iteration:07d}")
+    print("=" * 70)
+    print(f"Checkpoint: {resolved_checkpoint_dir}")
+    print(f"Base checkpoint: {MEGATRON_CHECKPOINT}")
+    print(f"Dataset: {resolved_preprocessed_dir}")
+    print("=" * 70 + "\n")
+
+    script_args = [
+        "--preprocessed_dir",
+        resolved_preprocessed_dir,
+        "--checkpoint_dir",
+        resolved_checkpoint_dir,
+        "--base_checkpoint",
+        MEGATRON_CHECKPOINT,
+        "--hf_model",
+        HF_MODEL,
+        "--context",
+        context,
+        "--lora_rank",
+        str(lora_rank),
+        "--eval_iters",
+        str(eval_iters),
+    ]
+
+    cmd = [
+        "torchrun",
+        f"--nnodes={N_NODES}",
+        f"--node_rank={node_rank}",
+        f"--master_addr={master_addr}",
+        f"--master_port={master_port}",
+        "--nproc_per_node=8",
+        REMOTE_EVAL_SCRIPT_PATH,
+        *script_args,
+    ]
+
+    print(f"Running: {' '.join(cmd)}")
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    for line in process.stdout:
+        print(line, end="", flush=True)
+
+    process.wait()
+
+    if process.returncode != 0:
+        raise RuntimeError(f"Eval exited with code {process.returncode}")
+
+    # Ensure logs are flushed before returning.
+    time.sleep(1)
+
+    print("[DONE] Evaluation complete")
+    return {
+        "status": "ok",
+        "iteration": iteration,
+        "checkpoint_dir": resolved_checkpoint_dir,
+    }
