@@ -1,7 +1,9 @@
+import json
 import math
 import os
 import subprocess
 
+from utils import read_port_counters
 import modal
 import modal.experimental
 
@@ -27,6 +29,7 @@ image = (
         "curl -fsSL -o /tmp/fabtests-2.3.1.tar.bz2 https://github.com/ofiwg/libfabric/releases/download/v2.3.1/fabtests-2.3.1.tar.bz2",
         "tar -xjf /tmp/fabtests-2.3.1.tar.bz2 -C /opt && rm -f /tmp/fabtests-2.3.1.tar.bz2",
     )
+    .add_local_python_source("utils")
 )
 app = modal.App("rdma-bandwidth-efa", image=image)
 
@@ -59,7 +62,20 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
     # Get current node rank
     cluster_info = modal.experimental.get_cluster_info()
     container_rank: int = cluster_info.rank
-    print(f"[rank {container_rank}] Starting rdma_bandwidth_test", flush=True)
+    print(f"[rank {container_rank}] Initializing cluster info", flush=True)
+
+    # Read initial RDMA counters
+    initial_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/1/hw_counters/*",
+        {
+            "rdma_write_bytes": 0,
+            "rdma_write_recv_bytes": 0,
+        },
+    )
+    print(
+        f"[rank {container_rank}] Initial counters: {json.dumps(initial_counters)} bytes",
+        flush=True,
+    )
 
     # Get local ib devices (sorted by device index from 0 to 7)
     local_efa_domains = get_local_efa_domains()
@@ -174,6 +190,20 @@ def efa_bandwidth_test(server_ip_dict: modal.Dict):
             )
             client_args = failed
             time.sleep(RETRY_DELAY)
+
+    # Read final RDMA counters and print the delta
+    final_counters = read_port_counters(
+        "/sys/class/infiniband/*/ports/1/hw_counters/*",
+        {
+            "rdma_write_bytes": 0,
+            "rdma_write_recv_bytes": 0,
+        },
+    )
+    delta = {k: final_counters[k] - initial_counters.get(k, 0) for k in final_counters}
+    print(
+        f"[rank {container_rank}] Counter delta: {json.dumps(delta)} bytes",
+        flush=True,
+    )
 
 
 # Run fi_rma_bw command for server
