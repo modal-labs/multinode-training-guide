@@ -70,7 +70,8 @@ with image.imports():
 # ── Volumes ───────────────────────────────────────────────────────────────────
 
 hf_cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-data_volume = modal.Volume.from_name("slime-data", create_if_missing=True)
+# use v2 for large datasets with > 500K files
+data_volume = modal.Volume.from_name("slime-data", create_if_missing=True, version=2)
 checkpoints_volume = modal.Volume.from_name("slime-checkpoints", create_if_missing=True)
 
 modal_volumes = {
@@ -188,7 +189,7 @@ def post_process_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")
 @app.function(
     image=image,
     volumes={str(DATA_PATH): data_volume},
-    timeout=4 * 60 * 60,
+    timeout=12 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def download_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):

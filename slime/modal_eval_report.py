@@ -189,15 +189,23 @@ def report(run: str = os.environ.get("EVAL_RUN", ""), top: int = 12):
 
     def spread(label: str, values: list[float]) -> None:
         if not values:
-            print(f"  {label:<10} (none recorded)")
+            print(f"  {label:<22} (none recorded)")
             return
         print(
-            f"  {label:<10} n={len(values):4d}  p50 {pct(values, 0.5):7.1f}s  p90 {pct(values, 0.9):7.1f}s  "
+            f"  {label:<22} n={len(values):4d}  p50 {pct(values, 0.5):7.1f}s  p90 {pct(values, 0.9):7.1f}s  "
             f"p99 {pct(values, 0.99):7.1f}s  max {max(values):7.1f}s"
         )
 
     print("\n=== timing ===")
     spread("elapsed", [float(r["elapsed"]) for r in rows if r["elapsed"] is not None])
+    # Split elapsed by bucket: a task that cannot build still burns its build
+    # budget before giving up, so dead tasks are not cheap ones. This is what
+    # sizes the cost of leaving them in a training pool.
+    for bucket in sorted({r["bucket"] for r in rows}):
+        spread(
+            f"  elapsed/{bucket}",
+            [float(r["elapsed"]) for r in rows if r["bucket"] == bucket and r["elapsed"] is not None],
+        )
     for phase in ("boot", "image", "prep", "agent", "generate", "verifier"):
         spread(phase, [float(v) for r in rows if (v := r["timing"].get(phase)) is not None])
 

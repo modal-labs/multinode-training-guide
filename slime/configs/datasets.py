@@ -36,11 +36,14 @@ class Dataset:
     repo: str  # HF dataset repo id (content nested under the registry key)
     has_train: bool = False  # ships <key>/train.jsonl
     revision: str | None = None  # pin a commit/tag for reproducibility
+    nested: bool = True  # False for datasets in ROOT rather than under <key>/
 
 
 # key (== /data subdir == task_path prefix) -> dataset. Add a line per dataset.
 # Keys match the existing on-disk/HF dir names so publishing is a clean repackage.
 DATASETS: dict[str, Dataset] = {
+    # Nested=False means the repo is downloaded into /data/<key> instead of /data/<key>/<key>.
+    "snorkel_private_dataset_1": Dataset("snorkelai/snorkel-private-dataset-1", nested=False),
     "swegym_lite": Dataset("junlin-modal/swegym-lite", has_train=True),
     "frontier_cs": Dataset("junlin-modal/frontier-cs", has_train=True),
     "openthoughts_agent": Dataset("junlin-modal/openthoughts-agent", has_train=True),
@@ -77,13 +80,17 @@ def eval_datasets(specs: list[tuple[str, int | None]]) -> list[dict]:
 
 
 def pull(key: str, *, allow_patterns: list[str] | None = None) -> str:
-    """``snapshot_download`` the dataset repo into ``/data`` (nests under ``<key>/``)."""
+    """``snapshot_download`` the dataset repo into its volume (nests under ``<key>/``)."""
     from huggingface_hub import snapshot_download
 
     ds = DATASETS[key]
+    local_dir = DATA_PATH if ds.nested else DATA_PATH / key
     path = snapshot_download(
-        ds.repo, repo_type="dataset", local_dir=str(DATA_PATH), revision=ds.revision, allow_patterns=allow_patterns
+        ds.repo, repo_type="dataset", local_dir=str(local_dir), revision=ds.revision, allow_patterns=allow_patterns
     )
+
+    if not (DATA_PATH / key).is_dir():
+        raise RuntimeError(f"{ds.repo}: nothing landed at {DATA_PATH}/{key} — repo unreachable or not nested under {key!r}")
     print(f"[datasets] pulled {key} ({ds.repo}) -> {DATA_PATH}/{key}")
     return path
 
