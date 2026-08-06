@@ -16,7 +16,8 @@ Runs where the dump lives so prompts and responses never leave the container --
 only counts, rates and instance ids are printed.
 
 Defaults to the most recent dump on the checkpoints volume; pass ``EVAL_RUN`` to
-pin a specific run, which is how you line a checkpoint up against its baseline:
+pin a run (newest eval within it) and ``EVAL_ROLLOUT`` to pin a step, which is
+how you line a checkpoint up against its baseline:
 
     uv run --no-dev modal run slime/modal_eval_report.py::report
 
@@ -48,7 +49,11 @@ app = modal.App("snorkel-eval-report")
     memory=32 * 1024,
     timeout=30 * 60,
 )
-def report(run: str = os.environ.get("EVAL_RUN", ""), top: int = 12):
+def report(
+    run: str = os.environ.get("EVAL_RUN", ""),
+    rollout: int = int(os.environ.get("EVAL_ROLLOUT", "-1")),
+    top: int = 12,
+):
     import re
     import statistics
     from collections import Counter, defaultdict
@@ -57,14 +62,15 @@ def report(run: str = os.environ.get("EVAL_RUN", ""), top: int = 12):
     import torch
 
     # ── Locate the dump ───────────────────────────────────────────────────────
+    # A training run writes rollout_eval_<n>.pt at every eval interval, so a run
+    # alone no longer pins one file: default to its newest eval, or pass
+    # EVAL_ROLLOUT to pick the step (e.g. 0 for the pre-training anchor).
     root = Path(DUMPS)
-    if run:
-        path = root / run / "rollout_eval_0.pt"
-    else:
-        found = sorted(root.glob("*/rollout_eval_*.pt"), key=lambda p: p.stat().st_mtime)
-        if not found:
-            raise SystemExit(f"no eval dumps under {root}")
-        path = found[-1]
+    pattern = f"rollout_eval_{rollout}.pt" if rollout >= 0 else "rollout_eval_*.pt"
+    found = sorted((root / run).glob(f"*/{pattern}" if not run else pattern), key=lambda p: p.stat().st_mtime)
+    if not found:
+        raise SystemExit(f"no dumps matching {pattern} under {root / run}")
+    path = found[-1]
     print(f"[report] {path}")
 
     # weights_only=True refuses anything but tensors and primitives; the dump is
@@ -179,6 +185,58 @@ def report(run: str = os.environ.get("EVAL_RUN", ""), top: int = 12):
 
     for field in ("language", "language_bucket", "difficulty", "category"):
         breakdown(field)
+
+
+@app.function(
+    image=image,
+    volumes={CHECKPOINTS: checkpoints_volume},
+    cpu=2.0,
+    memory=32 * 1024,
+    timeout=30 * 60,
+)
+def trend(run: str = os.environ.get("EVAL_RUN", ""), top: int = 12):
+    """One line per in-run eval: the learning curve ``report`` shows one point of.
+
+    Same classification as ``report`` (solved over episodes; infra = aborted or
+    image_unusable, excluded from the adjusted rate), so the numbers line up.
+    """
+    from collections import defaultdict
+    from pathlib import Path
+
+    import torch
+
+    root = Path(DUMPS)
+    if run:
+        dumps = sorted((root / run).glob("rollout_eval_*.pt"), key=lambda p: int(p.stem.rsplit("_", 1)[-1]))
+    else:
+        runs = sorted({p.parent for p in root.glob("*/rollout_eval_*.pt")}, key=lambda d: d.stat().st_mtime)
+        if not runs:
+            raise SystemExit(f"no eval dumps under {root}")
+        dumps = sorted(runs[-1].glob("rollout_eval_*.pt"), key=lambda p: int(p.stem.rsplit("_", 1)[-1]))
+    print(f"[trend] {dumps[0].parent.name}: {len(dumps)} evals")
+    print(f"  {'rollout':>7} {'raw':>7} {'adjusted':>9} {'infra':>6}")
+
+    for path in dumps:
+        blob = torch.load(path, weights_only=True)
+        episodes: dict[tuple, list[dict]] = defaultdict(list)
+        for s in blob["samples"]:
+            md = s.get("metadata") or {}
+            episodes[(md.get("instance_id"), s.get("index"), s.get("group_index"))].append(s)
+
+        n = solved = infra = 0
+        for chain in episodes.values():
+            first = chain[0]
+            md = first.get("metadata") or {}
+            n += 1
+            if first.get("status") == "aborted" or (
+                first.get("remove_sample") and (md.get("agentic") or {}).get("exit_status") == "ImageUnusable"
+            ):
+                infra += 1
+            elif (md.get("agentic") or {}).get("is_solved"):
+                solved += 1
+        rollout_id = int(path.stem.rsplit("_", 1)[-1])
+        adj = solved / (n - infra) if n > infra else 0.0
+        print(f"  {rollout_id:>7} {100 * solved / n:6.1f}% {100 * adj:8.1f}% {infra:6d}")
 
     # ── Timing ────────────────────────────────────────────────────────────────
     def pct(values: list[float], q: float) -> float:

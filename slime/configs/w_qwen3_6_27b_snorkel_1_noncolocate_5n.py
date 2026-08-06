@@ -1,200 +1,246 @@
-"""Qwen3.6-27B (DENSE) agentic RL on ``snorkel_private_dataset_1`` — noncolocate, six nodes.
+"""Qwen3.6-27B agentic RL on Snorkel dataset 1: plain GRPO, six nodes.
 
-Training sibling of ``w_qwen3_6_27b_snorkel_1_eval``, which measured the base
-model on this dataset. Inherits the whole recipe (model, TP4xCP2 training, 16x
-TP2 rollout engines, GRPO, optimizer, checkpoint/resume) from
-``w_qwen3_6_27b_swe_rebench_v2_noncolocate_5n`` and swaps only the data, so the
-snorkel numbers sit on the same scale as the rebench work.
+This recipe is self-contained: it inherits only ``SlimeConfig`` and spells out
+every model, topology, rollout, optimization, checkpoint, and environment
+parameter. It has no dependency on a SWE-rebench experiment config.
 
-Data. The eval slice is 500 repo-disjoint tasks; this trains on the 3,329-row
-complement written by the same ``_holdout`` call, so nothing trained on shares a
-codebase, test layout, or build with anything scored. That makes the eval a true
-holdout: it stays valid across checkpoints without a re-baseline.
+Data is split deterministically by repository, then reduced to a
+language-balanced 300-task subset: 240 train and 60 eval. A repository never
+appears on both sides. Set ``SNORKEL_TOTAL=full`` to use the complete split
+instead. The old 500-task baseline is not comparable;
+``skip_eval_before_train=False`` records a fresh step-0 anchor on the selected
+holdout.
 
-Sandbox concurrency — the snorkel-specific risk. Every task BUILDS its sandbox
-from a per-task Dockerfile (rebench pulls prebuilt images), so each episode costs
-the Modal client an image build with a context upload, and all episodes run
-through the ONE RolloutManager process's single client. The 500-task baseline
-eval lost 30% of its episodes (``ImageUnusable``) at 512 in-flight — initially
-misread as broken Dockerfiles, until ``modal_build_probe.py`` booted the whole
-pool at low per-client load and found 0 of 3,289 graded tasks unbuildable. The
-failures were client saturation, clustered by repo only because tasks in a repo
-share a Dockerfile and hence a build time. Hence ``sglang_server_concurrency``
-is set EXPLICITLY below (slime's default of 512 would mean a 2,048-episode
-pool); if episodes still die as ImageUnusable, lower it further and resume.
+This is plain GRPO, not DAPO. Each selected prompt still gets eight trajectories,
+but uniform-reward groups stay in the batch and naturally contribute zero
+advantage. There is no dynamic filter, rejection, oversampling, or refill loop.
 
-Build filtering survives as a cheap safety net: ``download_data`` drops pool
-rows the probe recorded as durably unbuildable (today: none) and keeps unprobed
-ones. ``SNORKEL_SKIP_BUILD_FILTER=1`` skips it; refresh the record with:
+Every Snorkel task builds a Dockerfile-backed sandbox. All sandbox operations
+pass through one RolloutManager Modal client, so concurrency is explicitly
+capped at 16 per SGLang engine: 16 engines x 16 = 256 in-flight episodes.
 
-    SNORKEL_EVAL_N=500 uv run --no-dev modal run -d slime/modal_build_probe.py::probe
+Prepare data:
 
-Baseline to beat (base model, 500-task slice, 2026-07-30): 40.0% raw / 57.1%
-over the 350 tasks that actually ran — the raw number carries the saturation
-losses, the adjusted one is the capability estimate. Hard tasks 38.4%, java
-28.9% — the two places with the most headroom.
-``skip_eval_before_train=False`` puts a step-0 anchor on the same slice; with
-the concurrency cap it should land near 57% raw, and that anchor doubles as the
-saturation test for the cap itself.
+    EXPERIMENT_CONFIG=w_qwen3_6_27b_snorkel_1_noncolocate_5n \
+        uv run --no-dev modal run slime/modal_train.py::download_data
 
-Score a saved checkpoint offline with ``w_qwen3_6_27b_snorkel_1_eval``
-(``EVAL_LOAD=<ckpt dir>``), then compare with ``modal_eval_report.py``.
+Launch a fresh run:
 
-Checkpoint/resume works exactly as in the rebench parent: a fresh local launch
-mints a new stamp and starts clean; a Modal auto-retry reuses it and resumes
-from the latest checkpoint. To continue an expired run:
-
-    RESUME=qwen3.6-27b-snorkel-1-noncolocate-5n-<stamp> \
-    SNORKEL_EVAL_N=500 EXPERIMENT_CONFIG=w_qwen3_6_27b_snorkel_1_noncolocate_5n \
+    EXPERIMENT_CONFIG=w_qwen3_6_27b_snorkel_1_noncolocate_5n \
         uv run --no-dev modal run -d slime/modal_train.py::train
 
-Prereqs: this config's ::download_data (pull, unpack, convert, split, filter) and
-the one-time ::convert_hf_to_megatron_checkpoint shared with the rebench configs.
+Resume an earlier run by its complete tag:
 
-    SNORKEL_EVAL_N=500 EXPERIMENT_CONFIG=w_qwen3_6_27b_snorkel_1_noncolocate_5n \
+    RESUME=qwen3.6-27b-snorkel-1-plain-300-noncolocate-5n-<stamp> \
+    EXPERIMENT_CONFIG=w_qwen3_6_27b_snorkel_1_noncolocate_5n \
         uv run --no-dev modal run -d slime/modal_train.py::train
 """
 
-import copy
-import json
 import os
-from pathlib import Path
+from datetime import datetime
 
-from configs.base import CHECKPOINTS_PATH, DATA_PATH
+from configs.base import CHECKPOINTS_PATH, DATA_PATH, HF_CACHE_PATH, ModalConfig, SlimeConfig
 from configs.datasets import pull
-from configs.w_qwen3_6_27b_snorkel_1_eval import (
-    _EVAL_N,
-    _EVAL_SEED,
-    _EVAL_SLICE,
-    _KEY,
-    _ROOT,
-    _SET_TAG,
-    _convert,
-    _holdout,
-    _report,
-    _unpack,
+from configs.snorkel_1_data import (
+    KEY,
+    ROOT,
+    SMALL_TOTAL,
+    convert,
+    eval_split_path,
+    report,
+    split,
     train_pool_path,
+    unpack,
 )
-from configs.w_qwen3_6_27b_swe_rebench_v2_noncolocate_5n import _LAUNCH_STAMP, _Slime, _eval_entry
-from configs.w_qwen3_6_27b_swe_rebench_v2_noncolocate_5n import modal as _parent_modal
 
-# Repo-disjoint complement of the eval slice, and the buildable subset of it.
-_TRAIN_POOL = train_pool_path(_EVAL_N, _EVAL_SEED)
-_BUILDABLE_IDS = f"{DATA_PATH}/{_KEY}/buildable_ids.json"
-_TRAIN_BUILDABLE = f"{DATA_PATH}/{_KEY}/train.holdout{_EVAL_N}.{_EVAL_SEED}.buildable.jsonl"
-
-# Escape hatch: train on the unfiltered pool, skipping the probe's verdict file.
-_SKIP_FILTER = os.environ.get("SNORKEL_SKIP_BUILD_FILTER") == "1"
-_TRAIN_DATA = _TRAIN_POOL if _SKIP_FILTER else _TRAIN_BUILDABLE
-
+_LAUNCH_STAMP = os.environ.get("LAUNCH_STAMP") or f"{datetime.now():%Y%m%d-%H%M%S}"
 _RESUME = os.environ.get("RESUME")
+_TOTAL_RAW = os.environ.get("SNORKEL_TOTAL", str(SMALL_TOTAL))
+if _TOTAL_RAW not in {str(SMALL_TOTAL), "full"}:
+    raise ValueError(f"SNORKEL_TOTAL must be {SMALL_TOTAL!r} or 'full', got {_TOTAL_RAW!r}")
+_DATASET_TOTAL = None if _TOTAL_RAW == "full" else SMALL_TOTAL
+_SET_TAG = "full" if _DATASET_TOTAL is None else str(_DATASET_TOTAL)
 _RUN_TAG = (
-    f"{os.environ.get('WANDB_GROUP') or 'qwen3.6-27b-snorkel-1-noncolocate-5n'}"
-    f"{'-nofilter' if _SKIP_FILTER else ''}-{_LAUNCH_STAMP}"
+    f"{os.environ.get('WANDB_GROUP') or f'qwen3.6-27b-snorkel-1-plain-{_SET_TAG}-noncolocate-5n'}"
+    f"-{_LAUNCH_STAMP}"
 )
 
-# SNORKEL_* are read at config import, which happens inside the container too, so
-# they ride in the image env alongside the parent's LAUNCH_STAMP/RESUME.
-modal = copy.copy(_parent_modal)
-modal.image_env = {
-    **_parent_modal.image_env,
-    **{
-        k: v
-        for k in ("SNORKEL_EVAL_N", "SNORKEL_BATCHES", "SNORKEL_UNPACK_WORKERS", "SNORKEL_SKIP_BUILD_FILTER")
-        if (v := os.environ.get(k)) is not None
-    },
-}
+_TRAIN_POOL = train_pool_path(_DATASET_TOTAL)
+_EVAL_SPLIT = eval_split_path(_DATASET_TOTAL)
+
+_IMAGE_ENV = {
+    key: value
+    for key in (
+        "WANDB_PROJECT",
+        "WANDB_GROUP",
+        "RESUME",
+        "SNORKEL_BATCHES",
+        "SNORKEL_TOTAL",
+        "SNORKEL_UNPACK_WORKERS",
+    )
+    if (value := os.environ.get(key)) is not None
+} | {"LAUNCH_STAMP": _LAUNCH_STAMP}
+
+modal = ModalConfig(
+    gpu="H200",
+    memory=(1024, int(2 * 1024 * 1024)),
+    ephemeral_disk=2 * 1024 * 1024,
+    local_slime="/Users/shariqmobin/Documents/code/work/modal-projects/slime",
+    image_run_commands=[
+        f"rm -rf {HF_CACHE_PATH}",
+        "apt-get update && apt-get install -y --no-install-recommends rdma-core libibverbs1 ibverbs-providers",
+        "uv pip install --system modal mini-swe-agent datasets",
+    ],
+    image_env={"MSWEA_SILENT_STARTUP": "1", **_IMAGE_ENV},
+)
 
 
-def _filter_buildable() -> None:
-    """Drop pool rows whose image the probe could not build.
-
-    Tasks the probe never reached are KEPT: an unprobed task is unknown, not
-    known-bad, and dropping it would silently shrink the pool if the probe was
-    interrupted. The coverage line says how much of the pool the decision rests on.
-    """
-    ids_file = Path(_BUILDABLE_IDS)
-    if not ids_file.is_file():
-        raise FileNotFoundError(
-            f"{ids_file}: run slime/modal_build_probe.py::probe first, "
-            "or set SNORKEL_SKIP_BUILD_FILTER=1 to train on the unfiltered pool"
-        )
-    blob = json.loads(ids_file.read_text())
-    buildable, unbuildable = set(blob["buildable"]), set(blob["unbuildable"])
-
-    rows = [ln for ln in Path(_TRAIN_POOL).read_text().splitlines() if ln.strip()]
-    kept, dropped, unprobed = [], 0, 0
-    for line in rows:
-        inst = json.loads(line)["metadata"]["instance_id"]
-        if inst in unbuildable:
-            dropped += 1
-        else:
-            kept.append(line)
-            unprobed += inst not in buildable
-
-    Path(_TRAIN_BUILDABLE).write_text("\n".join(kept) + "\n", encoding="utf-8")
-    print(f"[snorkel] buildable pool: kept {len(kept)}/{len(rows)}, dropped {dropped} unbuildable -> {_TRAIN_BUILDABLE}")
-    print(f"[snorkel]   probe coverage: {len(rows) - unprobed}/{len(rows)} rows probed ({unprobed} unknown, kept)")
+def _eval_entry(name: str, path: str) -> dict:
+    return {"name": name, "path": path, "metadata_overrides": {"eval_dataset": name}}
 
 
-class _SlimeSnorkelTrain(_Slime):
-    # ── Data ──────────────────────────────────────────────────────────────────
-    prompt_data = _TRAIN_DATA
+class _Slime(SlimeConfig):
+    # ── Model ─────────────────────────────────────────────────────────────────
+    slime_model_script = "scripts/models/qwen3.5-27B.sh"
+    make_vocab_size_divisible_by = 32
+    hf_checkpoint = "Qwen/Qwen3.6-27B"
+    ref_load = f"{CHECKPOINTS_PATH}/Qwen3.6-27B_torch_dist"
 
-    # ── Episode concurrency: capped for Dockerfile-building sandboxes ─────────
-    # Every episode's sandbox ops (App.lookup + Image.from_dockerfile with a
-    # context upload + Sandbox.create) run through the ONE RolloutManager
-    # process's single Modal client, and its event loop is what a bare
-    # `ImageUnusable` failure actually is: at 512 in-flight the 500-task eval
-    # lost 30% of episodes to client saturation, while the build probe proved
-    # the same tasks ~100% buildable at low per-client load. The parent leaves
-    # this unset, and slime's own default of 512 would mean 512 x 16 engines,
-    # clamped to a 2,048-thread episode pool — 4x the load that already failed.
-    # 16 x 16 engines = 256 concurrent episodes: half the failing level, and a
-    # far gentler creation rate. The in-run eval shares the pool math, so the
-    # step-0 anchor doubles as the saturation test — near 57% raw confirms the
-    # cap works; ImageUnusable episodes in the logs mean it must drop further.
-    # Rebench never needed this because its tasks pull PREBUILT images.
+    # ── Sync noncolocate topology: 2 train + 4 rollout nodes ─────────────────
+    async_mode = False
+    colocate = False
+    actor_num_nodes = 2
+    actor_num_gpus_per_node = 8
+    rollout_num_gpus = 32
+    update_weights_interval = 1
+    update_weight_buffer_size = 2147483648
+
+    # ── Agentic rollout ───────────────────────────────────────────────────────
+    custom_generate_function_path = "agentic_rl.generate.generate"
+    custom_rollout_log_function_path = "agentic_rl.metrics.log_rollout_data"
+    custom_config_path = {
+        "agentic_max_steps": 75,
+        "agentic_episode_timeout": 1800,
+        "agentic_eval_timeout": 300,
+        "agentic_exec_timeout": 120,
+        "router_policy": "consistent_hashing",
+    }
+    metadata_key = "metadata"
+    prompt_data = _TRAIN_POOL
+    input_key = "prompt"
+    label_key = "label"
+    apply_chat_template = False
+    rollout_shuffle = True
+    rm_type = None
+    balance_data = True
+
+    # ── Plain GRPO rollout sizing ─────────────────────────────────────────────
+    num_rollout = 500
+    rollout_batch_size = 32
+    rollout_max_response_len = 8192
+    rollout_temperature = 1.0
+    n_samples_per_prompt = 8
+    num_steps_per_rollout = 1
+    global_batch_size = 256
+    micro_batch_size = 1
+    rollout_max_context_len = 32768 * 2
+    sglang_reasoning_parser = "qwen3"
+    sglang_tool_call_parser = "qwen3_coder"
+    # Deliberately no dynamic_sampling_filter_path or over_sampling_batch_size.
+
+    # ── SGLang: 16 TP2 engines, capped at 256 sandbox episodes ────────────────
+    rollout_num_gpus_per_engine = 2
     sglang_server_concurrency = 16
+    sglang_mem_fraction_static = 0.85
+    sglang_cuda_graph_bs = [1, 2, 4, 8, 16] + list(range(24, 257, 8))
+    sglang_mamba_scheduler_strategy = "extra_buffer"
+    sglang_speculative_algorithm = "EAGLE"
+    sglang_speculative_num_steps = 3
+    sglang_speculative_eagle_topk = 1
+    sglang_speculative_num_draft_tokens = 4
+    sglang_enable_dp_attention = False
+    sglang_disable_custom_all_reduce = False
 
-    # Same slice and the same entry name the eval-only config scores, so the
-    # in-run curve and the offline base-vs-checkpoint numbers are one series.
+    # ── Eval: the language-balanced, repo-disjoint 20% holdout ────────────────
+    eval_interval = 5
+    skip_eval_before_train = False
+    eval_max_response_len = 8192
     eval_config = {
         "defaults": {"n_samples_per_eval_prompt": 1, "temperature": 0.6, "top_p": 1.0},
-        "datasets": [_eval_entry(f"snorkel1_{_SET_TAG}", _EVAL_SLICE)],
+        "datasets": [_eval_entry(f"snorkel1_{_SET_TAG}_repo20", _EVAL_SPLIT)],
     }
 
-    # ── Dynamic sampling ──────────────────────────────────────────────────────
-    # The parent's pool was prefiltered to mixed-outcome tasks, so 1.5x
-    # oversampling sufficed. This pool is not: it spans easy tasks the base model
-    # solves 86% of the time and hard ones it solves 38% of, so a large share of
-    # groups come back all-solved or all-failed and get dropped for zero
-    # advantage. 2x gives the refill loop more to work with per round. Watch
-    # rollout/dynamic_filter/drop_* and perf/rollout_time -- if the drop rate
-    # stays low this is just wasted episodes and should come back down.
-    over_sampling_batch_size = 64
+    # ── Dense 27B Megatron training: TP4 x CP2 x DP2 ─────────────────────────
+    tensor_model_parallel_size = 4
+    sequence_parallel = True
+    pipeline_model_parallel_size = 1
+    context_parallel_size = 2
+    expert_model_parallel_size = 1
+    expert_tensor_parallel_size = 1
+    use_dynamic_batch_size = True
+    max_tokens_per_gpu = 32768
+    log_probs_chunk_size = 1024
+    recompute_granularity = "full"
+    recompute_method = "uniform"
+    recompute_num_layers = 1
+    attention_dropout = 0.0
+    hidden_dropout = 0.0
+    accumulate_allreduce_grads_in_fp32 = True
+    attention_softmax_in_fp32 = True
+    attention_backend = "flash"
 
-    # ── Run identity: checkpoints, dumps and W&B all keyed to this launch ─────
-    save = f"{CHECKPOINTS_PATH}/swe_ckpts/{_RESUME or _RUN_TAG}"
-    load = save
+    # ── Checkpointing and rollout artifacts ──────────────────────────────────
     save_debug_rollout_data = f"{CHECKPOINTS_PATH}/swe_rollout_dumps/{_RUN_TAG}/rollout_{{rollout_id}}.pt"
+    save = f"{CHECKPOINTS_PATH}/swe_ckpts/{_RESUME or _RUN_TAG}"
+    save_interval = 5
+    load = save
+
+    # ── GRPO ──────────────────────────────────────────────────────────────────
+    advantage_estimator = "grpo"
+    use_kl_loss = False
+    kl_loss_coef = 0.0
+    kl_loss_type = "low_var_kl"
+    kl_coef = 0.0
+    entropy_coef = 0.0
+    eps_clip = 0.2
+    eps_clip_high = 0.28
+
+    # ── Optimizer ─────────────────────────────────────────────────────────────
+    optimizer = "adam"
+    lr = 4e-6
+    lr_decay_style = "constant"
+    weight_decay = 0.1
+    adam_beta1 = 0.9
+    adam_beta2 = 0.98
+    optimizer_cpu_offload = True
+    overlap_cpu_optimizer_d2h_h2d = True
+    use_precision_aware_optimizer = True
+
+    # ── Runtime environment ───────────────────────────────────────────────────
+    environment = {
+        "PYTHONPATH": "/root/Megatron-LM/:/root/slime",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "NCCL_NVLS_ENABLE": "1",
+        "MODAL_ENVIRONMENT": "shariq-dev",
+        "ASYNC_RL_TASK_ROOT": f"{DATA_PATH}",
+        "SLIME_AGENT_SANDBOX_CPU": "2",
+        "SLIME_AGENT_SANDBOX_MEMORY_MB": "4096",
+        "ASYNC_RL_REWARD_SHAPE": "binary",
+    }
+
+    # ── W&B ───────────────────────────────────────────────────────────────────
+    use_wandb = False
+    wandb_project = os.environ.get("WANDB_PROJECT")
     wandb_group = _RUN_TAG
+    disable_wandb_random_suffix = True
 
     def download_data(self) -> None:
-        """Pull, unpack, convert, split, and filter the pool to buildable tasks.
-
-        Everything persists on the slime-data volume and every step is
-        idempotent, so re-runs only do the missing work. The split is
-        deterministic, so this reproduces the exact eval slice the baseline was
-        measured on.
-        """
-        pull(_KEY)
-        _unpack(_ROOT)
-        _convert(_ROOT)
-        _holdout(_ROOT, _EVAL_N, _EVAL_SEED)
-        if not _SKIP_FILTER:
-            _filter_buildable()
-        _report(_ROOT)
+        """Materialize the full and 300-task repo-disjoint 80/20 splits."""
+        pull(KEY)
+        unpack(ROOT)
+        convert(ROOT)
+        split(ROOT)
+        report(ROOT)
 
 
-slime = _SlimeSnorkelTrain()
+slime = _Slime()

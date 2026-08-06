@@ -890,6 +890,11 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
         "env_vars": {
             "no_proxy": f"127.0.0.1,{master_addr}",
             "MASTER_ADDR": master_addr,
+            # W&B wraps stdout by default and uploads it at wandb.finish(), which
+            # for agentic runs means the RolloutManager's agent transcripts and
+            # task repo contents. Set before slime_cfg.environment so a config can
+            # opt back in.
+            "WANDB_CONSOLE": "off",
             **slime_cfg.environment,
         }
     }
