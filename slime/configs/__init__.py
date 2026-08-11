@@ -12,6 +12,8 @@ def get_module(name: str):
         if exc.name != f"configs.{name}":
             raise
         available = sorted(
-            f.stem for f in _CONFIGS_DIR.glob("*.py") if f.stem not in _SKIP
+            f.relative_to(_CONFIGS_DIR).with_suffix("").as_posix().replace("/", ".")
+            for f in _CONFIGS_DIR.rglob("*.py")
+            if f.stem not in _SKIP
         )
         raise ValueError(f"Unknown config {name!r}. Available: {available}") from exc
