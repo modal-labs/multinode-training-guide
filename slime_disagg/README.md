@@ -2,4 +2,4 @@
 
 This example has moved to the `cookbook/` folder of the `stitch` repo:
 
-https://github.com/modal-projects/stitch/tree/main/cookbook/slime_disagg
+https://github.com/modal-projects/stitch/tree/main/cookbook/
