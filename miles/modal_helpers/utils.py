@@ -104,15 +104,20 @@ def start_ray_head(my_ip: str, n_nodes: int) -> None:
     """Start Ray head node and wait for all workers to join."""
     import ray
 
-    subprocess.Popen(
+    # `ray start --head` (without --block) returns once GCS/raylet/dashboard are up,
+    # so wait for it instead of racing ray.init() against head startup.
+    head = subprocess.run(
         [
             "ray",
             "start",
             "--head",
             f"--node-ip-address={my_ip}",
             "--dashboard-host=0.0.0.0",
-        ]
+        ],
+        check=False,
     )
+    if head.returncode != 0:
+        raise RuntimeError(f"`ray start --head` exited with code {head.returncode}")
     for _ in range(30):
         try:
             ray.init(address="auto")
