@@ -50,7 +50,7 @@ JSON_CONFIG_FIELDS = ("train_env_vars", "apply_chat_template_kwargs", "multimoda
 class ModalConfig:
     """Modal infrastructure configuration — GPU provisioning and image setup only."""
 
-    docker_image: str = "radixark/miles:dev-202605291323"
+    docker_image: str = "radixark/miles:dev-202609151226"
     gpu: GPUType = "H100"
     memory: tuple[int, int] | None = (
         None  # per-container memory in MiB; None = Modal default

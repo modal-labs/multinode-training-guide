@@ -14,7 +14,7 @@ Knobs to tune:
 from configs.base import ModalConfig, MilesConfig, DATA_PATH, CHECKPOINTS_PATH, HF_CACHE_PATH
 
 modal = ModalConfig(
-    docker_image="radixark/miles:dev-202605291323",
+    docker_image="radixark/miles:dev-202609151226",
     gpu="H100",
     memory=(1024, int(2 * 1024 * 1024)),
     image_run_commands=[
