@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+# pyright: reportMissingImports=false
+
+import argparse
+import math
+import re
+
+import numpy as np
+import tinker
+from tinker import types
+
+
+RESULT_TIMEOUT_SECONDS = 20 * 60
+STRICT_INTEGER_RE = re.compile(r"-?\d+")
+PROMPTS = [
+    ("What is 13 + 29?", "42"),
+    ("What is 7 * 9?", "63"),
+    ("What is 81 / 9?", "9"),
+    ("What is 50 - 18?", "32"),
+]
+
+
+def tensor_int(values: list[int]) -> types.TensorData:
+    return types.TensorData.from_numpy(np.asarray(values, dtype=np.int64))
+
+
+def tensor_float(values: list[float]) -> types.TensorData:
+    return types.TensorData.from_numpy(np.asarray(values, dtype=np.float32))
+
+
+def extract_integer(text: str) -> str | None:
+    matches = STRICT_INTEGER_RE.findall(text.replace(",", ""))
+    return matches[-1] if matches else None
+
+
+def reward_for(response: str, answer: str) -> float:
+    prediction = extract_integer(response)
+    if prediction == answer:
+        return 1.0
+    if prediction is not None:
+        return 0.1
+    return 0.0
+
+
+def resolve(future, label: str):
+    return future.result(timeout=RESULT_TIMEOUT_SECONDS)
+
+
+def validate_forward_outputs(result, label: str) -> None:
+    for output in result.loss_fn_outputs:
+        for key, tensor in output.items():
+            for value in tensor.data:
+                scalar = float(value)
+                if not math.isfinite(scalar):
+                    raise RuntimeError(f"Non-finite {label} {key} value: {scalar}")
+
+
+def validate_optimizer_metrics(result, label: str) -> None:
+    for key, value in (result.metrics or {}).items():
+        metric = float(value)
+        if not math.isfinite(metric):
+            raise RuntimeError(f"Non-finite {label} metric {key}: {metric}")
+
+
+def make_prompt(question: str) -> str:
+    return (
+        "Solve the arithmetic problem. Answer with only the final integer.\n"
+        f"Question: {question}\nAnswer:"
+    )
+
+
+def make_policy_datum(
+    prompt_tokens: list[int],
+    response_tokens: list[int],
+    old_logprobs: list[float],
+    advantage: float,
+) -> types.Datum:
+    return types.Datum(
+        model_input=types.ModelInput.from_ints(prompt_tokens + response_tokens[:-1]),
+        loss_fn_inputs={
+            "target_tokens": tensor_int(response_tokens),
+            "weights": tensor_float([1.0] * len(response_tokens)),
+            "logprobs": tensor_float(old_logprobs),
+            "advantages": tensor_float([advantage] * len(response_tokens)),
+        },
+    )
+
+
+def build_rollout_batch(
+    training_client, tokenizer, samples_per_prompt: int, step: int
+) -> tuple[list[types.Datum], list[float]]:
+    sampler = training_client.save_weights_and_get_sampling_client(
+        name=f"rl_step_{step}"
+    )
+    return build_rollout_batch_from_sampler(
+        sampler, tokenizer, samples_per_prompt, step
+    )
+
+
+def build_rollout_batch_from_sampler(
+    sampler, tokenizer, samples_per_prompt: int, step: int
+) -> tuple[list[types.Datum], list[float]]:
+    data: list[types.Datum] = []
+    rewards: list[float] = []
+
+    for offset, (question, answer) in enumerate(PROMPTS):
+        prompt_tokens = tokenizer.encode(make_prompt(question), add_special_tokens=True)
+        sample = sampler.sample(
+            prompt=types.ModelInput.from_ints(prompt_tokens),
+            num_samples=samples_per_prompt,
+            sampling_params=types.SamplingParams(
+                max_tokens=24,
+                temperature=1.0,
+                top_p=1.0,
+                top_k=-1,
+                seed=step * 1000 + offset,
+            ),
+        )
+        sample = resolve(sample, f"rl_sample_step_{step}_{offset}")
+        for sequence in sample.sequences:
+            response_tokens = list(sequence.tokens)
+            if not response_tokens:
+                continue
+            response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+            reward = reward_for(response, answer)
+            if sequence.logprobs is None:
+                old_logprobs = [0.0] * len(response_tokens)
+            else:
+                old_logprobs = [float(logprob) for logprob in sequence.logprobs]
+                if not all(math.isfinite(logprob) for logprob in old_logprobs):
+                    old_logprobs = [0.0] * len(response_tokens)
+            data.append(
+                make_policy_datum(prompt_tokens, response_tokens, old_logprobs, reward)
+            )
+            rewards.append(reward)
+
+    if not data:
+        raise RuntimeError("No rollout tokens were sampled; cannot run RL update")
+    return data, rewards
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--samples-per-prompt", type=int, default=2)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be at least 1 for RL")
+
+    service_client = tinker.ServiceClient(base_url=args.base_url, api_key="tml-dummy")
+    training_client = service_client.create_lora_training_client(
+        base_model=args.model_name,
+        rank=args.lora_rank,
+    )
+    tokenizer = training_client.get_tokenizer()
+    optimizer = types.AdamParams(
+        learning_rate=args.learning_rate,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+    )
+
+    data: list[types.Datum] = []
+    rewards: list[float] = []
+    for step in range(args.steps):
+        data, rewards = build_rollout_batch(
+            training_client, tokenizer, args.samples_per_prompt, step
+        )
+        forward = training_client.forward_backward(
+            data,
+            "ppo",
+            {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
+        )
+        forward = resolve(forward, f"rl_step_{step}")
+        validate_forward_outputs(forward, f"rl_step_{step}")
+        optim = resolve(training_client.optim_step(optimizer), f"rl_optim_step_{step}")
+        validate_optimizer_metrics(optim, f"rl_optim_step_{step}")
+        mean_reward = sum(rewards) / len(rewards)
+        print(
+            f"rl_step={step} mean_reward={mean_reward:.3f} trajectories={len(data)} "
+            f"loss_outputs={len(forward.loss_fn_outputs)}",
+            flush=True,
+        )
+
+    state_path = resolve(
+        training_client.save_state(name=f"rl_state_step_{args.steps}"), "rl_save_state"
+    ).path
+    print(f"rl_state_checkpoint={state_path}", flush=True)
+    eval_forward = training_client.forward_backward(
+        data,
+        "ppo",
+        {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
+    )
+    eval_forward = resolve(eval_forward, "rl_eval_forward")
+    validate_forward_outputs(eval_forward, "rl_eval_forward")
+    print(
+        f"rl_eval_loss_outputs={len(eval_forward.loss_fn_outputs)}",
+        flush=True,
+    )
+
+    sampler_path = resolve(
+        training_client.save_weights_for_sampler(name=f"rl_sampler_step_{args.steps}"),
+        "rl_save_sampler",
+    ).path
+    print(f"rl_sampler_checkpoint={sampler_path}", flush=True)
+    sampler = service_client.create_sampling_client(model_path=sampler_path)
+    eval_data, eval_rewards = build_rollout_batch_from_sampler(
+        sampler, tokenizer, args.samples_per_prompt, args.steps
+    )
+    mean_eval_reward = sum(eval_rewards) / len(eval_rewards)
+    print(
+        f"rl_eval mean_reward={mean_eval_reward:.3f} trajectories={len(eval_data)}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
