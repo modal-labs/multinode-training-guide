@@ -30,7 +30,7 @@ modal = ModalConfig(
 
 
 class _Miles(MilesConfig):
-    miles_model_script = "scripts/models/kimi-k2-thinking.sh"
+    miles_model_script = "scripts/models/kimi-k2-thinking.py"
 
     environment = {
         "PYTHONPATH": "/root/Megatron-LM/",

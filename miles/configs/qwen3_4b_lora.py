@@ -30,7 +30,7 @@ modal = ModalConfig(
 
 
 class _Miles(MilesConfig):
-    miles_model_script = "scripts/models/qwen3-4B.sh"
+    miles_model_script = "scripts/models/qwen3-4B.py"
 
     environment = {
         "PYTHONPATH": "/root/Megatron-LM/",

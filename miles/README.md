@@ -83,6 +83,34 @@ For this config:
 - `download_data` downloads the training dataset to `/data`.
 - `train` launches the bridge-mode training job directly.
 
+## Run Qwen3-30B-A3B LoRA SFT (2 nodes)
+
+`qwen3_30b_a3b_lora_sft` is supervised fine-tuning with Miles' SFT rollout
+(`miles.rollout.sft_rollout`, `--loss-type sft_loss`). It uses
+`--debug-train-only`, so SGLang is never started and all 16 H100s run
+Megatron training: TP4 with sequence parallelism, EP8, and DP4. It uses bridge
+mode, so do not run `convert_hf_to_megatron_checkpoint`.
+
+```bash
+export EXPERIMENT_CONFIG=qwen3_30b_a3b_lora_sft
+
+modal run miles/modal_train.py::download_model
+modal run miles/modal_train.py::download_data
+modal run -d miles/modal_train.py::train
+```
+
+For this config:
+
+- `download_data` writes 2,048 short UltraChat conversations to
+  `/data/ultrachat-sft/train.jsonl` in the `messages` chat format.
+- `train` runs 20 optimizer steps at a global batch size of 32. The LoRA
+  adapter is saved under
+  `/checkpoints/Qwen3-30B-A3B-lora-sft/iter_<step>/adapter`, as an HF PEFT
+  adapter (`adapter_config.json`, `adapter_model.bin`) alongside per-rank
+  Megatron shards and optimizer state.
+- To use your own data, point `prompt_data` at a JSONL file with a `messages`
+  column.
+
 ## Launcher Model
 
 Each experiment lives in `miles/configs/<name>.py` and exposes:
@@ -106,7 +134,7 @@ Launcher-only fields are not passed to Miles:
 | --- | --- |
 | `environment` | Ray job environment variables |
 | `async_mode` | Selects `train_async.py` instead of `train.py` |
-| `miles_model_script` | Shell script sourced for `MODEL_ARGS` |
+| `miles_model_script` | Model script (`scripts/models/<model>.py`, or a legacy `.sh`) that defines `MODEL_ARGS` |
 | `source_hf_checkpoint` | Upstream repo/path used for download or config-specific conversion |
 | `megatron_conversion_hf_checkpoint` | Optional raw Megatron conversion input; defaults to `hf_checkpoint` |
 

@@ -84,8 +84,9 @@ class MilesConfig:
     Fields in _MILES_SKIP are launcher instructions, not Miles CLI args:
       environment       — injected into the Ray job runtime env
       async_mode        — selects train_async.py vs train.py
-      miles_model_script — path relative to /root/miles to a shell script that
-                           defines MODEL_ARGS for model architecture; sourced
+      miles_model_script — path relative to /root/miles to a model script
+                           (scripts/models/<model>.py, or a legacy .sh) that
+                           defines MODEL_ARGS for model architecture; loaded
                            before running the train command
       source_hf_checkpoint — optional upstream HF repo/local path used by
                              download_model() when hf_checkpoint points at a
@@ -117,7 +118,7 @@ class MilesConfig:
         "NCCL_NVLS_ENABLE": "1",
     }
     async_mode: bool = False  # True → use train_async.py
-    miles_model_script: str = ""  # shell script path relative to /root/miles
+    miles_model_script: str = ""  # model script path relative to /root/miles
     source_hf_checkpoint: str | None = None
     megatron_conversion_hf_checkpoint: str | None = None
 
@@ -211,7 +212,8 @@ class MilesConfig:
         if use_critic:
             training_gpus += critic_nodes * critic_gpus
 
-        if colocate:
+        # Train-only runs (e.g. SFT) start no rollout engines.
+        if colocate or f.get("debug_train_only", False):
             total_gpus = training_gpus
         else:
             rollout_gpus = rollout_gpus or (actor_nodes * gpus_per_node)

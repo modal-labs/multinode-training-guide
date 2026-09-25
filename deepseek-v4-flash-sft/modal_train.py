@@ -57,6 +57,9 @@ checkpoints_vol = modal.Volume.from_name(
 
 automodel_image = build_automodel_image(HERE)
 vllm_image = build_vllm_image(HERE)
+if SERVE_RUN_ID:
+    # Local env vars do not reach containers; bake the selected run into the image.
+    vllm_image = vllm_image.env({"SERVE_RUN_ID": SERVE_RUN_ID})
 
 
 def _validate_run_id(run_id: str) -> None:

@@ -151,6 +151,21 @@ def prepare_miles_config(miles_cfg, tmpdir: str) -> None:
             setattr(miles_cfg, field, path)
 
 
+def model_args_shell(miles_root: str, model_script: str) -> str:
+    """Shell snippet that defines the MODEL_ARGS array from a Miles model script.
+
+    Newer Miles images ship scripts/models/<model>.py instead of .sh files; the
+    .py form is loaded through Miles' own model_args_utils helper.
+    """
+    if model_script.endswith(".py"):
+        model_type = os.path.splitext(os.path.basename(model_script))[0]
+        loader = shlex.join(
+            ["python3", "-m", "miles.utils.external_utils.model_args_utils", model_type]
+        )
+        return f'read -ra MODEL_ARGS <<< "$(cd {miles_root} && {loader})"'
+    return f"source {miles_root}/{model_script}"
+
+
 def build_train_cmd(miles_cfg, miles_root: str) -> str:
     """Build the Ray job entrypoint, sourcing model arch args if needed."""
     train_script = (
@@ -158,8 +173,8 @@ def build_train_cmd(miles_cfg, miles_root: str) -> str:
     )
     if miles_cfg.miles_model_script:
         inner = (
-            f"source {miles_root}/{miles_cfg.miles_model_script} && "
-            f"python3 {train_script} ${{MODEL_ARGS[@]}} {shlex.join(miles_cfg.cli_args())}"
+            f"{model_args_shell(miles_root, miles_cfg.miles_model_script)} && "
+            f'python3 {train_script} "${{MODEL_ARGS[@]}}" {shlex.join(miles_cfg.cli_args())}'
         )
         return f"bash -c {shlex.quote(inner)}"
     return f"python3 {train_script} {shlex.join(miles_cfg.cli_args())}"

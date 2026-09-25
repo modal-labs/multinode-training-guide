@@ -9,7 +9,7 @@ import modal.experimental
 
 from configs import get_module, _CONFIGS_DIR
 from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, ModalConfig
-from modal_helpers.utils import get_checkpoint_conversion_policy
+from modal_helpers.utils import get_checkpoint_conversion_policy, model_args_shell
 
 # ── Experiment (client-side only — feeds decorator params) ────────────────────
 
@@ -212,9 +212,9 @@ def convert_hf_to_megatron_checkpoint(
     )
 
     cmd = (
-        f"source {MILES_ROOT}/{miles_cfg.miles_model_script} && "
+        f"{model_args_shell(MILES_ROOT, miles_cfg.miles_model_script)} && "
         f"torchrun {' '.join(torchrun_args)} {convert_script} "
-        f"${{MODEL_ARGS[@]}} {' '.join(extra_args)} "
+        f'"${{MODEL_ARGS[@]}}" {" ".join(extra_args)} '
         f"--hf-checkpoint {shlex.quote(hf_path)} --save {shlex.quote(save_path)}"
     )
 
@@ -245,7 +245,12 @@ def convert_hf_to_megatron_checkpoint(
     cloud=modal_cfg.cloud if modal_cfg and modal_cfg.cloud else None,
     region=modal_cfg.region if modal_cfg and modal_cfg.region else None,
     volumes=modal_volumes,
-    secrets=[modal.Secret.from_name("wandb-secret")],
+    # wandb-secret is only required by configs that set use_wandb = True.
+    secrets=(
+        [modal.Secret.from_name("wandb-secret")]
+        if getattr(miles_cfg, "use_wandb", False)
+        else []
+    ),
     timeout=24 * 60 * 60,
     experimental_options={"efa_enabled": True},
 )
