@@ -4,7 +4,7 @@ Standalone multi-node Ray + Slime pattern.
 Design:
 - Ray cluster bootstrap happens in modal.enter() inside a modal.Cls.
 - Job submission happens in a separate modal.method().
-- The submitting method is multi-node via @modal.experimental.clustered.
+- The submitting method is multi-node via @modal.clustered.
 - Local entrypoint accepts a config name, generates the Slime command, and submits it.
 """
 
@@ -14,7 +14,6 @@ import subprocess
 import time
 
 import modal
-import modal.experimental
 
 from slime_configs import get_config, list_configs
 
@@ -72,9 +71,8 @@ def _build_slime_cmd(config_name: str) -> tuple[str, str]:
     timeout=24 * 60 * 60,
     scaledown_window=1 * 60 * 60,
     retries=10,
-    experimental_options={"efa_enabled": True},
 )
-@modal.experimental.clustered(size=N_NODES, rdma=True)
+@modal.clustered(size=N_NODES, rdma=True)
 class RayCluster:
     @modal.enter()
     def bootstrap_ray(self):
@@ -82,9 +80,9 @@ class RayCluster:
         data_volume.reload()
         checkpoints_volume.reload()
 
-        cluster_info = modal.experimental.get_cluster_info()
-        self.rank = cluster_info.rank
-        self.node_ips = cluster_info.container_ipv4_ips
+        cluster = modal.Cluster.from_context()
+        self.rank = cluster.container_rank()
+        self.node_ips = cluster.container_ips(family="ipv4")
         self.main_addr = self.node_ips[0]
         self.node_addr = self.node_ips[self.rank]
 
