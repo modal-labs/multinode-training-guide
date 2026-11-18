@@ -29,6 +29,9 @@ image = (
     .entrypoint([])
     .add_local_python_source("configs", copy=True)
     .add_local_python_source("modal_helpers", copy=True)
+    .add_local_file(
+        "slime/modal_helpers/sitecustomize.py", "/root/sitecustomize.py", copy=True
+    )
 )
 if modal_cfg:
     for patch in modal_cfg.patch_files:
@@ -41,6 +44,11 @@ if modal_cfg:
             remote_path=SLIME_ROOT,
             copy=True,
             ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
+        )
+        image = image.add_local_file(
+            "slime/modal_helpers/sitecustomize.py",
+            f"{SLIME_ROOT}/sitecustomize.py",
+            copy=True,
         )
     if modal_cfg.image_run_commands:
         image = image.run_commands(*modal_cfg.image_run_commands)
@@ -75,6 +83,12 @@ app = modal.App(experiment)
 
 RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
+
+
+def efa_experimental_options():
+    if modal_cfg and getattr(modal_cfg, "efa_enabled", True):
+        return {"efa_enabled": True}
+    return None
 
 
 def run_config_hook(experiment: str, hook_name: str, mounted_volumes) -> None:
@@ -157,10 +171,17 @@ def post_process_data(experiment: str = os.environ.get("EXPERIMENT_CONFIG", ""))
 
 @app.function(
     image=image,
-    gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
+    gpu=(
+        f"{modal_cfg.conversion_gpu or modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}"
+        if modal_cfg
+        else None
+    ),
+    memory=modal_cfg.memory if modal_cfg and modal_cfg.memory else None,
+    cloud=modal_cfg.cloud if modal_cfg and modal_cfg.cloud else None,
+    region=modal_cfg.region if modal_cfg and modal_cfg.region else None,
     volumes=modal_volumes,
     timeout=4 * 60 * 60,
-    experimental_options={"efa_enabled": True},
+    experimental_options=efa_experimental_options(),
 )
 @(
     modal.experimental.clustered(
@@ -221,6 +242,9 @@ def convert_hf_to_megatron_checkpoint(
     env = {**os.environ, **slime_cfg.environment}
     if num_nodes > 1:
         env["SKIP_RELEASE_RENAME"] = "1"
+        env.setdefault("CONVERSION_DIST_TIMEOUT_MINUTES", "60")
+        env.setdefault("MODAL_DCP_BUFFERED_TORCH_SAVE", "1")
+        env.setdefault("MODAL_DCP_THREAD_COUNT", "1")
 
     print(
         f"Conversion layout for {experiment!r}: nodes={num_nodes}, "
@@ -247,7 +271,7 @@ def convert_hf_to_megatron_checkpoint(
     volumes=modal_volumes,
     secrets=[modal.Secret.from_name("wandb-secret")],
     timeout=24 * 60 * 60,
-    experimental_options={"efa_enabled": True},
+    experimental_options=efa_experimental_options(),
 )
 @(
     modal.experimental.clustered(slime_cfg.total_nodes(), rdma=True)
@@ -290,19 +314,20 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     start_ray_head(my_ip, n_nodes)
     prepare_slime_config(slime_cfg, tempfile.mkdtemp())
 
+    cmd = build_train_cmd(slime_cfg, SLIME_ROOT)
+    no_proxy = f"localhost,127.0.0.1,0.0.0.0,{master_addr},10.0.0.0/8,100.64.0.0/10"
+    env_vars = {
+        "no_proxy": no_proxy,
+        "NO_PROXY": no_proxy,
+        "MASTER_ADDR": master_addr,
+        "MODAL_RUNTIME_PATCHES_AUTOAPPLY": "1",
+        **slime_cfg.environment,
+    }
     if (wandb_key := os.environ.get("WANDB_API_KEY", "")) and getattr(
         slime_cfg, "use_wandb", False
     ):
-        slime_cfg.wandb_key = wandb_key
-
-    cmd = build_train_cmd(slime_cfg, SLIME_ROOT)
-    runtime_env = {
-        "env_vars": {
-            "no_proxy": f"127.0.0.1,{master_addr}",
-            "MASTER_ADDR": master_addr,
-            **slime_cfg.environment,
-        }
-    }
+        env_vars["WANDB_API_KEY"] = wandb_key
+    runtime_env = {"env_vars": env_vars}
 
     client = JobSubmissionClient("http://127.0.0.1:8265")
     job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
@@ -311,7 +336,13 @@ async def train(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
     mode = "async" if slime_cfg.async_mode else "sync"
     print(f"Job submitted: {job_id}")
     print(f"Training {experiment:<40} {nodes} node(s) × {gpu}  ({mode})")
-    print(f"Command: {cmd}, runtime_env: {runtime_env}")
+    printable_runtime_env = {
+        "env_vars": {
+            key: ("[REDACTED]" if key == "WANDB_API_KEY" else value)
+            for key, value in env_vars.items()
+        }
+    }
+    print(f"Command: {cmd}, runtime_env: {printable_runtime_env}")
 
     async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
         print(f"Ray dashboard: {tunnel.url}")
